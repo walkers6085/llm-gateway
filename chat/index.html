@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM Чат</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #6b7385; --border: #dfe3ea;
+  --accent: #2f6fed; --accent-text: #ffffff; --user: #e8f0fe; --code: #f0f2f5; --error: #c62828;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14161b; --panel: #1c1f26; --text: #e4e7ee; --muted: #8b93a5; --border: #2c313c;
+    --accent: #5b8def; --accent-text: #0d1117; --user: #22304a; --code: #262a33; --error: #ef6b6b;
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--text); font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  display: flex; flex-direction: column; }
+header { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px 16px;
+  background: var(--panel); border-bottom: 1px solid var(--border); }
+header h1 { font-size: 16px; margin: 0 8px 0 0; }
+input, select, textarea, button { font: inherit; color: inherit; }
+input, select, textarea { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; }
+#token { width: 220px; } #model { min-width: 160px; max-width: 260px; }
+button { border: 1px solid var(--border); background: var(--panel); border-radius: 8px; padding: 6px 12px; cursor: pointer; }
+button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+button:disabled { opacity: .5; cursor: default; }
+.spacer { flex: 1; }
+#status { color: var(--muted); font-size: 13px; }
+#status.err { color: var(--error); }
+details { padding: 0 16px; background: var(--panel); border-bottom: 1px solid var(--border); }
+details summary { cursor: pointer; color: var(--muted); padding: 6px 0; font-size: 13px; }
+#system { width: 100%; min-height: 60px; margin-bottom: 10px; resize: vertical; }
+main { flex: 1; overflow-y: auto; padding: 16px; }
+.log { max-width: 820px; margin: 0 auto; display: flex; flex-direction: column; gap: 12px; }
+.msg { padding: 10px 14px; border-radius: 12px; background: var(--panel); border: 1px solid var(--border);
+  overflow-wrap: anywhere; }
+.msg.user { background: var(--user); align-self: flex-end; max-width: 85%; white-space: pre-wrap; }
+.msg.error { color: var(--error); }
+.msg p { margin: 0 0 8px; } .msg p:last-child { margin-bottom: 0; }
+.msg pre { background: var(--code); padding: 10px; border-radius: 8px; overflow-x: auto; }
+.msg code { background: var(--code); padding: 1px 4px; border-radius: 4px; font-size: 13.5px; }
+.msg pre code { padding: 0; background: none; }
+.msg ul, .msg ol { margin: 0 0 8px; padding-left: 22px; }
+.meta { color: var(--muted); font-size: 12px; margin-top: 6px; }
+.empty { color: var(--muted); text-align: center; margin-top: 15vh; }
+footer { padding: 12px 16px; background: var(--panel); border-top: 1px solid var(--border); }
+form { max-width: 820px; margin: 0 auto; display: flex; gap: 8px; align-items: flex-end; }
+#input { flex: 1; resize: none; min-height: 44px; max-height: 200px; }
+@media (max-width: 600px) { #token, #model { width: 100%; max-width: none; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>LLM Чат</h1>
+  <input id="token" type="password" placeholder="Токен gw-…" autocomplete="off">
+  <select id="model"><option value="">— модель —</option></select>
+  <button id="reload" title="Обновить список моделей">↻</button>
+  <span id="status"></span>
+  <span class="spacer"></span>
+  <button id="new">Новый чат</button>
+</header>
+<details>
+  <summary>Системный промпт и параметры</summary>
+  <textarea id="system" placeholder="Например: Отвечай кратко и по-русски."></textarea>
+  <label>Температура <input id="temperature" type="number" min="0" max="2" step="0.1" value="0.7" style="width:80px"></label>
+</details>
+<main><div class="log" id="log"><div class="empty">Введите токен, выберите модель и задайте вопрос.</div></div></main>
+<footer>
+  <form id="form">
+    <textarea id="input" rows="1" placeholder="Сообщение… (Enter — отправить, Shift+Enter — новая строка)"></textarea>
+    <button class="primary" id="send" type="submit">Отправить</button>
+    <button id="stop" type="button" hidden>Стоп</button>
+  </form>
+</footer>
+<script>
+const $ = (id) => document.getElementById(id);
+const store = {
+  get(k) { try { return localStorage.getItem(k) || ""; } catch { return ""; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+};
+let history = [];
+let controller = null;
+
+$("token").value = store.get("gw_token");
+$("system").value = store.get("gw_system");
+
+function setStatus(text, err = false) { $("status").textContent = text; $("status").className = err ? "err" : ""; }
+function headers() { return { "Content-Type": "application/json", "Authorization": "Bearer " + $("token").value.trim() }; }
+
+async function apiError(resp) {
+  try { const j = await resp.json(); return j.error?.message || j.detail || resp.statusText; }
+  catch { return resp.status + " " + resp.statusText; }
+}
+
+async function loadModels() {
+  if (!$("token").value.trim()) { setStatus("нужен токен", true); return; }
+  setStatus("загрузка моделей…");
+  try {
+    const resp = await fetch("/v1/models", { headers: headers() });
+    if (!resp.ok) { setStatus(await apiError(resp), true); return; }
+    const data = (await resp.json()).data || [];
+    const saved = store.get("gw_model");
+    $("model").innerHTML = data.map(m => `<option>${escapeHtml(m.id)}</option>`).join("") || '<option value="">нет моделей</option>';
+    if (data.some(m => m.id === saved)) $("model").value = saved;
+    setStatus(`моделей: ${data.length}`);
+  } catch (e) { setStatus("шлюз недоступен", true); }
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// Небольшой markdown: блоки кода, инлайн-код, жирный/курсив, списки, заголовки, абзацы.
+function renderMarkdown(src) {
+  const parts = src.split(/```/);
+  return parts.map((part, i) => {
+    if (i % 2) {
+      const body = part.replace(/^[^\n]*\n/, "");
+      return `<pre><code>${escapeHtml(body)}</code></pre>`;
+    }
+    return part.split(/\n{2,}/).map(block => {
+      let html = escapeHtml(block.trim());
+      if (!html) return "";
+      html = html.replace(/`([^`]+)`/g, "<code>$1</code>")
+                 .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+                 .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+      const lines = html.split("\n");
+      if (lines.every(l => /^\s*[-*•] /.test(l))) return "<ul>" + lines.map(l => `<li>${l.replace(/^\s*[-*•] /, "")}</li>`).join("") + "</ul>";
+      if (lines.every(l => /^\s*\d+[.)] /.test(l))) return "<ol>" + lines.map(l => `<li>${l.replace(/^\s*\d+[.)] /, "")}</li>`).join("") + "</ol>";
+      if (/^#{1,6} /.test(html)) return `<p><strong>${html.replace(/^#{1,6} /, "")}</strong></p>`;
+      return `<p>${lines.join("<br>")}</p>`;
+    }).join("");
+  }).join("");
+}
+
+function addMessage(role, text) {
+  const empty = document.querySelector(".empty"); if (empty) empty.remove();
+  const el = document.createElement("div");
+  el.className = "msg " + role;
+  if (role === "assistant") el.innerHTML = renderMarkdown(text); else el.textContent = text;
+  $("log").appendChild(el);
+  el.scrollIntoView({ block: "end" });
+  return el;
+}
+
+function busy(on) { $("send").hidden = on; $("stop").hidden = !on; $("input").disabled = on; }
+
+async function send(text) {
+  const model = $("model").value;
+  if (!$("token").value.trim()) { setStatus("нужен токен", true); return; }
+  if (!model) { setStatus("выберите модель", true); return; }
+  history.push({ role: "user", content: text });
+  addMessage("user", text);
+  const el = addMessage("assistant", "…");
+  const messages = [];
+  const system = $("system").value.trim();
+  if (system) messages.push({ role: "system", content: system });
+  messages.push(...history);
+
+  controller = new AbortController();
+  busy(true); setStatus("генерация…");
+  let answer = "", usage = null;
+  const started = performance.now();
+  try {
+    const resp = await fetch("/v1/chat/completions", {
+      method: "POST", headers: headers(), signal: controller.signal,
+      body: JSON.stringify({ model, messages, stream: true, temperature: Number($("temperature").value) }),
+    });
+    if (!resp.ok) throw new Error(await apiError(resp));
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split("\n"); buf = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith("data:")) continue;
+        const data = line.slice(5).trim();
+        if (data === "[DONE]") continue;
+        try {
+          const j = JSON.parse(data);
+          if (j.usage) usage = j.usage;
+          const delta = j.choices?.[0]?.delta?.content;
+          if (delta) { answer += delta; el.innerHTML = renderMarkdown(answer); el.scrollIntoView({ block: "end" }); }
+        } catch {}
+      }
+    }
+    setStatus("");
+  } catch (e) {
+    if (e.name === "AbortError") setStatus("остановлено");
+    else { el.classList.add("error"); answer = answer || ""; el.textContent = (answer ? answer + "\n\n" : "") + "Ошибка: " + e.message; setStatus("ошибка", true); }
+  } finally {
+    controller = null; busy(false); $("input").focus();
+  }
+  if (answer) {
+    history.push({ role: "assistant", content: answer });
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const secs = ((performance.now() - started) / 1000).toFixed(1);
+    meta.textContent = `${model} · ${secs} с` + (usage ? ` · токенов: ${usage.prompt_tokens} → ${usage.completion_tokens}` : "");
+    el.appendChild(meta);
+  } else if (!el.classList.contains("error")) {
+    el.remove(); history.pop();
+  }
+}
+
+$("form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const text = $("input").value.trim();
+  if (!text || controller) return;
+  $("input").value = ""; autosize();
+  send(text);
+});
+$("input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); $("form").requestSubmit(); }
+});
+function autosize() { const t = $("input"); t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, 200) + "px"; }
+$("input").addEventListener("input", autosize);
+$("stop").addEventListener("click", () => controller?.abort());
+$("new").addEventListener("click", () => {
+  controller?.abort(); history = [];
+  $("log").innerHTML = '<div class="empty">Новый чат.</div>'; $("input").focus();
+});
+$("token").addEventListener("change", () => { store.set("gw_token", $("token").value.trim()); loadModels(); });
+$("model").addEventListener("change", () => store.set("gw_model", $("model").value));
+$("system").addEventListener("change", () => store.set("gw_system", $("system").value));
+$("reload").addEventListener("click", loadModels);
+if ($("token").value) loadModels();
+</script>
+</body>
+</html>

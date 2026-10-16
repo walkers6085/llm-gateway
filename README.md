@@ -9,6 +9,14 @@ OpenAI-совместимый шлюз к инференсу, который д�
 клиент (чат, cliAgent, openai SDK) ──Bearer gw-…──▶ шлюз :7700 ──mTLS + UPSTREAM_API_KEY──▶ инференс
 ```
 
+## Установка
+```bash
+python3 -m venv venv
+venv/bin/pip install -r requirements.txt        # Windows: venv\Scripts\pip install -r requirements.txt
+cp .env.example .env
+venv/bin/uvicorn --factory gateway.app:create_app --host 0.0.0.0 --port 7700
+```
+
 ## Настройка
 1. Положить сертификаты в `certs/` (папка `chmod 700`, файлы `chmod 600`):
    `client.crt`, `client.key`, при необходимости `ca.pem` — CA сертификата **сервера** инференса.

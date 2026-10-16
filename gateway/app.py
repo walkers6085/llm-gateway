@@ -40,7 +40,9 @@ def error_body(message: str, type_: str, code: str | None = None) -> dict:
 
 
 def build_ssl_context(settings: Settings) -> ssl.SSLContext:
-    ctx = ssl.create_default_context(cafile=settings.ca_bundle or None)
+    ctx = ssl.create_default_context()
+    for ca in settings.ca_bundle:
+        ctx.load_verify_locations(cafile=ca)
     if settings.client_cert:
         ctx.load_cert_chain(
             settings.client_cert,
@@ -48,6 +50,16 @@ def build_ssl_context(settings: Settings) -> ssl.SSLContext:
             password=settings.client_key_password or None,
         )
     return ctx
+
+
+def describe(exc: BaseException) -> str:
+    """Полная цепочка причин: у httpx.ConnectError текст часто пустой."""
+    parts, seen = [], set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        parts.append(f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__)
+        exc = exc.__cause__ or exc.__context__
+    return " <- ".join(parts)
 
 
 def check_cert_expiry(path: str) -> None:
@@ -114,6 +126,8 @@ def extract_usage(payload: dict) -> tuple[int, int]:
 
 def create_app(settings: Settings | None = None, store: TokenStore | None = None,
                transport: httpx.AsyncBaseTransport | None = None) -> FastAPI:
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s:     [gateway] %(message)s")
     settings = settings or Settings.from_env()
     store = store or TokenStore(settings.db_path)
     rate = RateLimiter()
@@ -138,6 +152,10 @@ def create_app(settings: Settings | None = None, store: TokenStore | None = None
         app.state.client = httpx.AsyncClient(
             base_url=settings.upstream_base_url,
             timeout=httpx.Timeout(settings.upstream_timeout, connect=15),
+            # Системные HTTP(S)_PROXY не используем: внутренний инференс обычно доступен
+            # только напрямую. Прокси — только явно через UPSTREAM_PROXY.
+            trust_env=False,
+            proxy=settings.upstream_proxy or None,
             **kwargs,
         )
         yield
@@ -191,10 +209,10 @@ def create_app(settings: Settings | None = None, store: TokenStore | None = None
             return GatewayError(504, "Апстрим не ответил вовремя", "upstream_error", "upstream_timeout")
         cause = exc.__cause__ or exc.__context__
         if isinstance(exc, ssl.SSLError) or isinstance(cause, ssl.SSLError) or "SSL" in str(exc):
-            log.error("TLS-ошибка при обращении к апстриму: %s", exc)
+            log.error("TLS-ошибка при обращении к апстриму: %s", describe(exc))
             return GatewayError(502, "Ошибка TLS при подключении к апстриму (сертификат шлюза или CA)",
                                 "upstream_error", "upstream_tls_error")
-        log.error("Апстрим недоступен: %r", exc)
+        log.error("Апстрим недоступен: %s", describe(exc))
         return GatewayError(502, "Апстрим недоступен", "upstream_error", "upstream_unavailable")
 
     def passthrough_headers(resp: httpx.Response) -> dict[str, str]:
@@ -227,7 +245,7 @@ def create_app(settings: Settings | None = None, store: TokenStore | None = None
             resp = await app.state.client.get("/models", headers=upstream_headers(), timeout=10)
             ok = resp.status_code < 500
         except Exception as exc:
-            log.warning("health: апстрим недоступен: %r", exc)
+            log.warning("health: апстрим недоступен: %s", describe(exc))
             ok = False
         return JSONResponse({"status": "ok" if ok else "degraded", "upstream": ok},
                             status_code=200 if ok else 503)

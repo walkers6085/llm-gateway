@@ -18,6 +18,16 @@ def _path(name: str, default: str = "") -> str:
     return value
 
 
+def _paths(name: str) -> list[str]:
+    """Несколько путей через запятую (например, корневой и промежуточный CA)."""
+    out = []
+    for part in os.getenv(name, "").split(","):
+        part = part.strip()
+        if part:
+            out.append(part if os.path.isabs(part) else str(ROOT / part))
+    return out
+
+
 def _bool(name: str, default: bool = False) -> bool:
     return os.getenv(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
 
@@ -29,7 +39,8 @@ class Settings:
     client_cert: str = ""
     client_key: str = ""
     client_key_password: str = ""
-    ca_bundle: str = ""
+    ca_bundle: list[str] = field(default_factory=list)
+    upstream_proxy: str = ""
     upstream_timeout: float = 300.0
     db_path: str = ""
     max_request_body_bytes: int = 10 * 1024 * 1024
@@ -46,7 +57,8 @@ class Settings:
             client_cert=_path("CLIENT_CERT", "certs/client.crt"),
             client_key=_path("CLIENT_KEY", "certs/client.key"),
             client_key_password=os.getenv("CLIENT_KEY_PASSWORD", ""),
-            ca_bundle=_path("CA_BUNDLE"),
+            ca_bundle=_paths("CA_BUNDLE"),
+            upstream_proxy=os.getenv("UPSTREAM_PROXY", "").strip(),
             upstream_timeout=float(os.getenv("UPSTREAM_TIMEOUT", "300")),
             db_path=_path("DB_PATH", "data/gateway.db"),
             max_request_body_bytes=int(os.getenv("MAX_REQUEST_BODY_BYTES", str(10 * 1024 * 1024))),

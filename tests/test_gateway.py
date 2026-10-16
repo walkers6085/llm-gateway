@@ -144,7 +144,7 @@ def upstream_url(pki):
 def make(tmp_path, pki, upstream_url):
     def _make(**overrides):
         settings = Settings(upstream_base_url=upstream_url, client_cert=pki["client_cert"],
-                            client_key=pki["client_key"], ca_bundle=pki["ca"],
+                            client_key=pki["client_key"], ca_bundle=[pki["ca"]],
                             db_path=str(tmp_path / "gw.db"), upstream_timeout=10)
         for k, v in overrides.items():
             setattr(settings, k, v)

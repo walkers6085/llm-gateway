@@ -1,0 +1,43 @@
+# Инструменты: сеть
+
+Код: [`agent/tools/web.py`](../../../agent/tools/web.py). Тесты: [`tests/test_tools_web.py`](../../../tests/test_tools_web.py)
+(локальный HTTP-сервер, без интернета; HTML поиска — [`tests/fixtures/ddg.html`](../../../tests/fixtures/ddg.html)).
+
+| Инструмент | Права по умолчанию | Аргументы | Результат |
+|---|---|---|---|
+| `web_fetch` | ask | `url`, `offset`, `max_chars` (20000), `raw` | URL, статус, тип, заголовок + текст страницы; HTML → текст (`#` заголовки, `-` списки, ```` ``` ```` для `<pre>`, ссылки `[текст](url)`); длинный текст — частями (`offset`) |
+| `http_request` | ask | `method`, `url`, `headers`, `body` или `json` | `HTTP <код>`, заголовки ответа (без `set-cookie`), тело |
+| `web_search` | allow | `query`, `max_results` | нумерованный список: заголовок, URL, фрагмент |
+
+Предмет для правил прав — URL (`web_fetch(domain:python.org)`), для поиска — запрос.
+
+## Защита от SSRF
+
+Перед запросом и **перед каждым редиректом** (редиректы проходятся вручную, до `network.max_redirects`):
+
+1. схема только `http`/`https`;
+2. `network.deny_domains` — запрещено (домен и поддомены);
+3. если `network.allow_domains` не пуст — только эти домены;
+4. хост резолвится, и **все** адреса должны быть публичными: loopback, частные сети, link-local
+   (`169.254.169.254` — метаданные облака), multicast, IPv4-mapped IPv6 — запрещены.
+   Исключения: `network.allow_private: true` или хост в `network.allow_hosts`.
+
+Ограничение: между проверкой и соединением DNS может ответить иначе (DNS rebinding) — для
+строгой изоляции нужен отдельный egress-прокси (`network.proxy`).
+
+## Прочее
+
+- Системные `HTTP(S)_PROXY` не используются (`trust_env=False`), прокси — только `network.proxy`.
+- Тело читается не больше `network.max_bytes`; дальше — пометка об обрезке.
+- 301/302/303 после не-GET превращаются в GET без тела (как в браузере).
+- Двоичный ответ `web_fetch` — ошибка с типом и размером; статус ≥ 400 — результат с ошибкой.
+- Кодировка — из `Content-Type`, иначе из `<meta charset>`, иначе UTF-8.
+
+## Поиск
+
+- `search.provider: duckduckgo` (по умолчанию) — POST в HTML-версию DuckDuckGo, разбор
+  `a.result__a` / `.result__snippet`, ссылки `//duckduckgo.com/l/?uddg=…` раскодируются, реклама
+  (`y.js`) отбрасывается. Если DDG показал защиту от роботов (статус 202/403/429, `anomaly`) — ошибка
+  с советом переключиться на SearXNG.
+- `search.provider: searxng` + `search.searxng_url` — `GET <url>/search?q=…&format=json`
+  (в `settings.yml` SearXNG должен быть включён формат `json`).

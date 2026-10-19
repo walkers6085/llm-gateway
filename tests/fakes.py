@@ -176,3 +176,27 @@ def auth(raw):
 
 def tool_call(id_, name, **arguments):
     return {"id": id_, "name": name, "arguments": arguments}
+
+
+def sse_body(reply: dict) -> bytes:
+    """Ответ сценария как тело SSE (как у апстрима), для httpx.MockTransport."""
+    out = "".join("data: " + json.dumps({"choices": [{"index": 0, **c}]}) + "\n\n" for c in _scripted_chunks(reply))
+    out += "data: " + json.dumps({"choices": [], "usage": USAGE}) + "\n\n" + "data: [DONE]\n\n"
+    return out.encode()
+
+
+def scripted_transport(script: list[dict], seen: list | None = None):
+    """MockTransport, отдающий ответы `script` по очереди (без сети и TLS) — для тестов цикла агента."""
+    import httpx
+
+    def handler(request):
+        if seen is not None:
+            seen.append(json.loads(request.content))
+        if not script:
+            return httpx.Response(500, json={"error": {"message": "сценарий закончился"}})
+        reply = script.pop(0)
+        if reply.get("status"):
+            return httpx.Response(reply["status"], json={"error": {"message": reply["error"]}})
+        return httpx.Response(200, content=sse_body(reply), headers={"content-type": "text/event-stream"})
+
+    return httpx.MockTransport(handler)

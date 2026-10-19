@@ -1,3 +1,5 @@
+import asyncio
+import inspect
 import ssl
 
 import pytest
@@ -7,6 +9,16 @@ from gateway.app import create_app
 from gateway.config import Settings
 from gateway.tokens import TokenStore
 from tests.fakes import SCRIPT, SEEN, ServerThread, make_pki, upstream
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_pyfunc_call(pyfuncitem):
+    """`async def test_…` запускаются в своём цикле asyncio — без pytest-asyncio."""
+    if inspect.iscoroutinefunction(pyfuncitem.obj):
+        args = {name: pyfuncitem.funcargs[name] for name in pyfuncitem._fixtureinfo.argnames}
+        asyncio.run(pyfuncitem.obj(**args))
+        return True
+    return None
 
 
 @pytest.fixture(scope="session")

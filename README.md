@@ -31,6 +31,7 @@ venv/bin/uvicorn --factory gateway.app:create_app --host 0.0.0.0 --port 7700
 ```bash
 ./gwtoken create ivan --days 90 --rpm 30          # печатает токен один раз
 ./gwtoken create bot --models my-model            # только указанные модели
+./gwtoken agent ivan default                      # доступ к агенту на сервере (--off — забрать)
 ./gwtoken list                                    # статус, срок, расход за 30 дней
 ./gwtoken revoke ivan                             # по имени или префиксу gw-xxxxxxx
 ./gwtoken usage [ivan] --days 7                   # запросы/ошибки/токены по моделям
@@ -43,6 +44,19 @@ venv/bin/uvicorn --factory gateway.app:create_app --host 0.0.0.0 --port 7700
   Эндпоинты: `GET /v1/models`, `POST /v1/chat/completions` (в т.ч. stream), `/v1/completions`, `/v1/embeddings`.
 - cliAgent: провайдер `"options": {"baseURL": "http://<сервер>:7700/v1", "apiKey": "gw-…"}`.
 
+## Агент
+Поверх шлюза есть агент: модель вызывает инструменты (файлы, shell, `web_fetch`/`http_request`/`web_search`,
+MCP-серверы), права allow/ask/deny и хуки решают, что можно; сессии — в SQLite, настройки — в JSON.
+Два интерфейса на одном ядре (`agent/`):
+
+- **на сервере** — `/agent/*` и режим «Агент» в веб-чате; инструменты выполняются на машине шлюза.
+  Доступ выдаётся токену явно: `./gwtoken create ivan --agent default` (профили — `config/agent.json`,
+  образец `config/agent.json.example`);
+- **в терминале** — `./gwagent` (модель через шлюз по `GW_TOKEN`, инструменты — локально):
+  `GW_TOKEN=gw-… ./gwagent -p "задача"` или интерактивно `./gwagent`.
+
+Документация — **[вики](docs/wiki/Home.md)**: настройки, инструменты, MCP, хуки, права, API, безопасность.
+
 ## Ограничения и защита
 - `MAX_REQUEST_BODY_BYTES` (10 МБ), `--rpm` на токен, `MODEL_MAX_CONNECTIONS` — одновременных запросов на модель.
 - `GATEWAY_MODE=PROD` — без `/docs`. CORS выключен (чат открывается с того же адреса).
@@ -50,7 +64,8 @@ venv/bin/uvicorn --factory gateway.app:create_app --host 0.0.0.0 --port 7700
 
 ## Разработка
 ```bash
-venv/bin/pytest -q    # поднимает настоящий mTLS-апстрим с CERT_REQUIRED
+venv/bin/pytest -q    # поднимает настоящий mTLS-апстрим с CERT_REQUIRED; всё офлайн
 ```
+Устройство тестов — [docs/wiki/testing.md](docs/wiki/testing.md).
 Логи: `journalctl --user -u llm-gateway -f`. После правок кода — `systemctl --user restart llm-gateway`
 (страница чата — статика, перезапуск не нужен).

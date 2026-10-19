@@ -3,29 +3,48 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Что это
-OpenAI-совместимый прокси (FastAPI + httpx) к своему инференсу, доступному только по клиентскому сертификату (mTLS). Сертификат и `UPSTREAM_API_KEY` живут только на шлюзе; пользователи ходят по личным токенам `gw-…`. Протоколы не транслируются — ответы апстрима отдаются как есть, SSE-стрим проксируется байт-в-байт. Документация, сообщения об ошибках, комментарии и коммиты — на русском.
+OpenAI-совместимый прокси (FastAPI + httpx) к своему инференсу, доступному только по клиентскому сертификату (mTLS), плюс **агент** поверх него. Сертификат и `UPSTREAM_API_KEY` живут только на шлюзе; пользователи ходят по личным токенам `gw-…`. Документация, сообщения об ошибках, комментарии и коммиты — на русском.
+
+Ограничение владельца: **без фреймворков агентов и больших библиотек** — только stdlib + уже используемые `httpx`/FastAPI. Протоколы (chat/completions, SSE, MCP JSON-RPC, JSON Schema-валидация) реализованы вручную.
+
+## Вики — обязательна
+Подробная документация — `docs/wiki/` (оглавление `Home.md`). **Правка модуля = правка его страницы вики + строка в `docs/wiki/changelog.md` в том же коммите.** Карта «модуль → тесты → страница» — `docs/wiki/testing.md`. `tests/test_wiki.py` падает, если новый инструмент, ключ `DEFAULTS`, событие хука/цикла, эндпоинт `/agent/*` или страница не описаны, а также при битых относительных ссылках.
 
 ## Команды
 ```bash
-venv/bin/pytest -q                                   # все тесты (поднимают настоящий mTLS-апстрим)
-venv/bin/pytest -q tests/test_gateway.py::test_stream  # один тест
-venv/bin/uvicorn --factory gateway.app:create_app --host 0.0.0.0 --port 7700   # ручной запуск
-./gwtoken create|list|revoke|usage                   # токены; сам перезапускается из venv/
+venv/bin/pytest -q                                   # все тесты (~20 с, офлайн; поднимают настоящий mTLS-апстрим)
+venv/bin/pytest -q tests/test_loop.py::test_cancel_keeps_history_valid   # один тест
+venv/bin/uvicorn --factory gateway.app:create_app --host 0.0.0.0 --port 7700   # ручной запуск шлюза
+./gwtoken create|list|revoke|usage|agent             # токены; `agent <имя> <профиль>|--off` — доступ к /agent/*
+GW_TOKEN=gw-… ./gwagent [-p "задача"]                # CLI-агент; оба скрипта перезапускаются из venv/
 ```
-- Продакшен — user-юнит `~/.config/systemd/user/llm-gateway.service` (вне репозитория: `EnvironmentFile=.env`, порт `${PORT}`, `MemoryMax=300M`). После правок Python — `systemctl --user restart llm-gateway`; `chat/` — статика, перезапуск не нужен. Логи: `journalctl --user -u llm-gateway -f`.
+- Продакшен — user-юнит `~/.config/systemd/user/llm-gateway.service` (вне репозитория: `EnvironmentFile=.env`, порт `${PORT}`, `MemoryMax=300M`). После правок Python и `config/agent.json` — `systemctl --user restart llm-gateway`; `chat/` — статика. Логи: `journalctl --user -u llm-gateway -f`.
 - С 2026-10-16 сервис **остановлен и disabled** — ждёт реальных `UPSTREAM_BASE_URL` и сертификатов в `certs/`. Не включать без запроса владельца.
-- Линтера/форматтера в проекте нет.
+- Линтера/форматтера нет. Мало RAM — тесты не запускать параллельно с тяжёлыми задачами.
 
 ## Архитектура
-- `gateway/config.py` — `Settings.from_env()` читает `.env` из корня проекта (load_dotenv при импорте). Относительные пути (`CLIENT_CERT`, `DB_PATH`, `CA_BUNDLE` — несколько через запятую) резолвятся от корня. `MODEL_MAX_CONNECTIONS` и `CORS_ALLOW_ORIGINS` — JSON. `GATEWAY_MODE` по умолчанию `PROD` (без `/docs`).
-- `gateway/tokens.py` — `TokenStore` на SQLite (`data/gateway.db`, WAL, autocommit): таблица `tokens` (только sha256 + префикс `raw[:10]`, срок, `models` через запятую, `rpm`) и `usage` (по запросу: путь, модель, статус, токены, мс; тексты не пишутся). `find()` ищет по имени или префиксу и возвращает `None` при неоднозначности.
-- `gateway/app.py` — вся логика внутри фабрики `create_app(settings, store, transport)` (замыкания, не глобалы); uvicorn запускается с `--factory`.
-  - `lifespan` строит `ssl.SSLContext` (CA + клиентский cert/key). Ошибка загрузки сертификата или пустой URL **не роняют процесс** — пишутся в `app.state.config_error`, и все `/v1/*` отвечают 503 `gateway_not_configured` (чтобы systemd не уходил в цикл рестартов). `httpx.AsyncClient` создаётся с `trust_env=False`: системные `HTTP(S)_PROXY` намеренно игнорируются, прокси — только явный `UPSTREAM_PROXY`.
-  - `authenticate` (Depends): `Authorization: Bearer` или `x-api-key` → lookup → проверка активности → `RateLimiter` (скользящее окно 60 с в памяти процесса).
-  - `POST /v1/{path}` проксирует только `PROXIED_POST` (`chat/completions`, `completions`, `embeddings`); проверяет allowlist моделей токена, лимит тела, берёт семафор `ModelLimiter` на модель. Для stream-чата принудительно добавляет `stream_options.include_usage`, а `relay()` выуживает `usage` из SSE-строк, не меняя поток. Семафор освобождается и расход пишется в `finish()` — на всех путях (ошибка соединения, не-SSE ответ, обрыв стрима, 499 при отмене клиентом). При правках сохранять этот инвариант.
-  - `GET /v1/models` фильтрует список по allowlist токена. `/health` дёргает апстримный `/models`.
-  - Ошибки — `GatewayError` → тело в формате OpenAI (`{"error": {message, type, code, param}}`); ошибки апстрима классифицируются в `upstream_failure` (504 timeout / 502 TLS / 502 unavailable), полная цепочка причин — в лог через `describe()`.
-- `chat/index.html` — одностраничный чат без сборки, монтируется на `/chat` (`/` редиректит туда); токен хранит в `localStorage`, ходит в `/v1/models` и `/v1/chat/completions` того же origin (поэтому CORS по умолчанию выключен).
+Два пакета: `gateway/` (FastAPI) и `agent/` (ядро агента, **не импортирует FastAPI**). Подробно — `docs/wiki/architecture.md`.
+
+**Шлюз**
+- `gateway/config.py` — `Settings.from_env()` читает `.env` из корня (load_dotenv при импорте, существующие переменные окружения главнее). Относительные пути резолвятся от корня. `AGENT_CONFIG` — профили агента (`config/agent.json`, gitignored).
+- `gateway/tokens.py` — `TokenStore` (SQLite `data/gateway.db`, WAL): `tokens` (sha256, префикс, срок, allowlist моделей, rpm, `agent_profile` — добавляется миграцией `ALTER TABLE` для старых баз) и `usage` (агентские обращения к модели — с путём `agent`).
+- `gateway/app.py` — всё внутри фабрики `create_app(settings, store, transport)` (замыкания; uvicorn с `--factory`). Ошибка сертификата/пустой URL не роняют процесс → `app.state.config_error`, `/v1/*` и `/agent/*/messages` отвечают 503 `gateway_not_configured`. httpx-клиент с `trust_env=False` (системные прокси намеренно игнорируются). В `POST /v1/{path}` семафор `ModelLimiter` освобождается и расход пишется в `finish()` на всех путях — сохранять этот инвариант.
+- `gateway/agent_api.py` — `AgentService` + `mount()`: `/agent/*` с SSE. Переиспользует `authenticate`, `upstream()`, `upstream_headers()` и `GatewayError` из `create_app`; модель зовётся напрямую mTLS-клиентом (`app.state.client`), не через `/v1`. Идущий запрос — `Run` (задача + очередь событий + futures подтверждений); разрыв SSE отменяет задачу. MCP-менеджеры — по одному на профиль, закрываются в lifespan.
+
+**Ядро `agent/`**
+- `loop.py` — `Agent.run(text)` — асинхронный генератор событий-словарей (их одинаково потребляют CLI, SSE и тесты). Вызовы инструментов последовательны; каждое сообщение сразу пишется в SQLite. Инвариант: на каждый `tool_calls[i].id` в истории есть `tool`-сообщение (при отмене — «Отменено пользователем»), иначе апстрим отвергнет историю.
+- `runtime.py` — сборка `Agent` по настройкам (`BUILTIN`-реестр инструментов, MCP, хуки); единая точка для CLI и сервера.
+- `settings.py` — `DEFAULTS` + `SCHEMA` (валидатор `schema.py`, он же проверяет аргументы инструментов). Новый ключ = `DEFAULTS` + `SCHEMA` + строка в `docs/wiki/settings.md`.
+- `permissions.py` — порядок: deny-правила → решение хука `PreToolUse` → allow (+ правила «всегда» сессии) → ask → режим/умолчание инструмента (`Tool.default_permission`). Шаблон правила сравнивается с `Tool.subject(args)`.
+- `hooks.py` — внешние команды: JSON на stdin, код 2 = блок, stdout-JSON = решение/`updated_input`/`additional_context`.
+- `mcp.py` — свой клиент MCP (stdio и Streamable HTTP); инструменты — `mcp__<сервер>__<имя>`.
+- `tools/` — `files.py` (все пути через `resolve()` внутри workspace), `shell.py` (не песочница: урезанное окружение, группа процессов, таймаут), `web.py` (SSRF-проверка каждого хоста и редиректа).
+- `store.py` — сессии в SQLite; версия схемы в таблице `agent_meta`, **не** в `PRAGMA user_version` (база на сервере общая с токенами).
+- `cli.py` — `gwagent`.
+
+`chat/index.html` — одностраничный чат без сборки, режимы «Чат» (`/v1`) и «Агент» (`/agent/*`).
 
 ## Тесты
-`tests/test_gateway.py` генерирует PKI через `cryptography` (CA, серверный и клиентский сертификаты), поднимает в потоке uvicorn-апстрим с `ssl_cert_reqs=CERT_REQUIRED` (фикстура `upstream_url`, scope session) и создаёт шлюз через фикстуру `make(**overrides)`, которая переопределяет поля `Settings`. Апстрим складывает полученные запросы в `SEEN` (чистится в `make`). Новые тесты — по этому образцу, без моков TLS.
+- Общие подделки — `tests/fakes.py`: PKI, mTLS-апстрим (`upstream`) со сценарием `SCRIPT` (ответы ассистента с `tool_calls`, отдаются SSE-потоком кусками), `SEEN`, `ServerThread`, `scripted_transport` (MockTransport для цикла без сети). Фикстуры — `tests/conftest.py` (`make(**поля Settings)` → `(TestClient, TokenStore)`, чистит `SEEN`/`SCRIPT`).
+- `async def test_*` запускает хук в `conftest.py` (pytest-asyncio не нужен).
+- Всё офлайн: сайты, поисковик, MCP-серверы — локальные (`tests/fixtures/`). Без моков TLS.

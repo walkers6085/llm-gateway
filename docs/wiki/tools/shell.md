@@ -1,5 +1,7 @@
 # Инструмент: shell
 
+Инструмент `shell` выполняет команду оболочки в рабочей папке сессии.
+
 Код: [`agent/tools/shell.py`](../../../agent/tools/shell.py). Тесты: [`tests/test_tools_shell.py`](../../../tests/test_tools_shell.py).
 
 | Аргумент | Описание |

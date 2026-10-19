@@ -33,7 +33,7 @@ agent_messages (
 agent_tool_runs (               -- журнал аудита вызовов инструментов
   session_id, call_id, tool,
   args TEXT,                    -- JSON аргументов (после правки хуком)
-  decision TEXT,                -- allow | deny | ask:allow | ask:deny | hook:deny | error …
+  decision TEXT,                -- allow | deny | ask:allow | ask:deny | error (вызов не дошёл до прав)
   ok INTEGER, ms INTEGER, ts REAL
 )
 agent_meta (key, value)         -- schema_version

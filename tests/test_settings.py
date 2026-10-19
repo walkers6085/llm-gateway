@@ -107,3 +107,11 @@ def test_schema_errors(value, schema, msg):
 def test_schema_accepts_union_and_extra():
     validate(None, {"type": ["number", "null"]})
     validate({"a": 1, "b": 2}, {"type": "object", "properties": {"a": {"type": "integer"}}})
+
+
+def test_example_server_config_is_valid():
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    profiles = st.load_profiles(root / "config" / "agent.json.example")
+    assert {"default", "readonly", "power"} <= set(profiles)
+    assert profiles["readonly"]["permissions"]["mode"] == "read_only"

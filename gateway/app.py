@@ -20,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from .agent_api import AgentService, mount as mount_agent
 from .config import ROOT, Settings
 from .tokens import Token, TokenStore
 
@@ -159,6 +160,7 @@ def create_app(settings: Settings | None = None, store: TokenStore | None = None
             **kwargs,
         )
         yield
+        await app.state.agent.close()
         await app.state.client.aclose()
 
     app = FastAPI(
@@ -232,6 +234,9 @@ def create_app(settings: Settings | None = None, store: TokenStore | None = None
         if not isinstance(body, dict):
             raise GatewayError(400, "Тело запроса должно быть JSON-объектом")
         return body
+
+    app.state.agent = AgentService(settings, store, lambda: app.state.client, upstream_headers)
+    mount_agent(app, app.state.agent, authenticate, upstream, GatewayError)
 
     @app.get("/", include_in_schema=False)
     async def root():

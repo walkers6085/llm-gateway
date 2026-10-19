@@ -1,0 +1,26 @@
+{
+  "profiles": {
+    "default": {
+      "max_steps": 30,
+      "permissions": {
+        "allow": ["shell(ls*)", "shell(cat *)", "shell(git status*)", "shell(git diff*)"],
+        "deny": ["shell(*sudo*)", "shell(*rm -rf /*)"]
+      },
+      "network": { "deny_domains": ["internal.corp"] },
+      "hooks": {
+        "PreToolUse": [{ "matcher": "shell", "command": "$GATEWAY_ROOT/config/hooks/check_shell.py", "timeout": 10 }]
+      }
+    },
+    "readonly": {
+      "tools": { "enabled": ["read_file", "list_dir", "glob", "grep", "web_search", "web_fetch"] },
+      "permissions": { "mode": "read_only" }
+    },
+    "power": {
+      "max_steps": 60,
+      "permissions": { "mode": "allow_all", "deny": ["shell(*sudo*)"] },
+      "mcp": { "servers": {
+        "fs": { "type": "stdio", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/srv/shared"] }
+      } }
+    }
+  }
+}

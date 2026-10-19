@@ -1,5 +1,7 @@
 """Сборка агента по настройкам: встроенные инструменты + MCP + хуки. Общая для CLI и сервера."""
 
+import os
+
 from .hooks import Hooks
 from .llm import LLMClient
 from .loop import Agent, Approver
@@ -33,7 +35,10 @@ async def start_mcp(settings: dict) -> MCPManager:
 
 
 def make_agent(*, llm: LLMClient, settings: dict, store: SessionStore, session: Session,
-               mcp: MCPManager | None = None, approver: Approver | None = None, on_usage=None) -> Agent:
-    hooks = Hooks(settings["hooks"], cwd=session.workspace, session_id=session.id)
+               mcp: MCPManager | None = None, approver: Approver | None = None, on_usage=None,
+               hook_env: dict | None = None) -> Agent:
+    """hook_env — дополнительные переменные окружения для хуков (сервер передаёт GATEWAY_ROOT)."""
+    hooks = Hooks(settings["hooks"], cwd=session.workspace, session_id=session.id,
+                  env={**os.environ, **(hook_env or {})})
     return Agent(llm=llm, registry=make_registry(settings, mcp), settings=settings, store=store,
                  session=session, hooks=hooks, approver=approver, on_usage=on_usage)

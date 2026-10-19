@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS tokens (
     expires REAL,
     revoked REAL,
     models TEXT NOT NULL DEFAULT '',
-    rpm INTEGER NOT NULL DEFAULT 0
+    rpm INTEGER NOT NULL DEFAULT 0,
+    agent_profile TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS usage (
     token_id INTEGER NOT NULL,
@@ -49,6 +50,7 @@ class Token:
     revoked: float | None
     models: tuple[str, ...]
     rpm: int
+    agent_profile: str = ""  # профиль агента из config/agent.json; пусто — агент недоступен
 
     @property
     def active(self) -> bool:
@@ -72,6 +74,7 @@ def _row_to_token(row: sqlite3.Row) -> Token:
         revoked=row["revoked"],
         models=tuple(m for m in row["models"].split(",") if m),
         rpm=row["rpm"],
+        agent_profile=row["agent_profile"],
     )
 
 
@@ -82,15 +85,19 @@ class TokenStore:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
+        columns = {r["name"] for r in self.db.execute("PRAGMA table_info(tokens)")}
+        if "agent_profile" not in columns:  # база создана до появления агента
+            self.db.execute("ALTER TABLE tokens ADD COLUMN agent_profile TEXT NOT NULL DEFAULT ''")
 
     def create(self, name: str, days: float | None = None, models: list[str] | None = None,
-               rpm: int = 0) -> tuple[str, Token]:
+               rpm: int = 0, agent_profile: str = "") -> tuple[str, Token]:
         raw = TOKEN_PREFIX + secrets.token_urlsafe(32)
         now = time.time()
         expires = now + days * 86400 if days else None
         cur = self.db.execute(
-            "INSERT INTO tokens (name, hash, prefix, created, expires, models, rpm) VALUES (?,?,?,?,?,?,?)",
-            (name, hash_token(raw), raw[:10], now, expires, ",".join(models or []), rpm),
+            "INSERT INTO tokens (name, hash, prefix, created, expires, models, rpm, agent_profile) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (name, hash_token(raw), raw[:10], now, expires, ",".join(models or []), rpm, agent_profile),
         )
         return raw, self.get(cur.lastrowid)
 
@@ -114,6 +121,9 @@ class TokenStore:
 
     def revoke(self, token_id: int) -> None:
         self.db.execute("UPDATE tokens SET revoked=? WHERE id=? AND revoked IS NULL", (time.time(), token_id))
+
+    def set_agent_profile(self, token_id: int, profile: str) -> None:
+        self.db.execute("UPDATE tokens SET agent_profile=? WHERE id=?", (profile, token_id))
 
     def record(self, token_id: int, path: str, model: str | None, status: int,
                prompt_tokens: int = 0, completion_tokens: int = 0, ms: int = 0) -> None:

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Выдача и отзыв токенов LLM Gateway.
 
-  gwtoken create <имя> [--days 30] [--models m1,m2] [--rpm 30]
+  gwtoken create <имя> [--days 30] [--models m1,m2] [--rpm 30] [--agent <профиль>]
+  gwtoken agent <имя|префикс> <профиль> | --off
   gwtoken list
   gwtoken revoke <имя|префикс>
   gwtoken usage [<имя>] [--days 7]
@@ -45,6 +46,11 @@ def main() -> int:
     c.add_argument("--days", type=float, help="срок действия в днях (по умолчанию бессрочно)")
     c.add_argument("--models", default="", help="разрешённые модели через запятую (по умолчанию все)")
     c.add_argument("--rpm", type=int, default=0, help="лимит запросов в минуту (0 — без лимита)")
+    c.add_argument("--agent", default="", help="профиль агента из config/agent.json (по умолчанию агент недоступен)")
+    a = sub.add_parser("agent", help="выдать или забрать доступ к агенту")
+    a.add_argument("name")
+    a.add_argument("profile", nargs="?", default="")
+    a.add_argument("--off", action="store_true", help="забрать доступ")
     sub.add_parser("list", help="список токенов")
     r = sub.add_parser("revoke", help="отозвать токен")
     r.add_argument("name")
@@ -58,21 +64,34 @@ def main() -> int:
     if args.cmd == "create":
         models = [m.strip() for m in args.models.split(",") if m.strip()]
         try:
-            raw, t = store.create(args.name, days=args.days, models=models, rpm=args.rpm)
+            raw, t = store.create(args.name, days=args.days, models=models, rpm=args.rpm,
+                                  agent_profile=args.agent)
         except sqlite3.IntegrityError:
             print(f"Токен с именем {args.name!r} уже есть", file=sys.stderr)
             return 1
         print(raw)
         print(f"# {t.name}: до {fmt_ts(t.expires)}, модели: {','.join(t.models) or 'все'}, "
-              f"rpm: {t.rpm or '∞'}. Токен показан один раз — сохраните его.", file=sys.stderr)
+              f"rpm: {t.rpm or '∞'}, агент: {t.agent_profile or 'нет'}. Токен показан один раз — сохраните его.",
+              file=sys.stderr)
+    elif args.cmd == "agent":
+        t = store.find(args.name)
+        if t is None:
+            print(f"Не найден (или неоднозначен): {args.name}", file=sys.stderr)
+            return 1
+        if not args.off and not args.profile:
+            print("Укажите профиль или --off", file=sys.stderr)
+            return 1
+        store.set_agent_profile(t.id, "" if args.off else args.profile)
+        print(f"{t.name}: агент {'выключен' if args.off else 'профиль ' + args.profile}")
     elif args.cmd == "list":
         stats = {row["name"]: row for row in _totals(store, 30)}
         print(f"{'имя':<20} {'префикс':<12} {'статус':<8} {'создан':<10} {'до':<10} {'rpm':>4} "
-              f"{'запр.30д':>8} {'токенов30д':>10}  модели")
+              f"{'запр.30д':>8} {'токенов30д':>10} {'агент':<10} модели")
         for t in store.all():
             s = stats.get(t.name)
             print(f"{t.name:<20} {t.prefix:<12} {status(t):<8} {fmt_ts(t.created):<10} {fmt_ts(t.expires):<10} "
-                  f"{t.rpm or '∞':>4} {s['requests'] if s else 0:>8} {s['tokens'] if s else 0:>10}  "
+                  f"{t.rpm or '∞':>4} {s['requests'] if s else 0:>8} {s['tokens'] if s else 0:>10} "
+                  f"{t.agent_profile or '—':<10} "
                   f"{','.join(t.models) or 'все'}")
     elif args.cmd == "revoke":
         t = store.find(args.name)

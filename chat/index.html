@@ -50,20 +50,31 @@ main { flex: 1; overflow-y: auto; padding: 16px; }
 footer { padding: 12px 16px; background: var(--panel); border-top: 1px solid var(--border); }
 form { max-width: 820px; margin: 0 auto; display: flex; gap: 8px; align-items: flex-end; }
 #input { flex: 1; resize: none; min-height: 44px; max-height: 200px; }
-@media (max-width: 600px) { #token, #model { width: 100%; max-width: none; } }
+.tool { border: 1px solid var(--border); border-radius: 10px; background: var(--panel); font-size: 13.5px; }
+.tool summary { cursor: pointer; padding: 6px 10px; display: flex; gap: 8px; align-items: baseline; overflow: hidden; }
+.tool summary code { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.tool .st { width: 1em; flex: none; } .tool .st.ok { color: #2e7d32; } .tool .st.bad { color: var(--error); }
+.tool pre { margin: 0 10px 8px; background: var(--code); padding: 8px; border-radius: 6px; overflow-x: auto;
+  white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow-y: auto; }
+.perm { margin: 0 10px 8px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.perm span { flex: 1 1 100%; color: var(--muted); }
+#session { min-width: 160px; max-width: 280px; }
+@media (max-width: 600px) { #token, #model, #session { width: 100%; max-width: none; } }
 </style>
 </head>
 <body>
 <header>
   <h1>LLM Чат</h1>
+  <select id="mode" title="Режим"><option value="chat">Чат</option><option value="agent">Агент</option></select>
   <input id="token" type="password" placeholder="Токен gw-…" autocomplete="off">
   <select id="model"><option value="">— модель —</option></select>
+  <select id="session" hidden title="Сессия агента"></select>
   <button id="reload" title="Обновить список моделей">↻</button>
   <span id="status"></span>
   <span class="spacer"></span>
   <button id="new">Новый чат</button>
 </header>
-<details>
+<details id="params">
   <summary>Системный промпт и параметры</summary>
   <textarea id="system" placeholder="Например: Отвечай кратко и по-русски."></textarea>
   <label>Температура <input id="temperature" type="number" min="0" max="2" step="0.1" value="0.7" style="width:80px"></label>
@@ -84,6 +95,9 @@ const store = {
 };
 let history = [];
 let controller = null;
+let mode = store.get("gw_mode") === "agent" ? "agent" : "chat";
+let agentSession = store.get("gw_agent_session") || null;
+let cards = {};
 
 $("token").value = store.get("gw_token");
 $("system").value = store.get("gw_system");
@@ -210,28 +224,202 @@ async function send(text) {
   }
 }
 
+// ---------- режим агента (/agent/*, docs/wiki/web-chat.md) ----------
+
+function clearLog(text) {
+  $("log").innerHTML = text ? `<div class="empty">${escapeHtml(text)}</div>` : "";
+  cards = {};
+}
+
+function safeJson(s) { try { return typeof s === "string" ? JSON.parse(s || "{}") : (s || {}); } catch { return s; } }
+function shortArgs(a) { const t = typeof a === "string" ? a : JSON.stringify(a); return t.length > 120 ? t.slice(0, 119) + "…" : t; }
+
+function toolCard(id, name, args) {
+  const empty = document.querySelector(".empty"); if (empty) empty.remove();
+  const el = document.createElement("details");
+  el.className = "tool";
+  el.innerHTML = `<summary><span class="st">…</span><b></b><code></code></summary><pre class="args"></pre><pre class="result" hidden></pre>`;
+  el.querySelector("b").textContent = name;
+  el.querySelector("code").textContent = shortArgs(args);
+  el.querySelector(".args").textContent = typeof args === "string" ? args : JSON.stringify(args, null, 2);
+  $("log").appendChild(el);
+  el.scrollIntoView({ block: "end" });
+  cards[id] = el;
+  return el;
+}
+
+function setToolResult(el, ok, content, ms) {
+  const st = el.querySelector(".st");
+  st.textContent = ok ? "✓" : "✗"; st.className = "st " + (ok ? "ok" : "bad");
+  const res = el.querySelector(".result");
+  res.hidden = false; res.textContent = content + (ms != null ? `\n\n(${ms} мс)` : "");
+  el.querySelector(".perm")?.remove();
+}
+
+function askPermission(ev) {
+  const el = cards[ev.id] || toolCard(ev.id, ev.name, ev.arguments);
+  el.open = true;
+  el.querySelector(".st").textContent = "?";
+  const box = document.createElement("div");
+  box.className = "perm";
+  box.innerHTML = `<span></span><button class="primary" data-d="allow">Разрешить</button><button data-d="deny">Запретить</button><button data-d="always">Всегда</button>`;
+  const why = ev.reason && ev.reason !== "требует подтверждения" ? ` (${ev.reason})` : "";
+  box.querySelector("span").textContent = `Нужно подтверждение${why}. «Всегда» добавит правило ${ev.rule}`;
+  box.addEventListener("click", async (e) => {
+    const decision = e.target.dataset?.d; if (!decision) return;
+    box.querySelectorAll("button").forEach(b => b.disabled = true);
+    const resp = await fetch(`/agent/sessions/${agentSession}/approve`, {
+      method: "POST", headers: headers(), body: JSON.stringify({ id: ev.id, decision }) });
+    if (!resp.ok) { setStatus(await apiError(resp), true); box.querySelectorAll("button").forEach(b => b.disabled = false); return; }
+    box.remove(); el.querySelector(".st").textContent = "…";
+  });
+  el.appendChild(box);
+  el.scrollIntoView({ block: "end" });
+}
+
+async function loadSessions() {
+  if (!$("token").value.trim()) return;
+  const resp = await fetch("/agent/sessions", { headers: headers() });
+  if (!resp.ok) {
+    setStatus(await apiError(resp), true);
+    $("session").innerHTML = '<option value="">агент недоступен</option>';
+    return;
+  }
+  const data = (await resp.json()).data || [];
+  $("session").innerHTML = '<option value="">— новая сессия —</option>' +
+    data.map(x => `<option value="${escapeHtml(x.id)}">${escapeHtml(x.title || x.id)}</option>`).join("");
+  if (!data.some(x => x.id === agentSession)) agentSession = null;
+  $("session").value = agentSession || "";
+}
+
+async function openSession(id) {
+  agentSession = id || null;
+  store.set("gw_agent_session", agentSession || "");
+  clearLog(id ? "" : "Новая сессия агента: опишите задачу. Инструменты выполняются на сервере.");
+  if (!id) return;
+  const resp = await fetch(`/agent/sessions/${id}`, { headers: headers() });
+  if (!resp.ok) { setStatus(await apiError(resp), true); return; }
+  const s = await resp.json();
+  const ok = Object.fromEntries((s.tool_runs || []).map(r => [r.call_id, r.ok]));
+  for (const m of s.messages) {
+    if (m.role === "user") addMessage("user", m.content);
+    else if (m.role === "assistant") {
+      if (m.content) addMessage("assistant", m.content);
+      for (const c of m.tool_calls || []) toolCard(c.id, c.function.name, safeJson(c.function.arguments));
+    } else if (m.role === "tool" && cards[m.tool_call_id]) {
+      setToolResult(cards[m.tool_call_id], ok[m.tool_call_id] ?? false, m.content);
+    }
+  }
+  if (s.running) setStatus("в сессии идёт запрос (открыт в другой вкладке?)");
+}
+
+async function sendAgent(text) {
+  const model = $("model").value;
+  if (!agentSession) {
+    if (!model) { setStatus("выберите модель", true); return; }
+    const resp = await fetch("/agent/sessions", { method: "POST", headers: headers(), body: JSON.stringify({ model }) });
+    if (!resp.ok) { setStatus(await apiError(resp), true); return; }
+    agentSession = (await resp.json()).id;
+    store.set("gw_agent_session", agentSession);
+  }
+  const empty = document.querySelector(".empty"); if (empty) empty.remove();
+  addMessage("user", text);
+  controller = new AbortController();
+  busy(true); setStatus("агент работает…");
+  let el = null, answer = "", prompt = 0, completion = 0;
+  const started = performance.now();
+  const handle = (ev) => {
+    switch (ev.type) {
+      case "text":
+        if (!el) { el = addMessage("assistant", ""); answer = ""; }
+        answer += ev.text; el.innerHTML = renderMarkdown(answer); el.scrollIntoView({ block: "end" }); break;
+      case "assistant": el = null; break;
+      case "tool_call": toolCard(ev.id, ev.name, ev.arguments); break;
+      case "permission_request": askPermission(ev); setStatus("ждёт подтверждения"); break;
+      case "tool_result":
+        setToolResult(cards[ev.id] || toolCard(ev.id, ev.name, ""), ev.ok, ev.content, ev.ms);
+        setStatus("агент работает…"); break;
+      case "usage": prompt += ev.prompt_tokens; completion += ev.completion_tokens; break;
+      case "warning": setStatus(ev.message, true); break;
+      case "error": { const e = addMessage("assistant", ""); e.classList.add("error"); e.textContent = ev.message; break; }
+      case "done": {
+        const meta = document.createElement("div"); meta.className = "meta";
+        const secs = ((performance.now() - started) / 1000).toFixed(1);
+        const why = { stop: "", max_steps: " · лимит шагов", cancelled: " · отменено", error: " · ошибка", blocked: " · заблокировано" }[ev.reason] ?? "";
+        meta.textContent = `${secs} с · токенов: ${prompt} → ${completion}${why}`;
+        $("log").appendChild(meta); meta.scrollIntoView({ block: "end" }); break;
+      }
+    }
+  };
+  try {
+    const resp = await fetch(`/agent/sessions/${agentSession}/messages`, {
+      method: "POST", headers: headers(), signal: controller.signal, body: JSON.stringify({ content: text }) });
+    if (!resp.ok) throw new Error(await apiError(resp));
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const blocks = buf.split("\n\n"); buf = blocks.pop();
+      for (const block of blocks) {
+        const data = block.split("\n").filter(l => l.startsWith("data:")).map(l => l.slice(5).trim()).join("");
+        if (data) { try { handle(JSON.parse(data)); } catch (e) { console.error(e); } }
+      }
+    }
+    setStatus("");
+  } catch (e) {
+    if (e.name === "AbortError") setStatus("остановлено");
+    else { const m = addMessage("assistant", ""); m.classList.add("error"); m.textContent = "Ошибка: " + e.message; setStatus("ошибка", true); }
+  } finally {
+    controller = null; busy(false); $("input").focus();
+    loadSessions();
+  }
+}
+
+function applyMode() {
+  const agent = mode === "agent";
+  $("mode").value = mode;
+  $("session").hidden = !agent;
+  $("params").hidden = agent;
+  controller?.abort();
+  if (agent) { loadSessions().then(() => openSession(agentSession)); }
+  else { history = []; clearLog("Введите токен, выберите модель и задайте вопрос."); }
+}
+
 $("form").addEventListener("submit", (e) => {
   e.preventDefault();
   const text = $("input").value.trim();
   if (!text || controller) return;
   $("input").value = ""; autosize();
-  send(text);
+  if (mode === "agent") sendAgent(text); else send(text);
 });
 $("input").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); $("form").requestSubmit(); }
 });
 function autosize() { const t = $("input"); t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, 200) + "px"; }
 $("input").addEventListener("input", autosize);
-$("stop").addEventListener("click", () => controller?.abort());
+$("stop").addEventListener("click", () => {
+  if (mode === "agent" && agentSession) fetch(`/agent/sessions/${agentSession}/cancel`, { method: "POST", headers: headers() });
+  controller?.abort();
+});
 $("new").addEventListener("click", () => {
   controller?.abort(); history = [];
-  $("log").innerHTML = '<div class="empty">Новый чат.</div>'; $("input").focus();
+  if (mode === "agent") { openSession(null); $("session").value = ""; }
+  else $("log").innerHTML = '<div class="empty">Новый чат.</div>';
+  $("input").focus();
 });
-$("token").addEventListener("change", () => { store.set("gw_token", $("token").value.trim()); loadModels(); });
+$("mode").addEventListener("change", () => { mode = $("mode").value; store.set("gw_mode", mode); applyMode(); });
+$("session").addEventListener("change", () => { controller?.abort(); openSession($("session").value); });
+$("token").addEventListener("change", () => {
+  store.set("gw_token", $("token").value.trim()); loadModels(); if (mode === "agent") loadSessions();
+});
 $("model").addEventListener("change", () => store.set("gw_model", $("model").value));
 $("system").addEventListener("change", () => store.set("gw_system", $("system").value));
 $("reload").addEventListener("click", loadModels);
 if ($("token").value) loadModels();
+if (mode === "agent") applyMode();
 </script>
 </body>
 </html>

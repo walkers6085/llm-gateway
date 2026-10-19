@@ -185,3 +185,10 @@ def test_upstream_not_configured(agent_gw):
         sid = client.post("/agent/sessions", json={"model": "alpha"}, headers=auth(raw)).json()["id"]
         r = client.post(f"/agent/sessions/{sid}/messages", json={"content": "x"}, headers=auth(raw))
     assert r.status_code == 503 and r.json()["error"]["code"] == "gateway_not_configured"
+
+
+def test_chat_page_has_agent_mode(make):
+    client, _ = make()
+    with client:
+        page = client.get("/chat/").text
+    assert '<option value="agent">Агент</option>' in page and "/agent/sessions" in page

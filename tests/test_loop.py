@@ -182,7 +182,11 @@ async def test_cancel_keeps_history_valid(tmp_path):
             pass
 
     task = asyncio.create_task(consume())
-    await asyncio.sleep(0.3)
+    for _ in range(200):   # ждём, пока c1 выполнится и начнётся долгий c2
+        if any(m.get("tool_call_id") == "c1" for m in store.messages(agent.session.id)):
+            break
+        await asyncio.sleep(0.02)
+    await asyncio.sleep(0.05)
     task.cancel()
     try:
         await task

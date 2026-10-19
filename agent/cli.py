@@ -20,6 +20,7 @@ import httpx
 
 from .llm import LLMClient, LLMError
 from .mcp import MCPManager
+from .providers import ProviderManager
 from .runtime import make_agent, make_registry, start_mcp
 from .settings import SettingsError, expand, load
 from .store import Session, SessionStore
@@ -30,6 +31,8 @@ HELP = """Команды:
   /sessions          последние сессии
   /resume <id>       продолжить сессию (достаточно начала id)
   /model [имя]       показать или сменить модель
+  /models            модели текущего подключения
+  /provider [имя]    провайдеры; смена создаёт новую сессию
   /tools             инструменты
   /mcp               MCP-серверы
   /exit              выход (или Ctrl+D)
@@ -97,18 +100,13 @@ class App:
         self.session: Session | None = None
         self.agent = None
         self.task: asyncio.Task | None = None
+        self.providers = ProviderManager(args.providers_file)
+        self.provider = None
+        self.base_model = settings["model"]
 
     # ---------- подготовка ----------
 
     async def start(self) -> None:
-        gw = self.settings["gateway"]
-        token = gw.get("token") or os.environ.get(gw["token_env"], "")
-        if not token:
-            raise SettingsError(f"нет токена шлюза: задайте переменную {gw['token_env']} или gateway.token")
-        self.http = httpx.AsyncClient(base_url=gw["url"].rstrip("/"), trust_env=False,
-                                      timeout=httpx.Timeout(600, connect=15),
-                                      headers={"authorization": f"Bearer {token}"})
-        self.llm = LLMClient(self.http)
         if self.settings["mcp"]["servers"]:
             self.mcp = await start_mcp(self.settings)
             for name, error in self.mcp.errors.items():
@@ -116,17 +114,50 @@ class App:
         self.session = await self.pick_session()
         self.rebuild()
 
+    async def connect_provider(self, name, close_previous=True):
+        if name is not None:
+            connection = self.providers.connection(name, self.args.model)
+            url, token = connection.url, connection.token
+            model = connection.model
+        else:
+            gw = self.settings["gateway"]
+            token = gw.get("token") or os.environ.get(gw["token_env"], "")
+            if not token:
+                raise SettingsError(f"нет токена шлюза: задайте переменную {gw['token_env']} или gateway.token")
+            url, model = gw["url"], self.base_model
+        http = httpx.AsyncClient(base_url=url.rstrip("/"), trust_env=False,
+                                timeout=httpx.Timeout(600, connect=15),
+                                headers={"authorization": f"Bearer {token}"} if token else {})
+        if self.http and close_previous:
+            await self.http.aclose()
+        self.http, self.llm = http, LLMClient(http)
+        self.provider = name
+        self.settings["model"] = model
+
+    async def activate_session(self, session, enforce_explicit=False):
+        name = session.profile.removeprefix("provider:") if session.profile.startswith("provider:") else None
+        if enforce_explicit and self.args.provider and name != self.args.provider:
+            raise SettingsError("сессия принадлежит другому провайдеру; возобновите без --provider или создайте новую")
+        if name != self.provider or self.http is None:
+            await self.connect_provider(name)
+        return session
+
+    def create_session(self, model):
+        return self.store.create(OWNER, model=model, workspace=str(self.workspace),
+                                 profile=f"provider:{self.provider}" if self.provider else "")
+
     async def pick_session(self) -> Session:
         if self.args.resume:
             s = self.store.find(self.args.resume, owner=OWNER)
             if s is None:
                 raise SettingsError(f"сессия {self.args.resume!r} не найдена (или префикс неоднозначен)")
-            return s
+            return await self.activate_session(s, enforce_explicit=True)
         if self.args.continue_:
             for s in self.store.list(OWNER, limit=200):
                 if s.workspace == str(self.workspace):
-                    return s
-        return self.store.create(OWNER, model=await self.default_model(), workspace=str(self.workspace))
+                    return await self.activate_session(s, enforce_explicit=True)
+        await self.connect_provider(self.args.provider or (self.providers.config["default"] if self.args.providers_file or self.providers.path.exists() else None))
+        return self.create_session(await self.default_model())
 
     async def default_model(self) -> str:
         if self.settings["model"]:
@@ -250,7 +281,7 @@ class App:
         if cmd == "/help":
             con.line(HELP)
         elif cmd == "/new":
-            self.session = self.store.create(OWNER, model=self.session.model, workspace=str(self.workspace))
+            self.session = self.create_session(self.session.model)
             self.rebuild()
             con.line(f"Новая сессия {self.session.id}")
         elif cmd == "/sessions":
@@ -263,9 +294,43 @@ class App:
             if s is None:
                 con.line("Не найдена (или префикс неоднозначен): /resume <id>", err=True)
             else:
-                self.session = s
+                try:
+                    self.session = await self.activate_session(s)
+                except (ValueError, SettingsError) as exc:
+                    con.line(str(exc), err=True)
+                    return None
                 self.rebuild()
                 con.line(f"Сессия {s.id}: {s.title} ({len(self.store.messages(s.id))} сообщений)")
+        elif cmd == "/provider":
+            if not arg:
+                con.line(f"Текущий провайдер: {self.provider or '(gateway из настроек)'}")
+                for name, provider in self.providers.config["providers"].items():
+                    con.line(f"  {name}: {provider['url']} · {provider['model'] or '(без модели)'}")
+            else:
+                # Сначала проверяем подключение и модель, затем меняем текущую сессию.
+                old_provider, old_http, old_llm = self.provider, self.http, self.llm
+                old_model = self.settings["model"]
+                try:
+                    await self.connect_provider(arg, close_previous=False)
+                    model = await self.default_model()
+                except (ValueError, SettingsError, httpx.HTTPError) as exc:
+                    if self.http is not old_http:
+                        await self.http.aclose()
+                    self.provider, self.http, self.llm = old_provider, old_http, old_llm
+                    self.settings["model"] = old_model
+                    con.line(f"Провайдер: {exc}", err=True)
+                    return None
+                if old_http:
+                    await old_http.aclose()
+                self.session = self.create_session(model)
+                self.rebuild()
+                con.line(f"Провайдер: {arg}; модель: {model}; новая сессия {self.session.id}")
+        elif cmd == "/models":
+            try:
+                for model in await self.llm.models():
+                    con.line(model)
+            except (LLMError, httpx.HTTPError) as exc:
+                con.line(f"Модели: {exc}", err=True)
         elif cmd == "/model":
             if arg:
                 self.store.update(self.session.id, model=arg)
@@ -293,6 +358,8 @@ def parse_args(argv):
     p.add_argument("-p", "--prompt", help="выполнить один запрос и выйти")
     p.add_argument("--cwd", help="рабочая папка (по умолчанию текущая)")
     p.add_argument("--model", help="модель")
+    p.add_argument("--provider", help="имя подключения из менеджера провайдеров")
+    p.add_argument("--providers-file", help="JSON провайдеров; без --provider используется default")
     p.add_argument("--settings", help="дополнительный файл настроек JSON")
     p.add_argument("--resume", metavar="ID", help="продолжить сессию")
     p.add_argument("-c", "--continue", dest="continue_", action="store_true",
@@ -330,7 +397,7 @@ async def amain(argv=None, read=input, out=None, err=None) -> int:
                 console.line(console.c("2", f"сессия {app.session.id}"), err=True)
             return 0 if reason == "stop" else 1
         return await app.repl()
-    except SettingsError as exc:
+    except (SettingsError, ValueError, OSError) as exc:
         console.line(f"gwagent: {exc}", err=True)
         return 2
     finally:

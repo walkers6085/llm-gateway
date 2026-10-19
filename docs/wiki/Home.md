@@ -12,6 +12,7 @@ shell, сеть, MCP), права и хуки решают, что можно, �
 - [llm-client.md](llm-client.md) — клиент chat/completions, стрим и сборка tool_calls
 
 ## Настройка
+- [providers.md](providers.md) — именованные подключения и выбор модели для CLI и бенчмарков
 - [settings.md](settings.md) — все ключи JSON-настроек, слои CLI, профили сервера
 - [permissions.md](permissions.md) — правила allow/ask/deny, режимы, подтверждения
 - [hooks.md](hooks.md) — хуки на события агента
@@ -29,6 +30,7 @@ shell, сеть, MCP), права и хуки решают, что можно, �
 - [web-chat.md](web-chat.md) — веб-чат: режимы «Чат» и «Агент»
 
 ## Эксплуатация
+- [bench/README.md](bench/README.md) — бенчмарки качества, скорости и контекстного окна
 - [security.md](security.md) — модель угроз и рекомендации
 - [testing.md](testing.md) — как устроены тесты, как добавлять новые
 - [changelog.md](changelog.md) — история изменений

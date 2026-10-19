@@ -147,3 +147,56 @@ def test_launcher_script(tmp_path):
     env = {**os.environ, "GW_TOKEN": ""}
     r = subprocess.run([str(ROOT / "gwagent"), "--help"], capture_output=True, text=True, env=env, timeout=30)
     assert r.returncode == 0 and "Терминальный агент" in r.stdout
+
+
+async def test_provider_switch_resume_and_missing_key(gw, monkeypatch):
+    from agent.providers import ProviderManager
+    cfg, ws, db = gw
+    providers_file = ws / "providers.json"
+    manager = ProviderManager(providers_file)
+    url = json.loads(cfg.read_text())["gateway"]["url"]
+    manager.add("first", url, "GW_TOKEN", "alpha")
+    manager.add("second", url, "GW_TOKEN", "beta")
+    manager.add("broken", url, "MISSING_TEST_PROVIDER_KEY", "alpha")
+    manager.use("first")
+    monkeypatch.delenv("MISSING_TEST_PROVIDER_KEY", raising=False)
+    SCRIPT.extend([{"content": "один"}, {"content": "два"}])
+    out, err, read = run_cli(["/models", "первый", "/provider broken", "/provider second", "второй", "/exit"])
+    args = ["--cwd", str(ws), "--settings", str(cfg), "--providers-file", str(providers_file)]
+    assert await amain(args, read=read, out=out, err=err) == 0
+    assert [r["body"]["model"] for r in SEEN if r["path"] == "chat"] == ["alpha", "beta"]
+    assert "MISSING_TEST_PROVIDER_KEY" in err.getvalue()
+    sessions = SessionStore(db).list("local")
+    first = next(s for s in sessions if s.profile == "provider:first")
+    second = next(s for s in sessions if s.profile == "provider:second")
+    # Сохранённый провайдер важнее изменившегося default.
+    SCRIPT.append({"content": "продолжаю"})
+    out, err, read = run_cli([])
+    assert await amain(args + ["--resume", second.id, "-p", "дальше"], read=read, out=out, err=err) == 0
+    assert SEEN[-1]["body"]["model"] == "beta"
+    assert [m["content"] for m in SEEN[-1]["body"]["messages"] if m["role"] == "user"] == ["второй", "дальше"]
+    out, err, read = run_cli([])
+    assert await amain(args + ["--provider", "second", "--resume", first.id, "-p", "x"], read=read, out=out, err=err) == 2
+    assert "другому провайдеру" in err.getvalue()
+
+
+async def test_failed_provider_switch_keeps_current_connection(gw, monkeypatch):
+    from agent.llm import LLMClient
+    from agent.providers import ProviderManager
+    cfg, ws, db = gw
+    providers_file = ws / "providers.json"
+    manager = ProviderManager(providers_file)
+    url = json.loads(cfg.read_text())["gateway"]["url"]
+    manager.add("first", url, "GW_TOKEN", "alpha")
+    manager.add("empty", url, "GW_TOKEN")
+    async def empty_models(self):
+        return []
+    monkeypatch.setattr(LLMClient, "models", empty_models)
+    SCRIPT.append({"content": "после ошибки"})
+    out, err, read = run_cli(["/provider empty", "проверка", "/exit"])
+    assert await amain(["--cwd", str(ws), "--settings", str(cfg), "--provider", "first",
+                        "--providers-file", str(providers_file)], read=read, out=out, err=err) == 0
+    assert "ни одной модели" in err.getvalue()
+    assert "после ошибки" in out.getvalue()
+    [session] = SessionStore(db).list("local")
+    assert session.profile == "provider:first" and session.model == "alpha"

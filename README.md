@@ -69,3 +69,20 @@ venv/bin/pytest -q    # поднимает настоящий mTLS-апстри�
 Устройство тестов — [docs/wiki/testing.md](docs/wiki/testing.md).
 Логи: `journalctl --user -u llm-gateway -f`. После правок кода — `systemctl --user restart llm-gateway`
 (страница чата — статика, перезапуск не нужен).
+
+
+## Бенчмарки и провайдеры
+
+Отдельные проверки модели: скорость, контекстное окно, «иголка в стоге сена», арифметика,
+вызовы инструментов, JSON по схеме и цепочки действий. Результаты — JSON и Markdown;
+подробности и ограничения — в [вики бенчмарков](docs/wiki/bench/README.md).
+
+```bash
+venv/bin/python -m bench --model MODEL --quick
+venv/bin/python -m agent.providers add local --url http://127.0.0.1:8000/v1 --model MODEL
+./gwagent --provider local
+venv/bin/python -m bench --provider local --suites tools,structured,chain --quick
+```
+
+[Менеджер провайдеров](docs/wiki/providers.md) общий для CLI агента и бенчмарков:
+именованные URL, модели и ключи из окружения, список моделей и сохранённый выбор подключения.

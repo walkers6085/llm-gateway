@@ -82,3 +82,11 @@ agent_meta (key, value)         -- schema_version
 sqlite3 data/gateway.db "SELECT id, owner, title, datetime(updated,'unixepoch') FROM agent_sessions"
 sqlite3 data/gateway.db "SELECT tool, decision, ok, ms FROM agent_tool_runs WHERE session_id='…'"
 ```
+
+
+## Провайдеры локального CLI
+
+CLI использует существующее поле `profile` со значением `provider:NAME` для привязки к
+[провайдеру](providers.md); миграция SQLite не требуется. Модель остаётся исходным ID API.
+При возобновлении выбирается сохранённое подключение; смена провайдера создаёт новую сессию.
+Профили серверного API продолжают иметь прежнее значение.

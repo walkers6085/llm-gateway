@@ -119,7 +119,7 @@ async def test_turn_checkpoint_covers_shell_and_replays_metrics(tmp_path):
 
 
 async def test_titles_generated_locally_and_custom_preserved(tmp_path):
-    agent,store,_=fixture_agent(tmp_path,[{'content':'готово'}])
+    agent,store,_=fixture_agent(tmp_path,[{'content':'готово'},{'content':'второй ответ'}])
     assert agent.session.title.startswith('Новая сессия ·')
     await run(agent,'## Настройка мониторинга сервера\nПодробности')
     assert store.get(agent.session.id).title=='Настройка мониторинга сервера'

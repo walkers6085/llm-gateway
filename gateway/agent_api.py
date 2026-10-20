@@ -130,6 +130,7 @@ class AgentService:
             agent = None
         if agent is None:
             llm = LLMClient(self.client(), headers=self.upstream_headers(), options=profile['model_options'], limiter=self.model_limiter)
+            await llm.discover_model_limits()
             agent = make_agent(
                 llm=llm, settings=profile, store=self.sessions, session=session,
                 mcp=await self.mcp_for(token.agent_profile, profile),

@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 from .tools.base import Tool
 
 ALLOW, ASK, DENY = "allow", "ask", "deny"
+READ_ONLY_TOOLS = frozenset({"read_file", "list_dir", "glob", "grep", "web_fetch", "web_search", "goal", "todo", "question"})
 MODES = ("default", "allow_all", "read_only")
 
 
@@ -55,6 +56,8 @@ class Permissions:
 
     def decide(self, tool: Tool, args: dict, hook_decision: str | None = None) -> tuple[str, str]:
         """→ (allow|ask|deny, причина). hook_decision — решение хука PreToolUse, если он его вернул."""
+        if self.mode == "read_only" and tool.name not in READ_ONLY_TOOLS:
+            return DENY, "инструмент недоступен в строгом режиме read_only"
         rule = self._first(self.deny, tool, args)
         if rule:
             return DENY, f"запрещено правилом {rule}"
@@ -70,6 +73,8 @@ class Permissions:
         rule = self._first(self.ask, tool, args)
         if rule:
             return self._ask(tool, f"правило {rule}")
+        if self.mode == "read_only":
+            return ALLOW, "инструмент чтения"
         if self.mode == "allow_all":
             return ALLOW, "режим allow_all"
         if tool.default_permission == ALLOW:

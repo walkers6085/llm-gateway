@@ -476,7 +476,8 @@ async def test_dashboard_context_planning_mcp_without_model_then_tool_updates(gw
     try:
         _, events = await receive(proc, 'ready')
         snapshot = next(e for e in events if e['type'] == 'snapshot')
-        assert snapshot['context']['max_input_tokens'] == 32768
+        assert snapshot['context']['max_input_tokens'] == snapshot['context']['context_window'] - snapshot['context']['max_output_tokens']
+        assert snapshot['context']['context_source'] == 'fallback'
         assert snapshot['context']['estimated_tokens'] > 0
         servers = {s['name']: s for s in snapshot['mcp']}
         assert servers['local']['state'] == 'connected' and servers['off']['state'] == 'disabled'
@@ -678,3 +679,53 @@ async def test_opencode_import_model_settings_and_export_dialogs(gw,tmp_path):
         exported=json.loads(output.read_text())['provider']['custom']['models']['chat']
         assert exported['name']=='Понятное имя' and exported['limit']['context']==8448
     finally:await stop(proc)
+
+
+async def test_permissions_picker_persists_session_saves_settings_and_blocks_writes(gw, tmp_path):
+    cfg, ws, db = gw
+    proc = await launch(gw, tmp_path)
+    try:
+        await receive(proc, 'ready')
+        send(proc, type='submit', text='/permissions')
+        _, rows = await receive(proc, 'idle')
+        menu = next(event['selection'] for event in rows if event['type'] == 'table')
+        assert menu['kind'] == 'permissions'
+        assert {item['key'] for item in menu['choices']} == {'allow_all', 'default', 'read_only', 'save'}
+        send(proc, type='submit', text='/permissions read_only save')
+        _, rows = await receive(proc, 'idle')
+        snap = next(event for event in rows if event['type'] == 'snapshot')
+        assert snap['permissions_mode'] == 'read_only'
+        assert snap['session']['permissions_mode'] == 'read_only'
+        saved = json.loads((tmp_path / 'agent-home/settings.json').read_text())
+        assert saved['permissions']['mode'] == 'read_only'
+        SCRIPT.extend([{'tool_calls': [tool_call('blocked', 'write_file', path='blocked.txt', content='x')]}, {'content': 'Запись запрещена'}])
+        send(proc, type='submit', text='Проверить запрет записи')
+        _, rows = await receive(proc, 'idle')
+        assert not any(event['type'] == 'permission_request' for event in rows)
+        assert not (ws / 'blocked.txt').exists()
+        result = next(event for event in rows if event['type'] == 'tool_result')
+        assert not result['ok'] and result['decision'] == 'deny'
+        from agent.store import SessionStore
+        store = SessionStore(db)
+        assert store.get(snap['session']['id']).permissions_mode == 'read_only'
+        store.close()
+    finally:
+        await stop(proc)
+
+
+async def test_cancel_command_after_completed_model_turn():
+    from types import SimpleNamespace
+    bridge = Bridge([], output=io.StringIO())
+    completed = asyncio.create_task(asyncio.sleep(0))
+    await completed
+    bridge.app = SimpleNamespace(task=completed)
+    started = asyncio.Event()
+    async def command():
+        started.set()
+        await asyncio.Event().wait()
+    bridge.work = asyncio.create_task(command())
+    await started.wait()
+    bridge.handle({'type': 'cancel'})
+    with pytest.raises(asyncio.CancelledError):
+        await bridge.work
+    assert completed.done() and not completed.cancelled()

@@ -206,3 +206,9 @@ TUI проверяется в CI на Bun 1.3.8 и 1.3.14: установка и
 применение профилей и их сброс между провайдерами, JSONL-тест — импорт, настройку модели
 и экспорт через диалоги. Карта: agent/opencode.py → tests/test_opencode.py → opencode.md;
 agent/providers.py → те же тесты и test_providers.py → providers.md.
+
+agent/retry.py и agent/context.py → tests/test_retry_cleanup.py → request-processing.md. Проверяются границы backoff, Retry-After, восстановление после 429, отсутствие повторного выполнения инструментов, отмена, новые уточнения, отсутствие повторов после частичного ответа и постоянных ошибок, целостность истории, точность JSON/Unicode и MCP structuredContent. TUI-тест проверяет ожидание 429 и Esc.
+
+Сводка через модель: tests/test_model_compaction.py → agent/compaction.py, store.py, loop.py → [обработка запросов](request-processing.md), [сессии](sessions.md). Проверяются части истории, лимиты, резервный вариант, отмена, трассировка и отказ от устаревшего результата. Строгие права и глобальный стандарт проверяются tests/test_permissions.py; сохранение и блокировка записи через меню — tests/test_tui.py и tui/src/view.test.ts.
+
+Окна моделей: tests/test_model_limits.py → agent/model_limits.py, llm.py, cli.py, loop.py → [обработка запросов](request-processing.md), [настройки](settings.md). Проверяются форматы API, aliases, ручные ограничения, разные провайдеры с одинаковым ID, выбор до первого чата, необязательный каталог, общий бюджет и оценка токенов. Панель окна и источника — tui/src/sidebar.test.ts.

@@ -65,3 +65,9 @@ assistant, включая историю для следующего запро�
 chat/completions; api_model заменяет ID на стороне API, сохраняя локальное имя сессии.
 Ключевые model/messages/stream нельзя заменить произвольным JSON. Модельные лимиты ответа
 применяются через штатный max_tokens/max_completion_tokens. [Обмен OpenCode](opencode.md).
+
+LLMError содержит retryable и retry_after, сообщения ошибок приводятся к ограниченной строке. HTTP Retry-After разбирается в секундах или HTTP-дате; SSE error.code/status распознаёт временные ошибки. Сам LLMClient запросы не повторяет: повтором и отменой управляет Agent. Ошибки формата не помечаются временными. [Повторы](request-processing.md).
+
+Суммаризация использует копию клиента с тем же подключением и семафором, без инструментов, с отдельным лимитом выхода. Основные options/max_tokens не меняются. model.start различает purpose=response/compaction.
+
+LLMClient.models по-прежнему возвращает список ID, дополнительно заполняет model_metadata числовыми лимитами и aliases. discover_model_limits читает каталог один раз для клиента с таймаутом 5 секунд; ошибки каталога не блокируют chat/completions. Новый клиент имеет отдельный каталог.

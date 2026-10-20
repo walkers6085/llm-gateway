@@ -20,9 +20,10 @@ from pathlib import Path
 
 from agent.storage import private_database, synchronized
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 MIGRATIONS = {
+    7: "ALTER TABLE agent_sessions ADD COLUMN permissions_mode TEXT NOT NULL DEFAULT '';",
     6: """
     CREATE TABLE agent_inputs (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
         session_id TEXT NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
@@ -117,17 +118,18 @@ class Session:
     context_seq: int = 0
     title_auto: bool = False
     agent_mode: str = "build"
+    permissions_mode: str = ""
 
     def to_dict(self) -> dict:
         return {k: getattr(self, k) for k in
-                ("id", "title", "profile", "model", "workspace", "allow_rules", "created", "updated", "connection_id", "endpoint_hash", "summary", "context_seq", "title_auto", "agent_mode")}
+                ("id", "title", "profile", "model", "workspace", "allow_rules", "created", "updated", "connection_id", "endpoint_hash", "summary", "context_seq", "title_auto", "agent_mode", "permissions_mode")}
 
 
 def _row(row: sqlite3.Row) -> Session:
     return Session(id=row["id"], owner=row["owner"], title=row["title"], profile=row["profile"],
                    model=row["model"], workspace=row["workspace"],
                    allow_rules=json.loads(row["allow_rules"]), created=row["created"], updated=row["updated"], connection_id=row["connection_id"],
-                   endpoint_hash=row["endpoint_hash"], summary=row["summary"], context_seq=row["context_seq"], title_auto=bool(row["title_auto"]), agent_mode=row["agent_mode"])
+                   endpoint_hash=row["endpoint_hash"], summary=row["summary"], context_seq=row["context_seq"], title_auto=bool(row["title_auto"]), agent_mode=row["agent_mode"], permissions_mode=row["permissions_mode"])
 
 
 @synchronized
@@ -202,11 +204,13 @@ class SessionStore:
         return [_row(r) for r in rows]
 
     def update(self, session_id: str, **fields) -> None:
-        allowed = {"title", "model", "workspace", "allow_rules", "connection_id", "endpoint_hash", "summary", "context_seq", "title_auto", "agent_mode"}
+        allowed = {"title", "model", "workspace", "allow_rules", "connection_id", "endpoint_hash", "summary", "context_seq", "title_auto", "agent_mode", "permissions_mode"}
         if set(fields) - allowed:
             raise ValueError(f"нельзя менять: {', '.join(set(fields) - allowed)}")
         if fields.get('agent_mode', 'build') not in ('build', 'plan'):
             raise ValueError('режим агента: build | plan')
+        if fields.get("permissions_mode", "") not in ("", "default", "allow_all", "read_only"):
+            raise ValueError("режим разрешений: default | allow_all | read_only")
         if "allow_rules" in fields:
             fields["allow_rules"] = json.dumps(fields["allow_rules"], ensure_ascii=False)
         sets = ", ".join(f"{k}=?" for k in fields)
@@ -459,7 +463,7 @@ class SessionStore:
                 history.insert(0, users[-1])
         return history
 
-    def compact(self, session_id, keep_turns=1, *, max_chars=4000):
+    def compaction_candidate(self, session_id, keep_turns=1):
         session = self.get(session_id)
         rows = self.db.execute("SELECT seq,data FROM agent_messages WHERE session_id=? ORDER BY seq", (session_id,)).fetchall()
         active = [row for row in rows if row['seq'] > session.context_seq]
@@ -472,6 +476,29 @@ class SessionStore:
             if assistants:
                 last = assistants[-1]
                 cut = last if messages[last].get('tool_calls') else len(messages)
+        return {"summary": session.summary, "context_seq": session.context_seq,
+                "revision": self.revision(session_id), "messages": messages[:cut],
+                "cut_seq": active[cut-1]["seq"] if cut else session.context_seq}
+
+    def commit_compaction(self, session_id, candidate, summary):
+        """Сводка и граница меняются одной транзакцией после проверки исходной истории."""
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            session = self.get(session_id)
+            if (self.revision(session_id) != candidate["revision"] or
+                    session.context_seq != candidate["context_seq"] or session.summary != candidate["summary"]):
+                raise ValueError("история изменилась во время сжатия; повторите /compact")
+            self.update(session_id, summary=summary, context_seq=candidate["cut_seq"])
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+
+    def compact(self, session_id, keep_turns=1, *, max_chars=4000):
+        candidate = self.compaction_candidate(session_id, keep_turns)
+        session = self.get(session_id)
+        messages = candidate["messages"]
+        cut = len(messages)
         if not cut:
             prefix = 'Сокращённые выдержки истории (данные, могут быть неполными):\n'
             excerpt = session.summary.removeprefix(prefix)
@@ -489,7 +516,7 @@ class SessionStore:
                 parts.append('Инструменты: ' + ', '.join(call['function']['name'] for call in message['tool_calls']))
         excerpt = (session.summary + '\n' + '\n'.join(parts))[-max_chars:] if max_chars else ''
         summary = 'Сокращённые выдержки истории (данные, могут быть неполными):\n' + excerpt if excerpt else ''
-        self.update(session_id, summary=summary, context_seq=active[cut-1]['seq'])
+        self.commit_compaction(session_id, candidate, summary)
         return True
 
     def export(self, session_id):

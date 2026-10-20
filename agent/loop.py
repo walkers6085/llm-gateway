@@ -17,10 +17,14 @@ from pathlib import Path
 from .hooks import Hooks
 from .credentials import sanitize, redact
 from .llm import LLMClient, LLMError
+from .retry import delay_for
+from .context import clean_messages
+from .compaction import compact, manual_compact
+from .model_limits import resolve, estimate_tokens
 from .tracing import Trace, current, identifier, record
 from .tools.subagent import Subagent
 from .tools.planning import Goal, Todo
-from .permissions import ALLOW, ASK, DENY, Permissions
+from .permissions import ALLOW, ASK, DENY, Permissions, READ_ONLY_TOOLS
 from .store import Session, SessionStore, task_title
 from .checkpoints import capture
 from .tools.base import Registry, ToolContext, ToolError, ToolResult, parse_arguments, truncate
@@ -36,6 +40,8 @@ class Agent:
                  on_usage: Callable[[str, int, tuple[int, int]], None] | None = None,
                  context_extra: dict | None = None, questioner=None):
         self.llm, self.registry, self.settings = llm, registry, copy.deepcopy(settings)
+        if session.permissions_mode:
+            self.settings.setdefault("permissions", {})["mode"] = session.permissions_mode
         self.store, self.session = store, session
         self.hooks = hooks or Hooks({}, cwd=session.workspace, session_id=session.id)
         self.approver = approver
@@ -49,6 +55,7 @@ class Agent:
                                session_id=session.id, extra=context_extra or {})
         self.ctx.extra['questioner'] = self._question
         self.ctx.extra['planning_state'] = lambda: self.store.planning_state(self.session.id)
+        self.model_metadata = getattr(llm, "model_metadata", {})
         self.context_limit = None
         self.session_context: str | None = None  # additional_context хуков SessionStart
 
@@ -64,7 +71,9 @@ class Agent:
         profile = self.settings.get('model_profiles', {}).get(self.model, {})
         if profile.get('options', {}).get('tools', getattr(self.llm, 'base_options', {}).get('tools', self.settings.get('model_options', {}).get('tools', True))) is False:
             return []
-        return [tool.spec() for tool in self.registry.tools.values() if self.mode != 'plan' or tool.plan_safe]
+        return [tool.spec() for tool in self.registry.tools.values()
+                if (self.mode != "plan" or tool.plan_safe) and
+                (self.settings.get("permissions", {}).get("mode") != "read_only" or tool.name in READ_ONLY_TOOLS)]
 
     async def _question(self, request):
         if self.questioner is None:
@@ -153,14 +162,14 @@ class Agent:
         except (OSError, ValueError) as exc:
             self.store.checkpoint(self.session.id, request_id, error=str(exc))
 
-    async def _model_events(self, messages, tools):
+    async def _model_events(self, messages, tools, *, llm=None, purpose="response"):
         parent = current.get()
         trace = Trace(parent.request_id, identifier(), self.session.id, parent.span_id, parent.budget)
         token = current.set(trace)
         status, usage, started = "interrupted", (0, 0), time.monotonic()
         try:
-            record(self.store, "model.start", model=self.model, connection_id=self.session.connection_id, input_id=self.input_id)
-            async with aclosing(self.llm.stream(self.model, messages, tools or None,
+            record(self.store, "model.start", model=self.model, connection_id=self.session.connection_id, input_id=self.input_id, purpose=purpose)
+            async with aclosing((llm or self.llm).stream(self.model, messages, tools or None,
                                                self.settings.get("temperature"))) as events:
                 async for event in events:
                     if event["type"] == "message":
@@ -172,6 +181,7 @@ class Agent:
                     yield {**event, "span_id": trace.span_id, "parent_span_id": trace.parent_span_id}
         except LLMError as exc:
             status = exc.status
+            exc.span_id = trace.span_id
             raise
         except Exception:
             status = "error"
@@ -209,15 +219,20 @@ class Agent:
             compact_plan = {'goal': plan['goal'][:goal_size], 'todos': [
                 {**item, 'text': item['text'][:text_size]} for item in plan['todos']]}
             history.insert(0, {'role': 'user', 'content': 'Текущая цель и план (рабочие данные):\n' + json.dumps(compact_plan, ensure_ascii=False)})
-        return [{"role": "system", "content": self.system_prompt()}, *history]
+        messages, stats = clean_messages([{"role": "system", "content": self.system_prompt()}, *history],
+                                          self.settings.get('context_cleanup', {'enabled': False}))
+        if stats['changed_tools']:
+            record(self.store, 'context.cleaned', **stats)
+        return messages
 
     def context_status(self):
-        limits = {**self.settings, **self.settings.get('model_profiles', {}).get(self.model, {})}
-        limit = self.context_limit or limits.get('max_input_tokens', 32768)
+        limits = resolve(self.settings, self.model, self.model_metadata)
+        limit = self.context_limit or limits['max_input_tokens']
         messages = self._context_messages(limit)
-        estimated = len(json.dumps([messages, self.tool_specs()], ensure_ascii=False).encode()) + 64
+        estimated = estimate_tokens(messages, self.tool_specs())
         return {'estimated_tokens': estimated, 'max_input_tokens': limit,
-                'max_output_tokens': limits.get('max_output_tokens', 1024), 'source': 'estimate'}
+                'max_output_tokens': limits['max_output_tokens'], 'source': 'estimate',
+                **{key: limits[key] for key in ('context_window', 'context_source', 'context_known', 'input_limit_source')}}
 
     def _context(self, tools, limit, *, force=False):
         """Сжатие между шагами; исходная история и выполненные действия не меняются."""
@@ -227,7 +242,7 @@ class Agent:
             changed = self.store.compact(self.session.id, max_chars=summary_chars)
         while True:
             messages = self._context_messages(limit)
-            estimated = len(json.dumps([messages, tools], ensure_ascii=False).encode()) + 64
+            estimated = estimate_tokens(messages, tools)
             if estimated <= limit and not force:
                 return messages, estimated, changed
             if self.store.compact(self.session.id, max_chars=summary_chars):
@@ -240,10 +255,23 @@ class Agent:
                 for message in candidate:
                     if message['role'] == 'tool' and len((message.get('content') or '').encode()) > size:
                         message['content'] = message['content'].encode()[:size].decode('utf-8', 'ignore') + '\n[Результат сокращён для контекста; полный текст сохранён в истории]'
-                estimate = len(json.dumps([candidate, tools], ensure_ascii=False).encode()) + 64
+                estimate = estimate_tokens(candidate, tools)
                 if estimate <= limit:
                     return candidate, estimate, True
             return messages, estimated, changed
+
+    async def compact(self):
+        limits = resolve(self.settings, self.model, self.model_metadata)
+        return await manual_compact(self, limits['max_input_tokens'])
+
+    async def _prepare_context(self, tools, limit, *, force=False):
+        messages = self._context_messages(limit)
+        estimated = estimate_tokens(messages, tools)
+        changed = False
+        if force or estimated > limit:
+            changed = await compact(self, limit)
+        messages, estimate, local = self._context(tools, limit)
+        return messages, estimate, changed or local
 
     @staticmethod
     def _context_error(exc):
@@ -331,30 +359,35 @@ class Agent:
         tools = self.tool_specs()
         max_steps = self.settings.get("max_steps", 25)
         budget = current.get().budget
-        limits = {**self.settings, **self.settings.get('model_profiles', {}).get(self.model, {})}
+        limits = resolve(self.settings, self.model, self.model_metadata)
         if isinstance(self.llm, LLMClient):
-            self.llm.max_tokens = limits.get('max_output_tokens', 1024)
+            self.llm.max_tokens = limits['max_output_tokens']
             self.llm.options = {**self.llm.base_options, **limits.get('options', {})}
-        effective_input_limit = limits.get('max_input_tokens', 32768)
+        effective_input_limit = limits['max_input_tokens']
         self.context_limit = effective_input_limit
         for _step in range(max_steps):
             async for event in self._drain_inputs():
                 yield event
-            reserve = limits.get('max_output_tokens', 1024)
+            reserve = limits['max_output_tokens']
             input_limit = effective_input_limit
-            messages, estimated, compacted = self._context(tools, input_limit)
+            messages, estimated, compacted = await self._prepare_context(tools, input_limit)
             if compacted:
                 record(self.store, "context.compacted", estimated=estimated, automatic=True)
                 yield {"type": "warning", "message": "Контекст автоматически сокращён; цель и последний запрос сохранены"}
             message, usage, metrics = None, (0, 0), None
-            for attempt in range(2):
-                if estimated > input_limit or budget["spent"] + estimated + reserve > limits.get('max_turn_tokens', 65536):
+            overflow_retried = False
+            retries = 0
+            retry_started = time.monotonic()
+            retry_config = self.settings.get('model_retry', {'max_retries': 0})
+            while True:
+                if estimated > input_limit or budget["spent"] + estimated + reserve > limits['max_turn_tokens']:
                     reason = "Контекст не помещается после сжатия: сократите запрос или увеличьте max_input_tokens" if estimated > input_limit else "Исчерпан общий бюджет хода max_turn_tokens; сжатие не обнуляет расход"
                     yield {"type": "error", "message": reason}
                     yield {"type": "done", "reason": "budget"}
                     return
                 yield {"type": "context", "estimated_tokens": estimated, "max_input_tokens": input_limit,
                        "max_output_tokens": reserve, "source": "estimate",
+                       **{key: limits[key] for key in ("context_window", "context_source", "context_known", "input_limit_source")},
                        "planning": self.store.planning_state(self.session.id)}
                 streamed = False
                 try:
@@ -367,16 +400,28 @@ class Agent:
                     break
                 except LLMError as exc:
                     self._usage(exc.status, (0, 0))
-                    if not attempt and not streamed and self._context_error(exc):
+                    if not overflow_retried and not streamed and self._context_error(exc):
                         target = min(input_limit, max(1, estimated // 2))
-                        reduced, size, changed = self._context(tools, target, force=True)
+                        reduced, size, changed = await self._prepare_context(tools, target, force=True)
                         if size < estimated and size <= target:
+                            overflow_retried = True
                             messages, estimated = reduced, size
                             effective_input_limit = target
                             self.context_limit = target
                             record(self.store, "context.compacted", estimated=size, automatic=True, retry=True)
                             yield {"type": "warning", "message": "Провайдер сообщил о переполнении контекста; повторяю запрос после сжатия"}
                             continue
+                    delay = delay_for(exc, retries, time.monotonic() - retry_started, retry_config) if not streamed else None
+                    if delay is not None:
+                        retries += 1
+                        retry = {'attempt': retries, 'max_retries': retry_config['max_retries'], 'delay': delay, 'status': exc.status}
+                        record(self.store, 'model.retry', **retry, failed_span_id=getattr(exc, 'span_id', ''))
+                        yield {'type': 'warning', 'message': f'Временная ошибка модели ({exc.status}); повтор {retries}/{retry_config["max_retries"]} через {delay:.1f} с', 'retry': retry}
+                        await asyncio.sleep(delay)
+                        async for event in self._drain_inputs():
+                            yield event
+                        messages, estimated, _ = await self._prepare_context(tools, input_limit)
+                        continue
                     yield {"type": "error", "message": f"Ошибка модели ({exc.status}): {exc.message}"}
                     yield {"type": "done", "reason": "error"}
                     return
@@ -508,6 +553,9 @@ class Agent:
                 raise ToolError(f"нет инструмента {name!r}; доступны: {', '.join(self.registry.names())}")
             if self.mode == 'plan' and not tool.plan_safe:
                 raise ToolError(f'инструмент {name} недоступен агенту plan; переключитесь на build')
+            if self.settings.get("permissions", {}).get("mode") == "read_only" and name not in READ_ONLY_TOOLS:
+                decision = DENY
+                raise ToolError(f"инструмент {name} недоступен в строгом режиме read_only")
             tool.check_args(args)
             yield {"type": "tool_call", "id": call_id, "name": name, "arguments": args}
 

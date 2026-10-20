@@ -403,3 +403,38 @@ test('меню провайдеров открывает мастер добав
     setup.mockInput.pressEnter();expect(sent.at(-1)).toEqual({type:'submit',text:'/provider edit local'});
   }finally{view.dispose();await setup.dispose();}
 });
+
+
+test('429 показывает ожидание повтора и позволяет Esc без выхода из сессии',async()=>{
+  const setup=await createTestRenderer({width:115,height:40});const sent:Command[]=[];
+  const view=new AgentView(setup.renderer,c=>sent.push(c),()=>{});
+  try{
+    view.accept({type:'ready'});view.editor.setText('Задача');view.submit();
+    view.accept({type:'warning',message:'Повтор через 30 с',retry:{attempt:1,max_retries:5,delay:30,status:429}});
+    await setup.flush();expect(setup.captureCharFrame()).toContain('Ожидание повтора');expect(setup.captureCharFrame()).toContain('HTTP 429');
+    view.editor.setText('Черновик');setup.mockInput.pressEscape();await Bun.sleep(50);
+    expect(sent.at(-1)).toEqual({type:'cancel'});expect(view.editor.plainText).toBe('Черновик');
+    view.accept({type:'done',reason:'cancelled'});view.accept({type:'idle'});
+    view.submit();view.accept({type:'context',estimated_tokens:100,max_input_tokens:32000});
+    await setup.flush();expect(setup.captureCharFrame()).not.toContain('Ожидание повтора · HTTP');
+  }finally{view.dispose();await setup.dispose();}
+});
+
+test('режим доступа виден в заголовке, меню переключается стрелками и сохраняет черновик',async()=>{
+  const setup=await createTestRenderer({width:130,height:38});const sent:Command[]=[];
+  const view=new AgentView(setup.renderer,c=>sent.push(c),()=>{});
+  try{
+    view.accept({type:'snapshot',session:{id:'access',workspace:'/tmp',model:'alpha',agent_mode:'build'},provider:'local',permissions_mode:'allow_all'});
+    view.accept({type:'ready'});view.editor.setText('Мой черновик');
+    view.accept({type:'table',title:'Доступ',columns:[],rows:[],selection:{kind:'permissions',session_id:'access',current:'allow_all',choices:[
+      {key:'allow_all',label:'Полный доступ',command:'/permissions allow_all'},
+      {key:'read_only',label:'Только чтение',command:'/permissions read_only'},
+    ]}});
+    await setup.flush();expect(setup.captureCharFrame()).toContain('Полный доступ');
+    setup.mockInput.pressArrow('down');setup.mockInput.pressEnter();
+    expect(sent.at(-1)).toEqual({type:'submit',text:'/permissions read_only'});
+    view.accept({type:'snapshot',session:{id:'access',workspace:'/tmp',model:'alpha',agent_mode:'build'},provider:'local',permissions_mode:'read_only'});
+    view.accept({type:'idle'});await setup.flush();
+    expect(setup.captureCharFrame()).toContain('Только чтение');expect(view.editor.plainText).toBe('Мой черновик');
+  }finally{view.dispose();await setup.dispose();}
+});

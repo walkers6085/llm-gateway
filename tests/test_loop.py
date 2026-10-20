@@ -52,6 +52,9 @@ class Slow(Tool):
 
 
 def make_agent(tmp_path, script, seen=None, approver=None, hooks=None, **settings):
+    # Эти сценарии проверяют цикл с подтверждениями и локальным сжатием.
+    settings.setdefault("permissions", {"mode": "default"})
+    settings.setdefault("context_compaction", {"mode": "local"})
     store = SessionStore(tmp_path / "s.db")
     session = store.create("local", model="alpha", workspace=str(tmp_path))
     llm = LLMClient(httpx.AsyncClient(base_url="http://up/v1", transport=scripted_transport(script, seen)))
@@ -127,7 +130,7 @@ async def test_max_steps(tmp_path):
 
 
 async def test_llm_error(tmp_path):
-    agent, _, usage = make_agent(tmp_path, [{"status": 503, "error": "перегружен"}])
+    agent, _, usage = make_agent(tmp_path, [{"status": 503, "error": "перегружен"}], model_retry={"max_retries":0})
     evs = await run(agent)
     assert evs[-2]["type"] == "error" and "перегружен" in evs[-2]["message"]
     assert evs[-1]["reason"] == "error"

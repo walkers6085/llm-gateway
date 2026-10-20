@@ -113,7 +113,7 @@ async def test_close_child_repairs_both_histories(tmp_path):
 
 
 async def test_request_ids_unique_errors_correlated(tmp_path):
-    agent, store, _ = make_agent(tmp_path, [{'status':429,'error':'лимит'},{'content':'готово'}])
+    agent, store, _ = make_agent(tmp_path, [{'status':429,'error':'лимит'},{'content':'готово'}], model_retry={'max_retries':0})
     first, second = await run(agent), await run(agent)
     assert first[-1]['request_id']!=second[-1]['request_id']
     logs = store.traces(agent.session.id, first[-1]['request_id'])
@@ -125,7 +125,7 @@ async def test_request_ids_unique_errors_correlated(tmp_path):
 
 def test_v2_database_migration_preserves_audit(tmp_path):
     import sqlite3
-    from agent.store import MIGRATIONS, SessionStore
+    from agent.store import MIGRATIONS, SCHEMA_VERSION, SessionStore
     path = tmp_path/'old.db'
     db = sqlite3.connect(path)
     db.executescript('CREATE TABLE agent_meta (key TEXT PRIMARY KEY,value TEXT NOT NULL);')
@@ -136,7 +136,8 @@ def test_v2_database_migration_preserves_audit(tmp_path):
     db.execute("INSERT INTO agent_tool_runs VALUES ('old','call','read_file','{}','allow',1,3,1)")
     db.commit();db.close()
     store = SessionStore(path)
-    assert store.version()==6
+    assert store.version()==SCHEMA_VERSION
+    assert store.get("old").permissions_mode == ""
     assert store.tool_runs('old')[0]['request_id']==''
     store.trace('request','span','','old','model.end',{'completion_tokens':3})
     assert store.traces('old')[0]['data']['completion_tokens']==3
@@ -157,7 +158,7 @@ async def test_child_timeout_closes_tool_and_finishes_trace(tmp_path):
 
 
 async def test_child_shares_parent_token_budget(tmp_path):
-    agent, store, _ = make_agent(tmp_path, [], permissions={'mode':'allow_all'})
+    agent, store, _ = make_agent(tmp_path, [], permissions={'mode':'allow_all'}, max_turn_tokens=65536)
     agent.registry.add(Subagent())
     calls=[]
     def handle(request):

@@ -108,7 +108,7 @@ export class AgentView {
   private queuedMenu?:string;
   private thoughts:{box:BoxRenderable;title:TextRenderable;body:TextRenderable;text:string;expanded:boolean}[]=[];
   private thought?:typeof this.thoughts[number];private thoughtsExpanded=false;
-  private activityTimer?:ReturnType<typeof setInterval>;private busySince=0;private activity='Подготовка';private frame=0;
+  private activityTimer?:ReturnType<typeof setInterval>;private busySince=0;private activity='Подготовка';private retryUntil=0;private frame=0;
   private requestId='';private dialogDraft?:string;
   private steeringCards=new Map<string,BoxRenderable>();private pendingSteering=new Set<string>();
   private agentMode='build';private nextAgentMode?:string;private sessionInfo?:AgentEvent;private providerName='';
@@ -161,7 +161,7 @@ export class AgentView {
     switch(event.type){
       case 'snapshot':{
         const s=event.session;this.workspace=safeText(s.workspace);this.rail.update(event);
-        this.sessionInfo=s;this.providerName=safeText(event.provider);this.agentMode=s.agent_mode==='plan'?'plan':'build';this.nextAgentMode=event.next_agent_mode||undefined;this.metrics();
+        s.permissions_mode=event.permissions_mode||s.permissions_mode||'allow_all';this.sessionInfo=s;this.providerName=safeText(event.provider);this.agentMode=s.agent_mode==='plan'?'plan':'build';this.nextAgentMode=event.next_agent_mode||undefined;this.metrics();
         if(this.picker && this.picker.sessionId!==s.id)this.closePicker();
         if(Array.isArray(event.catalog))this.catalog=event.catalog.filter((item:any)=>
           item && ['command','tool'].includes(item.kind) && typeof item.command==='string' && item.command.startsWith('/') && typeof item.description==='string');
@@ -193,8 +193,8 @@ export class AgentView {
         if(this.dialogDraft!==undefined)this.dialogDraft=join(this.dialogDraft);else{this.editor.setText(join(this.editor.plainText));this.editor.gotoBufferEnd();}
         this.notice(event.message,'warning');break;
       }
-      case 'dashboard':this.restoreQueuedInputs(event.pending_inputs);this.rail.update(event);this.metrics();break;
-      case 'context':this.rail.setContext(event);this.metrics();break;
+      case 'dashboard':if(this.sessionInfo&&event.permissions_mode){this.sessionInfo.permissions_mode=event.permissions_mode;this.updateHeader();}this.restoreQueuedInputs(event.pending_inputs);this.rail.update(event);this.metrics();break;
+      case 'context':this.retryUntil=0;this.activity='Запрос к модели';this.rail.setContext(event);this.metrics();break;
       case 'user':this.usage={prompt:0,completion:0};this.user(event.text);break;
       case 'reasoning':this.activity='Модель рассуждает';this.reasoning(event.text);break;
       case 'text':{
@@ -233,7 +233,7 @@ export class AgentView {
         if(event.secret){this.editor.blur();this.mask.content='';}else this.editor.focus();break;
       case 'draft':this.dialogDraft=undefined;this.editor.setText(safeText(event.text));this.editor.gotoBufferEnd();break;
       case 'usage':this.rail.usage(Number(event.prompt_tokens));this.usage.prompt+=Number(event.prompt_tokens)||0;this.usage.completion+=Number(event.completion_tokens)||0;this.metrics();break;
-      case 'warning':this.notice(event.message,'warning');break;
+      case 'warning':if(event.retry){this.retryUntil=Date.now()+Number(event.retry.delay)*1000;this.activity='Ожидание повтора · HTTP '+event.retry.status;this.animateActivity();}this.notice(event.message,'warning');break;
       case 'error':case 'fatal':this.finishAnswer();this.notice(event.message,'error');if(event.type==='fatal'){this.closePicker();this.closePalette();this.dialog=undefined;this.pending=undefined;this.secret='';this.mask.content='';this.mask.visible=false;this.editor.visible=true;this.ready=false;this.closed=true;this.setBusy(false);this.status.content='Не удалось подключиться · Ctrl+D — выход';}break;
       case 'notice':this.notice(event.message,event.level==='error'?'error':'important');break;
       case 'table':
@@ -466,9 +466,11 @@ export class AgentView {
   }
   private animateActivity(){
     if(!this.busy||this.pending||this.dialog||this.completionStatus)return;
+    if(this.retryUntil&&this.retryUntil<=Date.now()){this.retryUntil=0;this.activity='Повторный запрос к модели';}
+    const waiting=this.retryUntil?' · ещё '+Math.ceil((this.retryUntil-Date.now())/1000)+' с':'';
     const frames=['● ○ ○','○ ● ○','○ ○ ●','○ ● ○'];
     this.status.height=2;this.status.fg=palette.blue;
-    this.status.content=`${frames[this.frame++%frames.length]}  ${this.activity} · ${Math.floor((Date.now()-this.busySince)/1000)} с\n${Date.now()<this.clipboardUntil?this.clipboardMessage:'Esc / Ctrl+C — отменить'+(this.requestId?' · запрос '+this.requestId:'')}`;
+    this.status.content=`${frames[this.frame++%frames.length]}  ${this.activity}${waiting} · ${Math.floor((Date.now()-this.busySince)/1000)} с\n${Date.now()<this.clipboardUntil?this.clipboardMessage:'Esc / Ctrl+C — отменить'+(this.requestId?' · запрос '+this.requestId:'')}`;
     this.renderer.requestRender();
   }
   private addTable(title:string,table:Table){
@@ -495,7 +497,8 @@ export class AgentView {
   private updateHeader(){
     const s=this.sessionInfo;if(!s)return;
     const mode=this.agentMode.toUpperCase()+(this.nextAgentMode&&this.nextAgentMode!==this.agentMode?' → '+this.nextAgentMode.toUpperCase():'');
-    this.header.content=`gwagent · ${mode} · ${this.providerName} / ${safeText(s.model||'модель не выбрана')} · ${safeText(s.title||s.id)}\n${safeText(s.workspace)} · ${safeText(s.id)}`;
+    const access=({allow_all:'Полный доступ',default:'С подтверждениями',read_only:'Только чтение'} as Record<string,string>)[s.permissions_mode]||s.permissions_mode;
+    this.header.content=`gwagent · ${mode} · ${safeText(access)} · ${this.providerName} / ${safeText(s.model||'модель не выбрана')} · ${safeText(s.title||s.id)}\n${safeText(s.workspace)} · ${safeText(s.id)}`;
   }
   private finishQuestion(){
     this.dialog=undefined;this.menu.visible=false;this.approvalBox.visible=false;this.secret='';this.mask.visible=false;this.editor.visible=true;
@@ -513,7 +516,7 @@ export class AgentView {
     if(!this.pending&&!this.dialog)this.prompt.content=value?'Уточнение в текущий цикл · Enter — отправить':'Сообщение или /help';
     if(this.activityTimer){clearInterval(this.activityTimer);this.activityTimer=undefined;}
     if(!value && this.ready)this.editor.focus();else if(value && !this.pending && !this.dialog && this.ready)this.editor.focus();
-    if(value){this.completionStatus=undefined;this.busySince=Date.now();this.activity='Подготовка запроса';this.requestId='';this.animateActivity();this.activityTimer=setInterval(()=>this.animateActivity(),180);}
+    if(value){this.retryUntil=0;this.completionStatus=undefined;this.busySince=Date.now();this.activity='Подготовка запроса';this.requestId='';this.animateActivity();this.activityTimer=setInterval(()=>this.animateActivity(),180);}
     else{this.status.height=1;this.status.fg=palette.muted;}
     this.updateMenu();this.metrics();
   }

@@ -34,7 +34,7 @@ def gw(gateway_settings, tmp_path, monkeypatch):
         cfg = tmp_path / "cli.json"
         db = tmp_path / "sessions.db"
         cfg.write_text(json.dumps({"gateway": {"url": f"http://127.0.0.1:{srv.port}/v1"},
-                                   "sessions": {"db": str(db)}}))
+                                   "sessions": {"db": str(db)}, "permissions": {"mode": "default"}}))
         ws = tmp_path / "ws"
         ws.mkdir()
         yield cfg, ws, db
@@ -248,7 +248,7 @@ async def test_direct_subagent_command_and_logs(gw):
 
 async def test_compact_command_after_single_turn(gw):
     cfg, ws, db = gw
-    SCRIPT.extend([{'content': 'Подробный старый ответ ' * 500}, {'content': 'Продолжаю'}])
+    SCRIPT.extend([{'content': 'Подробный старый ответ ' * 500}, {'content': 'Цель: исходная задача; старый ответ сохранён'}, {'content': 'Продолжаю'}])
     out, err, read = run_cli(['Исходная задача', '/compact', 'Следующий запрос', '/exit'])
     code = await amain(['--cwd', str(ws), '--settings', str(cfg)], read=read, out=out, err=err)
     assert code == 0
@@ -314,3 +314,26 @@ async def test_provider_model_profiles_apply_to_requests_without_leaking_between
     assert requests[0]['top_p']==.9 and requests[0]['reasoning_effort']=='low'
     assert requests[1]['model']=='alpha' and 'top_p' not in requests[1] and 'reasoning_effort' not in requests[1]
     assert 'temperature' not in requests[1]
+
+
+async def test_default_full_access_and_explicit_read_only_on_resume(gw):
+    cfg, ws, db = gw
+    config = json.loads(cfg.read_text())
+    config.pop('permissions')
+    cfg.write_text(json.dumps(config))
+    SCRIPT.extend([{'tool_calls': [tool_call('write-default', 'write_file', path='allowed.txt', content='ok')]}, {'content': 'Готово'}])
+    out, err, read = run_cli(['Создай файл', '/permissions allow_all', '/permissions nonsense', '/exit'])
+    assert await amain(['--cwd', str(ws), '--settings', str(cfg)], read=read, out=out, err=err) == 0
+    assert (ws / 'allowed.txt').read_text() == 'ok'
+    assert 'режим разрешений:' in err.getvalue()
+    store = SessionStore(db)
+    [session] = store.list('local')
+    assert session.permissions_mode == 'allow_all'
+    store.close()
+    SCRIPT.extend([{'tool_calls': [tool_call('write-blocked', 'write_file', path='blocked.txt', content='x')]}, {'content': 'Недоступно'}])
+    out, err, read = run_cli([])
+    assert await amain(['--cwd', str(ws), '--settings', str(cfg), '--resume', session.id, '--read-only', '-p', 'Создай ещё файл'], read=read, out=out, err=err) == 0
+    assert not (ws / 'blocked.txt').exists()
+    store = SessionStore(db)
+    assert store.get(session.id).permissions_mode == 'read_only'
+    store.close()

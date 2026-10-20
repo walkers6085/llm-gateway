@@ -49,3 +49,15 @@ test('длинные цель и задачи раскрываются заго�
     await setup.mockMouse.click(heading.x+1,heading.y);await setup.flush();expect(setup.captureCharFrame()).not.toContain('конец цели');
   }finally{view.dispose();await setup.dispose();}
 });
+
+test('окно API отделено от лимита входа, а неизвестный размер явно помечен',async()=>{
+  const setup=await createTestRenderer({width:125,height:52});const view=new AgentView(setup.renderer,()=>{},()=>{});
+  try{
+    view.accept({type:'snapshot',session:{id:'limits',model:'m',workspace:'/tmp'},provider:'test',
+      context:{estimated_tokens:25000,max_input_tokens:50000,max_output_tokens:1024,context_window:262144,context_source:'api',input_limit_source:'config'}});
+    await setup.flush();let frame=setup.captureCharFrame();
+    expect(frame).toContain('~50%');expect(frame).toContain('262');expect(frame).toContain('144');expect(frame).toContain('API провайдера');expect(frame).toContain('Вход ограничен настройками');
+    view.accept({type:'context',estimated_tokens:1000,max_input_tokens:130048,max_output_tokens:1024,context_window:131072,context_source:'fallback'});
+    await setup.flush();frame=setup.captureCharFrame();expect(frame).toContain('неизвестно');expect(frame).toContain('резервный лимит');
+  }finally{view.dispose();await setup.dispose();}
+});

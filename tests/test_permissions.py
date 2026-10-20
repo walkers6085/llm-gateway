@@ -88,3 +88,22 @@ def test_session_rules_and_ask_rules():
 def test_always_rule():
     assert Shell().always_rule({"command": "make test"}) == "shell(make test)"
     assert Mcp().always_rule({}) == "mcp__github__create_issue"
+
+
+def test_strict_read_only_cannot_be_overridden():
+    ro = Permissions({'mode': 'read_only', 'allow': ['*']}, session_rules=['shell'])
+    for tool in (Shell(), Mcp()):
+        for hook in (None, 'allow', 'ask'):
+            assert ro.decide(tool, {'command': 'cat README.md'}, hook)[0] == 'deny'
+    assert Permissions({'mode': 'read_only'}).decide(Fetch(), {'url': 'https://example.test'})[0] == 'allow'
+    assert Permissions({'mode': 'read_only', 'deny': ['web_fetch']}).decide(Fetch(), {})[0] == 'deny'
+
+
+def test_global_default_and_explicit_confirmations(tmp_path):
+    from agent.settings import DEFAULTS, load_profiles
+    assert DEFAULTS['permissions']['mode'] == 'allow_all'
+    path = tmp_path / 'agent.json'
+    path.write_text('{"profiles":{"auto":{},"interactive":{"permissions":{"mode":"default"}}}}')
+    profiles = load_profiles(path)
+    assert profiles['auto']['permissions']['mode'] == 'allow_all'
+    assert profiles['interactive']['permissions']['mode'] == 'default'

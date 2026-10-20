@@ -333,8 +333,17 @@ def render_result(result: dict) -> ToolResult:
             parts.append(f"[ссылка на ресурс {item.get('uri', '')}]")
         else:
             parts.append(json.dumps(item, ensure_ascii=False))
-    if not parts and result.get("structuredContent") is not None:
-        parts.append(json.dumps(result["structuredContent"], ensure_ascii=False))
+    if result.get("structuredContent") is not None:
+        structured = result['structuredContent']
+        duplicate = False
+        for part in parts:
+            try:
+                if json.loads(part) == structured:
+                    duplicate = True;break
+            except (ValueError, TypeError):
+                pass
+        if not duplicate:
+            parts.append(json.dumps(structured, ensure_ascii=False))
     return ToolResult("\n".join(parts) or "(пустой результат)", is_error=bool(result.get("isError")))
 
 

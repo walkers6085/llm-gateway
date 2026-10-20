@@ -32,9 +32,12 @@ DEFAULTS: dict = {
     "system_prompt": DEFAULT_SYSTEM_PROMPT,
     "temperature": None,
     "max_steps": 25,
-    "max_input_tokens": 32768,
+    "model_retry": {"max_retries": 5, "initial_delay": 2, "max_delay": 60, "max_elapsed": 180},
+    "context_compaction": {"mode": "model", "timeout": 30, "max_output_tokens": 512},
+    "context_cleanup": {"enabled": True, "compact_json": True, "collapse_blank_lines": True, "deduplicate_lines": False},
+    "max_input_tokens": 0,
     "max_output_tokens": 1024,
-    "max_turn_tokens": 65536,
+    "max_turn_tokens": 0,
     "model_profiles": {},
     "subagents": {"enabled": True, "max_calls": 3, "max_steps": 8, "timeout": 120},
     "model_options": {"tools": True, "stream": True, "temperature": True, "usage": True,
@@ -45,7 +48,7 @@ DEFAULTS: dict = {
                     "web_fetch", "http_request", "web_search", "goal", "todo", "question"],
     },
     "permissions": {
-        "mode": "default",
+        "mode": "allow_all",
         "allow": [],
         "ask": [],
         "deny": [],
@@ -114,7 +117,7 @@ MODEL_OPTIONS = _obj({
     'reasoning_effort': {'type': 'string', 'enum': ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']},
 })
 MODEL_PROFILE = _obj({
-    'max_input_tokens': POS, 'max_output_tokens': POS, 'max_turn_tokens': POS,
+    'context_window': POS, 'max_input_tokens': INT, 'max_output_tokens': POS, 'max_turn_tokens': INT,
     'options': MODEL_OPTIONS,
 })
 
@@ -124,7 +127,14 @@ SCHEMA = _obj({
     "system_prompt": STR,
     "temperature": {"type": ["number", "null"], "minimum": 0, "maximum": 2},
     "max_steps": POS,
-    "max_input_tokens": POS, "max_output_tokens": POS, "max_turn_tokens": POS,
+    "model_retry": _obj({"max_retries": {"type": "integer", "minimum": 0, "maximum": 10},
+                         "initial_delay": {"type": "number", "minimum": 0},
+                         "max_delay": {"type": "number", "minimum": 0},
+                         "max_elapsed": {"type": "number", "minimum": 0}}),
+    "context_compaction": _obj({"mode": {"type": "string", "enum": ["model", "local"]},
+                                "timeout": POS, "max_output_tokens": POS}),
+    "context_cleanup": _obj({"enabled": BOOL, "compact_json": BOOL, "collapse_blank_lines": BOOL, "deduplicate_lines": BOOL}),
+    "max_input_tokens": INT, "max_output_tokens": POS, "max_turn_tokens": INT,
     "subagents": _obj({"enabled": BOOL, "max_calls": POS, "max_steps": POS, "timeout": POS}),
     "model_profiles": {"type": "object", "additionalProperties": MODEL_PROFILE},
     "model_options": _obj({"tools": BOOL, "stream": BOOL, "temperature": BOOL, "usage": BOOL,

@@ -30,9 +30,12 @@ from .trust import TrustStore, fingerprint
 from .runtime import make_agent, make_registry, start_mcp
 from .settings import SettingsError, expand, load
 from .store import Session, SessionStore, task_title
+from .permissions import MODES
+from .model_limits import resolve
 
 OWNER = "local"
 COMMANDS = [
+    {"command": "/permissions", "description": "Выбрать режим доступа к инструментам", "arguments": "optional", "usage": "/permissions [default|allow_all|read_only] [save]"},
     {'command': '/provider import', 'description': 'Импортировать провайдеров из OpenCode', 'arguments': 'none'},
     {'command': '/provider export', 'description': 'Экспортировать провайдеров в OpenCode без секретов', 'arguments': 'none'},
     {'command': '/provider model', 'description': 'Настроить модель, контекст и параметры генерации', 'arguments': 'required', 'usage': '/provider model NAME [MODEL]'},
@@ -66,6 +69,7 @@ HELP = """Команды:
   /data              показать единый каталог данных
   /provider model NAME [MODEL]  параметры модели и лимиты
   /provider import|export  обмен настройками OpenCode
+  /permissions [MODE] [save]  режим доступа; save — сохранить в настройках
   /mode [build|plan]  показать или сменить активного агента
   /revert            выбрать прошлое сообщение и режим отката
   /agent задача      запустить отдельного сабагента
@@ -173,6 +177,7 @@ class App:
         self.providers = ProviderManager(args.providers_file)
         self.store = SessionStore(expand(settings["sessions"]["db"]))
         self.provider = None
+        self.catalogs = {}
         self.base_profiles = copy.deepcopy(settings["model_profiles"])
         self.base_model = settings["model"]
         self.connection = None
@@ -202,6 +207,12 @@ class App:
         from .settings import merge
         profiles = self.providers.get(name).get('model_profiles', {}) if name is not None else {}
         self.settings['model_profiles'] = merge(self.base_profiles, profiles)
+
+    def get_model_metadata(self):
+        if self.llm is not None and self.llm.model_metadata:
+            return self.llm.model_metadata
+        cached = self.catalogs.get(self.provider)
+        return cached[1] if cached and self.connection and cached[0] == self.connection.endpoint_hash else {}
 
     async def model_client(self):
         if self.llm is None:
@@ -237,7 +248,11 @@ class App:
                     connection = self.resolve_connection(name)
                     async with httpx.AsyncClient(base_url=connection.url.rstrip('/') + '/', trust_env=False,
                                                  timeout=10, **connection.http_kwargs()) as http:
-                        models = await LLMClient(http).models()
+                        catalog_client = LLMClient(http)
+                        models = await catalog_client.models()
+                        self.catalogs[name] = (connection.endpoint_hash, catalog_client.model_metadata)
+                        if name == self.provider and self.llm is not None and self.connection.endpoint_hash == connection.endpoint_hash:
+                            self.llm.model_metadata = catalog_client.model_metadata
                     if not models:
                         raise ValueError('API вернул пустой каталог')
             except (ValueError, OSError, SettingsError, LLMError, httpx.HTTPError, httpx.InvalidURL, TimeoutError) as exc:
@@ -248,6 +263,13 @@ class App:
                         'display_name': config.get('model_names', {}).get(model, model),
                         'available': error is None, 'tags': sorted(tags.get(model, []))}
                        for model in dict.fromkeys(models) if model]
+            from .settings import merge
+            profiles = merge(self.base_profiles, config.get('model_profiles', {}))
+            cached = self.catalogs.get(name)
+            detected = cached[1] if cached and cached[0] == self.provider_info(name).endpoint_hash else {}
+            for entry in entries:
+                bounds = resolve({**self.settings, 'model_profiles': profiles}, entry['model'], detected)
+                entry.update({key: bounds[key] for key in ('context_window', 'context_source', 'max_input_tokens')})
             return entries, ({'provider': choice['label'], 'message': error} if error else None)
         results = await asyncio.gather(*(fetch(c) for c in self.provider_choices() if c['enabled']))
         return [m for entries, _ in results for m in entries], [error for _, error in results if error]
@@ -333,6 +355,7 @@ class App:
         if self.http and close_previous:
             await self.http.aclose()
         self.http, self.llm = http, LLMClient(http, options={**self.settings["model_options"], **connection.options})
+        await self.llm.discover_model_limits()
         self.connection = connection
         self.provider = name
         self.settings["model"] = model
@@ -355,6 +378,9 @@ class App:
             await self.connect_provider(name)
         if session.endpoint_hash and session.endpoint_hash != self.connection.endpoint_hash:
             raise SettingsError('адрес подключения сессии изменился; создайте новую сессию')
+        if self.args.allow_all or self.args.read_only:
+            session.permissions_mode = 'allow_all' if self.args.allow_all else 'read_only'
+            self.store.update(session.id, permissions_mode=session.permissions_mode)
         return session
 
     def create_session(self, model):
@@ -397,6 +423,7 @@ class App:
         self.agent = make_agent(llm=self.llm, settings=self.settings, store=self.store, session=self.session,
                                 mcp=self.mcp, approver=self.approve if self.can_ask() else None,
                                 questioner=self.question if self.can_ask() else None)
+        self.agent.model_metadata = self.get_model_metadata()
 
     def can_ask(self) -> bool:
         return self.interactive or bool(getattr(sys.stdin, "isatty", lambda: False)())
@@ -424,6 +451,27 @@ class App:
             raise ValueError('дождитесь завершения запроса перед сменой агента')
         self.store.update(self.session.id, agent_mode=mode)
         self.session.agent_mode = mode
+        self.rebuild()
+
+    def permissions_mode(self):
+        return self.session.permissions_mode or self.settings['permissions']['mode']
+
+    def set_permissions(self, mode, *, save=False):
+        if mode not in MODES:
+            raise ValueError('режим разрешений: default | allow_all | read_only')
+        if self.task and not self.task.done():
+            raise ValueError('дождитесь завершения запроса перед сменой разрешений')
+        if save:
+            from .data import location
+            from .storage import file_lock, write_json
+            path = location('settings.json')
+            with file_lock(path):
+                data = json.loads(path.read_text()) if path.exists() else {}
+                data.setdefault('permissions', {})['mode'] = mode
+                write_json(path, data)
+            self.settings["permissions"]["mode"] = mode
+        self.store.update(self.session.id, permissions_mode=mode)
+        self.session.permissions_mode = mode
         self.rebuild()
 
     async def question(self, request):
@@ -632,8 +680,23 @@ class App:
                 con.line('Активный агент: ' + self.session.agent_mode)
             except ValueError as exc:
                 con.line(str(exc), err=True)
+        elif cmd == '/permissions':
+            try:
+                fields = arg.split()
+                if fields and fields != ['save']:
+                    if len(fields) > 2 or len(fields) == 2 and fields[1] != 'save':
+                        raise ValueError('использование: /permissions [default|allow_all|read_only] [save]')
+                    self.set_permissions(fields[0], save=len(fields) == 2)
+                elif fields == ['save']:
+                    self.set_permissions(self.permissions_mode(), save=True)
+                else:
+                    self.console.line('Режимы: default — подтверждения; allow_all — полный доступ; read_only — только чтение')
+                self.console.line('Режим разрешений: ' + self.permissions_mode())
+            except (ValueError, OSError) as exc:
+                self.console.line(str(exc), err=True)
         elif cmd == '/compact':
-            changed = self.store.compact(self.session.id)
+            agent = self.agent or make_agent(llm=None, settings=self.settings, store=self.store, session=self.session, mcp=self.mcp)
+            changed = await agent.compact()
             self.session = self.store.get(self.session.id)
             self.rebuild()
             con.line('Контекст сокращён; исходная история сохранена' if changed else 'Контекст уже минимален: последний запрос сохранён полностью')
@@ -801,7 +864,7 @@ def parse_args(argv):
                    help="продолжить последнюю сессию в этой папке")
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--allow-all", action="store_true", help="не спрашивать подтверждений (permissions.mode=allow_all)")
-    mode.add_argument("--read-only", action="store_true", help="запрещать всё, что требует подтверждения")
+    mode.add_argument("--read-only", action="store_true", help="строгое чтение: без shell, записи, MCP и делегации")
     p.add_argument("--json", action="store_true", help="события построчно в JSON (с -p)")
     display = p.add_mutually_exclusive_group()
     display.add_argument("--tui", action="store_true", help="интерфейс OpenTUI (Bun)")

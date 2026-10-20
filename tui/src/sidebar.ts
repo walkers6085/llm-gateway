@@ -37,11 +37,15 @@ export class Sidebar extends BoxRenderable{
   private renderState(){
     const limit=Number(this.context?.max_input_tokens),used=Number(this.context?.estimated_tokens);
     if(limit>0&&Number.isFinite(used)){
+      const window=Number(this.context?.context_window)||limit;
+      const sources:Record<string,string>={config:'настройки модели',api:'API провайдера',catalog:'каталог моделей',fallback:'неизвестно · резервный лимит'};
+      const origin=sources[this.context?.context_source]||'настройки';
       const percent=used/limit*100,filled=Math.max(0,Math.min(16,Math.round(percent/100*16)));
       const color=percent>=90?'#b58b92':percent>=75?'#afa07c':palette.blue;
       this.contextText.content=new StyledText([chunk('Контекст · ~'+percent.toLocaleString('ru-RU',{maximumFractionDigits:1})+'%\n',color),
         chunk('━'.repeat(filled)+'─'.repeat(16-filled)+'\n',color),
-        chunk(`~${Math.round(used).toLocaleString('ru-RU')} / ${limit.toLocaleString('ru-RU')} ток.\nОценка следующего входа`,palette.muted),
+        chunk(`Окно: ${window.toLocaleString('ru-RU')} ток.\n${origin}\n~${Math.round(used).toLocaleString('ru-RU')} / ${limit.toLocaleString('ru-RU')} ток.\nОценка следующего входа`,palette.muted),
+        chunk(this.context?.input_limit_source==='config'?'\nВход ограничен настройками':'',palette.muted),
         chunk(this.lastPrompt!==undefined?`\nПоследний вход: ${this.lastPrompt.toLocaleString('ru-RU')} ток.`:'',palette.muted),
         chunk(`\nРезерв ответа: ${Number(this.context?.max_output_tokens||0).toLocaleString('ru-RU')}`,palette.muted)]);
     }else this.contextText.content='Контекст\nЛимит пока неизвестен';

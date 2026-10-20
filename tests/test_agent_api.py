@@ -10,7 +10,7 @@ import pytest
 from tests.fakes import SCRIPT, SEEN, auth, tool_call
 
 PROFILES = {"profiles": {
-    "default": {"workspace_root": "WS"},
+    "default": {"workspace_root": "WS", "permissions": {"mode": "default"}},
     "auto": {"workspace_root": "WS", "permissions": {"mode": "allow_all"}},
     "ro": {"workspace_root": "WS", "permissions": {"mode": "read_only"}, "tools": {"enabled": ["read_file"]}},
 }}
@@ -228,8 +228,9 @@ def test_subagent_mtls_audit_and_shared_workspace_deletion(agent_gw, child_first
         rows = send(client,raw,session['id'],'Поручи создание файла')
         child = next(e['session_id'] for e in rows if e['type']=='subagent_start')
         rid = rows[0]['request_id']
-        assert all(item['trace']['x-request-id']==rid for item in SEEN)
-        assert len({item['trace']['x-span-id'] for item in SEEN})==4
+        model_calls = [item for item in SEEN if item['path'] == 'chat']
+        assert all(item['trace']['x-request-id']==rid for item in model_calls)
+        assert len({item['trace']['x-span-id'] for item in model_calls})==4
         assert store.usage(token.id)[0]['requests']==4
         workspace=Path(session['workspace'])
         assert (workspace/'child.txt').read_text()=='результат'

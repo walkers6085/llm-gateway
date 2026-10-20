@@ -2,6 +2,7 @@
 import {badgeForTag,type Badge} from './theme.ts';
 
 export const menuSpecs={
+  permissions:{title:'Режим доступа к инструментам',search:'Поиск режима',empty:'Нет режимов.',action:'выбрать'},
   revert:{title:'Изменить прошлое сообщение',search:'Поиск по вашим сообщениям',empty:'Нет сообщений для изменения.',action:'выбрать'},
   model:{title:'Выбор модели · все провайдеры',search:'Поиск по провайдеру, модели и тегам',empty:'Провайдер не вернул доступных моделей. Выбор модели не изменён.',action:'переключить'},
   provider:{title:'Выбор провайдера',search:'Поиск провайдера',empty:'Нет доступных провайдеров.',action:'переключить'},
@@ -22,9 +23,11 @@ export function createPicker(event:any,draft:string):PickerState{
     if(kind==='provider'&&item.command)return {key:item.command,command:item.command,name:item.label,label:item.label+' '+(item.description||''),description:item.description,group:item.group||'Управление'};
     if(kind==='model'){
       const tags=(item.tags||[]).map(String);
+      const window=Number(item.context_window);
+      const bounds=window>0?`Окно: ${window.toLocaleString('ru-RU')} ток.${item.context_source==='fallback'?' · неизвестно, резерв':''} · `:'';
       return {key:JSON.stringify([item.provider,item.model]),provider:item.provider,model:item.model,name:item.display_name||item.model,group:item.provider_name,
         label:`${item.provider_name} / ${item.display_name||""} ${item.model} ${tags.join(' ')} ${item.available?'':'API недоступен'}`,
-        description:(item.display_name&&item.display_name!==item.model?item.model+' · ':'')+(item.available?'': 'Из конфига · API недоступен'),badges:[...tags.map(badgeForTag),...(item.available?[]:[{text:'API недоступен',tone:'warning' as const}])]};
+        description:bounds+(item.display_name&&item.display_name!==item.model?item.model+' · ':'')+(item.available?'': 'Из конфига · API недоступен'),badges:[...tags.map(badgeForTag),...(item.available?[]:[{text:'API недоступен',tone:'warning' as const}])]};
     }
     if(kind==='provider')return {key:JSON.stringify([item.provider]),provider:item.provider,name:item.label,label:`${item.label} / ${item.model||''}`,
       description:item.model?'Модель: '+item.model:'Модель не выбрана',group:'Подключения',disabled:item.enabled===false,badges:[]};

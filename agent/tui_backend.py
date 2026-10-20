@@ -74,7 +74,8 @@ class Bridge:
     def dashboard_data(self):
         app = self.app
         agent = app.agent or make_agent(llm=None, settings=app.settings, store=app.store, session=app.session, mcp=app.mcp)
-        return {'session_id': app.session.id, 'planning': app.store.planning_state(app.session.id),
+        agent.model_metadata = app.get_model_metadata()
+        return {'session_id': app.session.id, 'permissions_mode': app.permissions_mode(), 'planning': app.store.planning_state(app.session.id),
                 'context': agent.context_status(),
                 'mcp': app.mcp.status(include_disabled=True) if app.mcp else [],
                 'pending_inputs': app.store.pending_inputs(app.session.id)}
@@ -214,6 +215,22 @@ class Bridge:
         if text == '/data':
             from .data import paths
             self.emit({'type': 'table', 'title': 'Каталог данных', 'columns': ['Файл', 'Путь'], 'rows': [[name, path] for name, path in paths().items()]})
+            return True
+        if text == '/permissions':
+            mode = app.permissions_mode()
+            choices = [
+                {'key': name, 'label': label, 'description': description,
+                 'command': '/permissions ' + name, 'tags': ['текущий'] if mode == name else []}
+                for name, label, description in (
+                    ('allow_all', 'Полный доступ', 'Все инструменты без обычных подтверждений; явные запреты сохраняются'),
+                    ('default', 'С подтверждениями', 'Спрашивать разрешение для изменяющих инструментов'),
+                    ('read_only', 'Только чтение', 'Без shell, записи, MCP и делегации'))]
+            choices.append({'key': 'save', 'label': 'Сохранить текущий режим по умолчанию',
+                            'description': mode + ' → $GWAGENT_HOME/settings.json',
+                            'command': '/permissions save'})
+            self.emit({'type': 'table', 'title': 'Режим доступа', 'columns': [], 'rows': [],
+                       'selection': {'kind': 'permissions', 'session_id': app.session.id,
+                                     'current': mode, 'choices': choices}})
             return True
         if text == '/revert':
             messages = app.revert_messages()
@@ -510,7 +527,7 @@ class Bridge:
             for future in list(self.pending.values()):
                 if not future.done():
                     future.cancel()
-            if self.app and self.app.task:
+            if self.app and self.app.task and not self.app.task.done():
                 self.app.task.cancel()
             elif self.work and not self.work.done():
                 self.work.cancel()

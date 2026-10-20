@@ -12,12 +12,17 @@ import httpx
 
 from .streaming import data_events
 from .tracing import current
+from .retry import TRANSIENT, retry_after
+from .model_limits import metadata
 
 
 class LLMError(Exception):
-    def __init__(self, status: int, message: str):
-        self.status, self.message = status, message
-        super().__init__(f"{status}: {message}")
+    def __init__(self, status: int, message: str, *, retryable=False, retry_after=None):
+        self.status = status
+        self.message = message if isinstance(message, str) else json.dumps(message, ensure_ascii=False)
+        self.message = self.message[:4000]
+        self.retryable, self.retry_after = retryable, retry_after
+        super().__init__(f"{status}: {self.message}")
 
 
 def _error_message(body: bytes) -> str:
@@ -67,6 +72,8 @@ class LLMClient:
         self.base_options = dict(options or {})
         self.options, self.max_tokens = dict(self.base_options), max_tokens
         self.limiter = limiter
+        self.model_metadata = {}
+        self.catalog_loaded = False
 
     async def stream(self, model, messages, tools=None, temperature=None):
         sem = self.limiter(model) if self.limiter else None
@@ -107,10 +114,11 @@ class LLMClient:
         try:
             resp = await self.http.send(request, stream=True)
         except httpx.HTTPError as exc:
-            raise LLMError(502, f"модель недоступна: {type(exc).__name__}: {exc}") from exc
+            raise LLMError(502, f"модель недоступна: {type(exc).__name__}: {exc}", retryable=True) from exc
         try:
             if resp.status_code != 200:
-                raise LLMError(resp.status_code, _error_message(await resp.aread()))
+                raise LLMError(resp.status_code, _error_message(await resp.aread()), retryable=resp.status_code in TRANSIENT,
+                               retry_after=retry_after(resp.headers.get("retry-after")))
             if not resp.headers.get("content-type", "").startswith("text/event-stream"):
                 # Апстрим проигнорировал stream=true — разбираем обычный ответ.
                 data = json.loads(await resp.aread())
@@ -142,7 +150,14 @@ class LLMClient:
                     break
                 chunk = json.loads(payload)
                 if chunk.get("error"):
-                    raise LLMError(502, _error_message(payload.encode()))
+                    error = chunk['error']
+                    code = (error.get('status') or error.get('code') or error.get('type')) if isinstance(error, dict) else None
+                    status = {'rate_limit_exceeded': 429, 'overloaded_error': 503}.get(str(code))
+                    if status is None:
+                        try:status = int(code)
+                        except (TypeError, ValueError):status = None
+                    raise LLMError(status if status in TRANSIENT else 502, _error_message(payload.encode()),
+                                   retryable=status in TRANSIENT, retry_after=retry_after(resp.headers.get('retry-after')))
                 if chunk.get("usage"):
                     usage = _usage(chunk)
                 for choice in chunk.get("choices") or []:
@@ -166,7 +181,7 @@ class LLMClient:
         except (ValueError, TypeError, KeyError, IndexError, AttributeError) as exc:
             raise LLMError(502, f"неверный ответ модели: {type(exc).__name__}") from exc
         except httpx.HTTPError as exc:
-            raise LLMError(502, f"обрыв ответа модели: {type(exc).__name__}: {exc}") from exc
+            raise LLMError(502, f"обрыв ответа модели: {type(exc).__name__}: {exc}", retryable=True) from exc
         finally:
             await resp.aclose()
 
@@ -178,9 +193,29 @@ class LLMClient:
             data = resp.json()
             if not isinstance(data, dict) or not isinstance(data.get('data'), list):
                 raise ValueError('ожидается массив data')
-            return [m['id'] for m in data['data'] if isinstance(m, dict) and isinstance(m.get('id'), str)]
+            entries = [m for m in data['data'] if isinstance(m, dict) and isinstance(m.get('id'), str)]
+            catalog = {}
+            for item in entries:
+                info = metadata(item)
+                catalog[item['id']] = {**catalog.get(item['id'], {}), **info}
+                for alias in item.get('aliases', []) if isinstance(item.get('aliases', []), list) else []:
+                    if isinstance(alias, str):
+                        catalog[alias] = {**info, **catalog.get(alias, {})}
+            self.model_metadata, self.catalog_loaded = catalog, True
+            return [m['id'] for m in entries]
         except (ValueError, TypeError, KeyError) as exc:
             raise LLMError(502, 'неверный каталог моделей') from exc
+
+    async def discover_model_limits(self):
+        if self.catalog_loaded:
+            return
+        try:
+            import asyncio
+            async with asyncio.timeout(5):
+                await self.models()
+        except (LLMError, httpx.HTTPError, ValueError, OSError, TimeoutError):
+            # Каталог необязателен: недоступность /models не блокирует чат.
+            self.catalog_loaded = True
 
 
 def _assistant(content: str, tool_calls: list[dict], reasoning: str = "") -> dict:

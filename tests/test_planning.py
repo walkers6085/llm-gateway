@@ -72,7 +72,7 @@ async def test_context_event_matches_request_and_preview_does_not_compact(tmp_pa
     agent, store, _ = make_agent(tmp_path, [{'content': 'Готово'}], seen,
                                 model_profiles={'alpha': {'max_input_tokens': 10000, 'max_output_tokens': 500}})
     store.add_message(agent.session.id, {'role': 'user', 'content': 'старая задача'})
-    store.add_message(agent.session.id, {'role': 'assistant', 'content': 'большой ответ ' * 1000})
+    store.add_message(agent.session.id, {'role': 'assistant', 'content': 'большой ответ ' * 2000})
     before = store.get(agent.session.id).context_seq
     status = agent.context_status()
     assert status['estimated_tokens'] > 10000
@@ -80,7 +80,8 @@ async def test_context_event_matches_request_and_preview_does_not_compact(tmp_pa
     events = await run(agent, 'Последний запрос')
     context = next(event for event in events if event['type'] == 'context')
     assert context['max_input_tokens'] == 10000 and context['max_output_tokens'] == 500
-    size = len(json.dumps([seen[0]['messages'], seen[0]['tools']], ensure_ascii=False).encode()) + 64
+    from agent.model_limits import estimate_tokens
+    size = estimate_tokens(seen[0]['messages'], seen[0]['tools'])
     assert context['estimated_tokens'] == size
     await agent.llm.http.aclose(); store.close()
 

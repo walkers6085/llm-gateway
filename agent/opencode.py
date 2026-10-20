@@ -123,6 +123,7 @@ def prepare(manager, path, *, replace=False):
                 if type(context) is not int or context<1 or output is not None and (type(output) is not int or output<1 or output>=context):
                     raise ValueError(name+'/'+model+': нужны положительные лимиты, output меньше context')
                 # Без явного output сохраняем резерв штатного лимита ответа 1024.
+                profile['context_window']=context
                 profile['max_input_tokens']=context-(output or 1024)
                 if profile['max_input_tokens']<1:raise ValueError(name+'/'+model+': context слишком мал для резерва ответа')
             native=profile.setdefault('options',{})
@@ -177,7 +178,11 @@ def export_config(manager,path,*,providers=None):
             spec={'name':p.get('model_names',{}).get(model,model)}
             if 'free' in p.get('tags',{}).get(model,[]):spec['cost']={'input':0,'output':0}
             if 'api_model' in params:spec['id']=params['api_model']
-            if 'max_input_tokens' in profile:spec.setdefault('limit',{})['context']=profile['max_input_tokens']+profile.get('max_output_tokens',1024)
+            window = profile.get('context_window')
+            if window and profile.get('max_input_tokens') and profile['max_input_tokens'] != window-profile.get('max_output_tokens',1024):
+                raise ValueError(name+'/'+model+': отдельный лимит входа и окно модели не отображаются в OpenCode без потерь')
+            if window or profile.get('max_input_tokens'):
+                spec.setdefault('limit',{})['context']=window or profile['max_input_tokens']+profile.get('max_output_tokens',1024)
             if 'max_output_tokens' in profile:spec.setdefault('limit',{})['output']=profile['max_output_tokens']
             values={external:params[internal] for external,internal in (('temperature','temperature_value'),('topP','top_p'),('reasoningEffort','reasoning_effort')) if internal in params}
             if values:spec['options']=values

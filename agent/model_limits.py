@@ -8,7 +8,7 @@ KNOWN_WINDOWS = {
     'glm-4.5': 131072, 'glm-4.5-air': 131072, 'glm-4.5-flash': 131072,
     'glm-4.7': 200000, 'glm-4.7-flash': 200000, 'glm-5.1': 200000,
 }
-FALLBACK_WINDOW = 131072
+FALLBACK_WINDOW = 120000
 
 
 def positive(value):
@@ -44,18 +44,24 @@ def resolve(settings, model, catalog=None):
         window, source = KNOWN_WINDOWS.get(api_model.lower()), 'catalog'
     if not window:
         window, source = FALLBACK_WINDOW, 'fallback'
-    output = profile.get('max_output_tokens', settings.get('max_output_tokens', 1024))
-    output = min(output, positive(reported.get('max_output_tokens')) or output, max(1, window - 1))
+    requested = profile.get('max_output_tokens', settings.get('max_output_tokens', 0))
+    if requested == 0:
+        # Лимита ответа нет: max_tokens не отправляется, длину задаёт промпт.
+        output = 0
+    else:
+        output = min(requested, positive(reported.get('max_output_tokens')) or requested, max(1, window - 1))
     configured = profile.get('max_input_tokens', settings.get('max_input_tokens', 0))
     if source == 'fallback':
         window = max(window, (configured or 0) + output)
     # Явный лимит входа — пользовательское ограничение, а не паспортное окно модели.
     input_limit = min(configured or window - output, max(1, window - output))
+    # 0 отключает суммарный бюджет: размер окна ограничивает один вызов, а не весь ход.
     turn = profile.get('max_turn_tokens', settings.get('max_turn_tokens', 0))
     return {**settings, **profile, 'context_window': window, 'context_source': source,
             'context_known': source != 'fallback', 'max_input_tokens': input_limit,
             'input_limit_source': 'config' if configured else source,
-            'max_output_tokens': output, 'max_turn_tokens': turn or max(65536, window * 4)}
+            'max_output_tokens': output, 'output_unlimited': output == 0,
+            'max_turn_tokens': turn}
 
 
 def estimate_tokens(messages, tools=None):

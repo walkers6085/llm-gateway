@@ -13,8 +13,8 @@ from tests.test_loop import make_agent, run, hook_cmd
 
 def test_plan_registry_contains_only_safe_tools():
     plan = make_registry(DEFAULTS, agent_mode='plan')
-    assert {'read_file', 'grep', 'goal', 'todo', 'question'} <= set(plan.names())
-    assert not {'shell', 'write_file', 'edit_file', 'http_request', 'subagent'} & set(plan.names())
+    assert {'read_file', 'grep', 'goal', 'todo', 'question', 'subagent', 'inspect'} <= set(plan.names())
+    assert not {'shell', 'write_file', 'edit_file', 'http_request'} & set(plan.names())
     build = make_registry(DEFAULTS)
     assert {'shell', 'write_file', 'question'} <= set(build.names())
 

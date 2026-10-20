@@ -198,10 +198,79 @@ class SessionStore:
         rows = self.db.execute(sql, args).fetchall()
         return _row(rows[0]) if len(rows) == 1 else None
 
-    def list(self, owner: str, limit: int = 50) -> list[Session]:
-        rows = self.db.execute("SELECT * FROM agent_sessions WHERE owner=? ORDER BY updated DESC LIMIT ?",
-                               (owner, limit))
-        return [_row(r) for r in rows]
+    def list(self, owner: str, limit: int = 50, *, include_internal=False) -> list[Session]:
+        hidden = set()
+        if not include_internal:
+            for row in self.db.execute("SELECT e.data,e.session_id,e.event FROM agent_trace_events e JOIN agent_sessions s ON s.id=e.session_id WHERE s.owner=? AND e.event IN ('subagent.start','session.internal')", (owner,)):
+                data = json.loads(row['data'])
+                if row['event'] == 'session.internal':
+                    hidden.add(row['session_id'])
+                elif data.get('hidden'):
+                    hidden.add(data.get('child_session_id'))
+        sessions = []
+        rows = self.db.execute("SELECT * FROM agent_sessions WHERE owner=? ORDER BY updated DESC", (owner,))
+        for row in rows:
+            if len(sessions) >= limit:
+                break
+            if row['id'] in hidden:
+                continue
+            session = _row(row)
+            if session.title_auto:
+                session.title = self.ensure_title(session.id)
+            sessions.append(session)
+        return sessions
+
+    def ensure_title(self, session_id, text=None, *, force=False):
+        """Восстанавливаем автозаголовок из исходного запроса, не меняя порядок сессий."""
+        session = self.get(session_id)
+        if session is None:
+            raise ValueError('сессия не найдена')
+        if not session.title_auto and not force:
+            return session.title
+        texts = []
+        for row in self.db.execute("SELECT m.data,x.data AS meta FROM agent_messages m LEFT JOIN agent_message_meta x USING(session_id,seq) WHERE m.session_id=? AND m.role='user' ORDER BY m.seq LIMIT 40", (session_id,)):
+            meta = json.loads(row['meta'] or '{}')
+            if meta.get('request_id') and 'user_input' not in meta:
+                continue
+            texts.append(meta.get('user_input', json.loads(row['data']).get('content') or ''))
+        if text:
+            texts.append(text)
+        title = next((task_title(value) for value in texts if meaningful_title(value)), None)
+        title = title or (task_title(texts[0]) if texts else initial_title(session_id) if force else session.title or initial_title(session_id))
+        if not session.title_auto or title != session.title:
+            self.db.execute('UPDATE agent_sessions SET title=?,title_auto=1 WHERE id=?', (title, session_id))
+        return title
+
+    def statistics(self, owner, session_id=None):
+        """Агрегаты только владельца; токены берём из model.end без дублирования usage."""
+        from .statistics import summarize
+        if session_id is not None and self.get(session_id, owner=owner) is None:
+            raise ValueError('сессия не найдена')
+        where, args = 's.owner=?', [owner]
+        if session_id is not None:
+            where += ' AND s.id=?'
+            args.append(session_id)
+        sessions = self.db.execute('SELECT COUNT(*) FROM agent_sessions s WHERE ' + where, args).fetchone()[0]
+        related = "SELECT request_id FROM agent_trace_events WHERE session_id=? AND event='request.start' AND parent_span_id=''"
+        event_where = where if session_id is None else 's.owner=? AND (s.id=? OR e.request_id IN (' + related + '))'
+        tool_where = where if session_id is None else 's.owner=? AND (s.id=? OR t.request_id IN (' + related + '))'
+        related_args = args if session_id is None else [owner, session_id, session_id]
+        events = [dict(row) for row in self.db.execute("SELECT e.event,e.data FROM agent_trace_events e JOIN agent_sessions s ON s.id=e.session_id WHERE e.event IN ('request.start','model.end','model.retry','context.compacted') AND " + event_where, related_args)]
+        tools = [dict(row) for row in self.db.execute('SELECT t.tool,t.ok,t.ms FROM agent_tool_runs t JOIN agent_sessions s ON s.id=t.session_id WHERE ' + tool_where, related_args)]
+        messages = self.db.execute("SELECT COUNT(*) FROM agent_messages m JOIN agent_sessions s ON s.id=m.session_id WHERE " + where + " AND m.role='user'", args).fetchone()[0]
+        return summarize(events, tools, sessions=sessions, messages=messages)
+
+    def session_summaries(self, owner):
+        """Краткие метрики списка одним проходом, без загрузки текстов ответов."""
+        result = {}
+        for row in self.db.execute("SELECT m.session_id,COUNT(*) AS messages FROM agent_messages m JOIN agent_sessions s ON s.id=m.session_id WHERE s.owner=? AND m.role='user' GROUP BY m.session_id", (owner,)):
+            result[row['session_id']] = {'messages': row['messages'], 'tokens': 0, 'tokens_known': False}
+        for row in self.db.execute("SELECT e.session_id,e.data FROM agent_trace_events e JOIN agent_sessions s ON s.id=e.session_id WHERE s.owner=? AND e.event='model.end'", (owner,)):
+            data = json.loads(row['data'])
+            item = result.setdefault(row['session_id'], {'messages': 0, 'tokens': 0, 'tokens_known': False})
+            item['tokens_known'] |= bool(data.get('prompt_tokens') or data.get('completion_tokens'))
+            item['tokens'] += data.get('prompt_tokens', 0) + data.get('completion_tokens', 0)
+        return result
 
     def update(self, session_id: str, **fields) -> None:
         allowed = {"title", "model", "workspace", "allow_rules", "connection_id", "endpoint_hash", "summary", "context_seq", "title_auto", "agent_mode", "permissions_mode"}
@@ -469,7 +538,7 @@ class SessionStore:
         active = [row for row in rows if row['seq'] > session.context_seq]
         messages = [json.loads(row['data']) for row in active]
         starts = [i for i, message in enumerate(messages) if message['role'] == 'user']
-        cut = starts[-keep_turns] if len(starts) > keep_turns else 0
+        cut = starts[-keep_turns] if keep_turns > 0 and len(starts) > keep_turns else 0
         # Один длинный ход тоже сжимаем, но никогда не разрываем группу вызовов/результатов.
         if not cut:
             assistants = [i for i, message in enumerate(messages) if message['role'] == 'assistant']
@@ -528,9 +597,28 @@ def initial_title(session_id):
     return f"Новая сессия · {datetime.now().strftime('%H:%M')} · {session_id[:6]}"
 
 
+def meaningful_title(text):
+    value = re.sub(r'[^\w\s]', '', text.lower()).strip()
+    return bool(value) and value not in {'привет', 'здравствуй', 'здравствуйте', 'давай', 'го', 'продолжай', 'продолжим', 'да', 'ок', 'hello', 'hi', 'continue', 'давай продолжим', 'implement the proposed plan', 'implement the plan', 'продолжаем', 'давай начнем'}
+
+
 def task_title(text):
-    line = next((line.strip() for line in text.splitlines() if line.strip()), 'Новая задача')
-    line = re.sub(r'^[#>*\s]+', '', line)
+    from .credentials import redact
+    lines, code = [], False
+    for line in text.splitlines():
+        if line.strip().startswith('```'):
+            code = not code
+            continue
+        if code:
+            continue
+        line = re.sub(r'^\s*(?:[#>*-]+\s*|\d+[.)]\s*)', '', line).strip()
+        if not line or re.match(r'^(?:<|/|\[|https?://)', line):
+            continue
+        line = re.sub(r'^(?:привет[!,. ]*|пожалуйста[, ]*|давай(?:те)? +)', '', line, flags=re.I).strip()
+        if meaningful_title(line):
+            lines.append(line)
+    line = lines[0] if lines else next((value.strip() for value in text.splitlines() if value.strip()), 'Новая задача')
+    line = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', redact(line))
     words = line.split()
     title = ' '.join(words[:10])
     if len(title) > 64:

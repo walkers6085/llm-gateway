@@ -11,7 +11,6 @@ import argparse
 import asyncio
 import copy
 import json
-import getpass
 import os
 import signal
 import re
@@ -29,45 +28,19 @@ from .credentials import redact
 from .trust import TrustStore, fingerprint
 from .runtime import make_agent, make_registry, start_mcp
 from .settings import SettingsError, expand, load
-from .store import Session, SessionStore, task_title
+from .store import Session, SessionStore
 from .permissions import MODES
 from .model_limits import resolve
 
 OWNER = "local"
-COMMANDS = [
-    {"command": "/permissions", "description": "Выбрать режим доступа к инструментам", "arguments": "optional", "usage": "/permissions [default|allow_all|read_only] [save]"},
-    {'command': '/provider import', 'description': 'Импортировать провайдеров из OpenCode', 'arguments': 'none'},
-    {'command': '/provider export', 'description': 'Экспортировать провайдеров в OpenCode без секретов', 'arguments': 'none'},
-    {'command': '/provider model', 'description': 'Настроить модель, контекст и параметры генерации', 'arguments': 'required', 'usage': '/provider model NAME [MODEL]'},
-    {'command': '/data', 'description': 'Показать каталог настроек и данных', 'arguments': 'none'},
-    {'command': '/mode', 'description': 'Выбрать агента build или plan', 'arguments': 'optional', 'usage': '/mode [build|plan]'},
-    {'command': '/revert', 'description': 'Изменить прошлое сообщение или откатить файлы', 'arguments': 'none'},
-    {'command': '/agent', 'description': 'Поручить задачу сабагенту', 'arguments': 'required', 'usage': '/agent задача'},
-    {'command': '/logs', 'description': 'Журнал вызовов текущей сессии', 'arguments': 'optional', 'usage': '/logs [request_id]'},
-    {'command': '/help', 'description': 'Справка по командам', 'arguments': 'none'},
-    {'command': '/connect', 'description': 'Настроить провайдера и сохранить ключ', 'arguments': 'optional', 'usage': '/connect [имя]'},
-    {'command': '/provider', 'description': 'Показать или выбрать провайдера', 'arguments': 'optional', 'usage': '/provider [имя]'},
-    {'command': '/provider add', 'description': 'Добавить подключение', 'arguments': 'optional', 'usage': '/provider add [NAME]'},
-    {'command': '/provider edit', 'description': 'Изменить URL и способ подключения', 'arguments': 'required', 'usage': '/provider edit NAME'},
-    {'command': '/provider enable', 'description': 'Включить подключение', 'arguments': 'required', 'usage': '/provider enable NAME'},
-    {'command': '/provider disable', 'description': 'Отключить подключение', 'arguments': 'required', 'usage': '/provider disable NAME'},
-    {'command': '/provider remove', 'description': 'Удалить подключение и сохранённые ключи', 'arguments': 'required', 'usage': '/provider remove NAME'},
-    {'command': '/provider set', 'description': 'Изменить URL и модель подключения', 'arguments': 'required', 'usage': '/provider set NAME URL [MODEL]'},
-    {'command': '/model', 'description': 'Показать или выбрать модель', 'arguments': 'optional', 'usage': '/model [имя]'},
-    {'command': '/models', 'description': 'Модели всех провайдеров и переключение', 'arguments': 'none'},
-    {'command': '/tools', 'description': 'Доступные инструменты и параметры', 'arguments': 'optional', 'usage': '/tools [имя]'},
-    {'command': '/mcp', 'description': 'Состояние MCP-серверов', 'arguments': 'none'},
-    {'command': '/new', 'description': 'Создать новую сессию', 'arguments': 'none'},
-    {'command': '/sessions', 'description': 'Список сохранённых сессий', 'arguments': 'none'},
-    {'command': '/resume', 'description': 'Продолжить сохранённую сессию', 'arguments': 'optional', 'usage': '/resume [ID]'},
-    {'command': '/compact', 'description': 'Сократить контекст с сохранением истории', 'arguments': 'none'},
-    {'command': '/export', 'description': 'Экспортировать историю в файл', 'arguments': 'required', 'usage': '/export FILE'},
-    {'command': '/delete', 'description': 'Удалить другую сессию с подтверждением', 'arguments': 'optional', 'usage': '/delete [ID]'},
-    {'command': '/exit', 'description': 'Завершить работу', 'arguments': 'none'},
-]
 HELP = """Команды:
   /data              показать единый каталог данных
-  /provider model NAME [MODEL]  параметры модели и лимиты
+  /provider manage [NAME]  меню управления подключением
+  /provider check [NAME]   проверить API без генерации
+  /provider default [NAME] провайдер для следующих запусков
+  /provider list          подключения и пути файлов
+  /provider reload        перечитать конфигурацию после ручной правки
+  /provider model [NAME] [MODEL]  параметры модели и лимиты
   /provider import|export  обмен настройками OpenCode
   /permissions [MODE] [save]  режим доступа; save — сохранить в настройках
   /mode [build|plan]  показать или сменить активного агента
@@ -76,14 +49,16 @@ HELP = """Команды:
   /logs [request_id]  журнал запросов, моделей и инструментов
   /connect [имя]     настроить подключение и сохранить ключ/пароль
   /provider add [NAME]  пошагово добавить подключение
-  /provider edit NAME   изменить URL, ключ или сертификат
-  /provider enable|disable|remove NAME  управление подключениями
+  /provider edit [NAME] изменить URL, ключ или сертификат
+  /provider enable|disable|remove [NAME] управление подключениями
   /provider set NAME URL [MODEL]  изменить адрес и модель
   /compact           сократить контекст, сохранив историю
   /export FILE       экспорт текущей сессии
   /delete ID         удалить другую сессию
   /new               новая сессия
   /sessions          последние сессии
+  /rename название   переименовать сессию; --auto — создать название заново
+  /stats [all]       статистика сессии или всех своих сессий
   /resume <id>       продолжить сессию (достаточно начала id)
   /model [имя]       показать или сменить модель
   /models            модели всех включённых провайдеров
@@ -120,6 +95,15 @@ class Console:
         self.end_text()
         print(safe_terminal(redact(text)), file=self.err if err else self.out, flush=True)
 
+    def table(self, title, columns, rows):
+        if self.as_json:
+            self.event({'type': 'table', 'title': title, 'columns': columns, 'rows': rows})
+        else:
+            self.line(title)
+            self.line(' | '.join(map(str, columns)))
+            for row in rows:
+                self.line(' | '.join(map(str, row)))
+
     def end_text(self) -> None:
         if self.mid_text:
             print(file=self.out, flush=True)
@@ -130,6 +114,8 @@ class Console:
             print(json.dumps(ev, ensure_ascii=False), file=self.out, flush=True)
             return
         kind = ev["type"]
+        if ev.get("reset_response") or (ev.get("retry") or {}).get("reset_response"):
+            self.line("[Незавершённый ответ отброшен]")
         if kind == "text":
             self.out.write(safe_terminal(redact(ev["text"])))
             self.out.flush()
@@ -175,7 +161,7 @@ class App:
         self.task: asyncio.Task | None = None
         self.active_request_id = None
         self.providers = ProviderManager(args.providers_file)
-        self.store = SessionStore(expand(settings["sessions"]["db"]))
+        self.store = SessionStore(":memory:" if getattr(args, "management_only", False) else expand(settings["sessions"]["db"]))
         self.provider = None
         self.catalogs = {}
         self.base_profiles = copy.deepcopy(settings["model_profiles"])
@@ -220,10 +206,21 @@ class App:
         return self.llm
 
     async def switch_provider(self, name):
+        # Выбор переживает перезапуск, включая gateway из settings.json.
+        if name is None:
+            if self.providers.selected:
+                self.providers.config['selected'] = False
+                self.providers.save()
+        else:
+            if not self.providers.get(name).get('enabled', True):
+                raise ValueError('Подключение отключено; сначала /provider enable ' + name)
+            if not self.providers.selected or self.providers.config['default'] != name:
+                self.providers.use(name)
         await self.select_provider(name)
         self.session = self.create_session(self.settings['model'])
         self.rebuild()
-        self.console.line(f"Провайдер: {name}; модель: {self.session.model or '(не выбрана)'}; новая сессия {self.session.id}")
+        suffix = "" if getattr(self.args, "management_only", False) else f"; новая сессия {self.session.id}"
+        self.console.line(f"Провайдер: {name}; модель: {self.session.model or '(не выбрана)'}" + suffix)
 
     def provider_choices(self):
         choices = [{'provider': name, 'label': name + (' · ' + config['name'] if config.get('name') else ''), 'model': self.session.model if name == self.provider and self.session else config['model'],
@@ -278,49 +275,14 @@ class App:
         if provider != self.provider:
             if provider is not None and not self.providers.get(provider).get('enabled', True):
                 raise ValueError('подключение отключено')
-            await self.select_provider(provider)
-            self.session = self.create_session(model)
+            await self.switch_provider(provider)
+            self.store.update(self.session.id, model=model)
+            self.session.model = model
         else:
             self.store.update(self.session.id, model=model)
             self.session.model = model
         self.rebuild()
         self.console.line(f"Модель: {model}; провайдер: {provider or 'gateway (настройки)'}")
-
-    def configure_provider(self, name, read=input, password=getpass.getpass):
-        return self.providers.configure(name, read=read, password=password,
-            default_url=self.settings['gateway']['url'] if name == 'gateway' and not self.providers.path.exists() else None,
-            default_model=self.base_model if name == 'gateway' else '')
-
-    def import_providers(self, read=input):
-        from .opencode import prepare
-        path = read('Путь к opencode.json или opencode.jsonc: ').strip()
-        replace = read('Объединить совпадающие провайдеры? [y/N]: ').strip().lower() in ('y', 'да')
-        candidate, secrets, names = prepare(self.providers, path, replace=replace)
-        if read('Импортировать проверенные подключения ' + ', '.join(names) + '? [y/N]: ').strip().lower() not in ('y', 'да'):
-            return False
-        self.providers.save_connections(candidate, secrets)
-        return True
-
-    def export_providers(self, read=input):
-        from .opencode import export_config
-        name = read('Провайдер для экспорта (Enter — все): ').strip()
-        path = read('Путь нового файла экспорта OpenCode: ').strip()
-        variables = export_config(self.providers, path, providers=[name] if name else None)
-        self.console.line('Экспорт создан без секретов' + ('; задайте переменные: ' + ', '.join(variables) if variables else ''))
-
-    def manage_provider(self, action, name, read=input):
-        if action != 'enable' and (name == self.provider or name == self.providers.config['default']):
-            raise ValueError('Сначала выберите другой провайдер; текущее подключение нельзя отключить или удалить')
-        self.providers.get(name)
-        if action == 'remove':
-            if read(f'Удалить подключение {name} и его сохранённые ключи? [y/N]: ').strip().lower() not in ('y', 'да'):
-                return
-            self.providers.remove(name)
-        elif action in ('enable', 'disable'):
-            self.providers.update(name, enabled=action == 'enable')
-        else:
-            raise ValueError('Доступны enable, disable, remove')
-        self.console.line(f'Подключение {name}: ' + {'remove': 'удалено', 'enable': 'включено', 'disable': 'отключено'}[action])
 
     async def start(self) -> None:
         if self.settings["mcp"]["servers"]:
@@ -428,15 +390,6 @@ class App:
     def can_ask(self) -> bool:
         return self.interactive or bool(getattr(sys.stdin, "isatty", lambda: False)())
 
-    def command_catalog(self):
-        """Меню доступно без LLM; инструменты открывают справку, а не выполняются."""
-        commands = [{'kind': 'command', **item} for item in COMMANDS]
-        tools = [{'kind': 'tool', 'command': '/tools ' + tool.name, 'name': tool.name,
-                  'description': tool.description, 'permission': tool.default_permission,
-                  'arguments': 'none'}
-                 for tool in make_registry(self.settings, self.mcp, agent_mode=self.session.agent_mode).tools.values()]
-        return commands + tools
-
     async def close(self) -> None:
         if self.mcp:
             await self.mcp.close()
@@ -528,14 +481,12 @@ class App:
 
     # ---------- работа ----------
 
-    async def ask(self, text: str, *, delegate=False) -> str:
+    async def ask(self, text: str, *, delegate=False, request_id=None) -> str:
         """Один запрос к агенту; → причина done."""
         reason = "error"
-        request_id = identifier()
+        request_id = request_id or identifier()
         self.active_request_id = request_id
-        if not self.session.title or self.session.title_auto and self.session.title.startswith('Новая сессия ·'):
-            self.session.title = task_title(text)
-            self.store.update(self.session.id, title=self.session.title)
+        self.session.title = self.store.ensure_title(self.session.id, text)
 
         async def consume():
             nonlocal reason
@@ -615,23 +566,19 @@ class App:
 
     async def command(self, text: str) -> str | None:
         con = self.console
-        cmd, _, arg = text.partition(" ")
-        arg = arg.strip()
+        parts = text.strip().split(maxsplit=1)
+        if not parts:
+            return
+        cmd, arg = parts[0], parts[1].strip() if len(parts) > 1 else ''
+        if cmd in ('/provider', '/providers', '/connect'):
+            from .provider_commands import ProviderCommands
+            await ProviderCommands(self).run(text)
+            return
         if cmd in ("/exit", "/quit", "/q"):
             return "exit"
         if cmd == '/data':
             from .data import home, paths
             con.line(json.dumps({'home': str(home()), 'paths': paths()}, ensure_ascii=False, indent=2))
-        elif cmd == '/connect':
-            try:
-                name = arg or self.provider or self.providers.config['default']
-                self.configure_provider(name, read=self.read)
-                await self.switch_provider(name)
-                con.line('Учётные данные сохранены; подключение выбрано')
-            except (EOFError, KeyboardInterrupt):
-                con.line('Настройка подключения отменена', err=True)
-            except (ValueError, OSError) as exc:
-                con.line(redact(str(exc)), err=True)
         elif cmd == '/revert':
             messages = self.revert_messages()
             if not messages:
@@ -696,10 +643,19 @@ class App:
                 self.console.line(str(exc), err=True)
         elif cmd == '/compact':
             agent = self.agent or make_agent(llm=None, settings=self.settings, store=self.store, session=self.session, mcp=self.mcp)
-            changed = await agent.compact()
+            before = agent.context_status()['estimated_tokens']
+            con.line('Суммаризация контекста текущей моделью… Esc — отмена')
+            changed = await agent.compact(on_progress=con.event)
             self.session = self.store.get(self.session.id)
             self.rebuild()
-            con.line('Контекст сокращён; исходная история сохранена' if changed else 'Контекст уже минимален: последний запрос сохранён полностью')
+            result = agent.last_compaction
+            if result['method'] == 'failed':
+                con.line('Сводка не создана: ' + result['reason'] + '. Контекст и история сохранены; /compact можно повторить.', err=True)
+            elif changed:
+                after = agent.context_status()['estimated_tokens']
+                con.line(f'Контекст сокращён: сводка создана моделью · ≈{before} → {after} токенов; исходная история сохранена')
+            else:
+                con.line('Новых сообщений для сводки нет; последний запрос сохранён полностью')
         elif cmd == '/export':
             if not arg:
                 con.line('Нужен путь: /export FILE', err=True)
@@ -720,6 +676,25 @@ class App:
             self.session = self.create_session(self.session.model)
             self.rebuild()
             con.line(f"Новая сессия {self.session.id}")
+        elif cmd == '/stats':
+            from .statistics import tables
+            if arg not in ('', 'all'):
+                con.line('Использование: /stats [all]', err=True)
+            else:
+                for title, columns, rows in tables(self.store.statistics(OWNER, None if arg == 'all' else self.session.id)):
+                    con.table(title, columns, rows)
+        elif cmd == '/rename':
+            if not arg.strip():
+                con.line('Использование: /rename название | /rename --auto', err=True)
+            elif arg.strip() == '--auto':
+                self.session.title = self.store.ensure_title(self.session.id, force=True)
+                self.session.title_auto = True
+                con.line('Название: ' + self.session.title)
+            else:
+                title = safe_terminal(redact(' '.join(arg.split())))[:80]
+                self.store.update(self.session.id, title=title, title_auto=0)
+                self.session.title, self.session.title_auto = title, False
+                con.line('Название: ' + title)
         elif cmd == "/sessions":
             for s in self.store.list(OWNER, limit=20):
                 mark = "*" if s.id == self.session.id else " "
@@ -737,75 +712,6 @@ class App:
                     return None
                 self.rebuild()
                 con.line(f"Сессия {s.id}: {s.title} ({len(self.store.messages(s.id))} сообщений)")
-        elif cmd == "/provider":
-            if not arg:
-                con.line(f"Текущий провайдер: {self.provider or '(gateway из настроек)'}")
-                for name, provider in self.providers.config["providers"].items():
-                    con.line(f"  {name}: {provider['url']} · {provider['model'] or '(без модели)'}")
-            elif arg in ('import', 'export'):
-                try:
-                    if arg == 'import':
-                        if self.import_providers(read=self.read):
-                            await self.switch_provider(self.providers.config['default'])
-                            con.line('Провайдеры импортированы')
-                    else:
-                        self.export_providers(read=self.read)
-                except (EOFError, KeyboardInterrupt):
-                    con.line('Операция отменена', err=True)
-                except (ValueError, OSError) as exc:
-                    con.line(redact(str(exc)), err=True)
-            elif arg.startswith('model '):
-                fields = arg.split(maxsplit=2)
-                try:
-                    self.providers.configure_model(fields[1], fields[2] if len(fields) == 3 else None, read=self.read)
-                    if self.provider == fields[1]:
-                        self.apply_model_profiles(self.provider);self.rebuild()
-                    con.line('Параметры модели сохранены')
-                except (ValueError, OSError) as exc:
-                    con.line(redact(str(exc)), err=True)
-            elif arg == 'add' or (arg.startswith(('add ', 'edit ')) and len(arg.split()) == 2):
-                fields = arg.split()
-                name = fields[1] if len(fields) == 2 else None
-                try:
-                    if fields[0] == 'edit':
-                        self.providers.get(name)
-                    elif name and name in self.providers.config['providers']:
-                        raise ValueError('Провайдер уже существует; используйте /provider edit ' + name)
-                    name = self.configure_provider(name, read=self.read)
-                    await self.switch_provider(name)
-                    con.line('Подключение сохранено и выбрано')
-                except (ValueError, OSError) as exc:
-                    con.line(redact(str(exc)), err=True)
-            elif arg.startswith(('enable ', 'disable ', 'remove ')):
-                try:
-                    action, name = arg.split()
-                    self.manage_provider(action, name, read=self.read)
-                except (EOFError, KeyboardInterrupt):
-                    con.line('Изменение подключения отменено', err=True)
-                except (ValueError, OSError) as exc:
-                    con.line(redact(str(exc)), err=True)
-            elif arg.startswith(('add ', 'set ')):
-                fields = arg.split()
-                try:
-                    if len(fields) not in (3, 4):
-                        raise ValueError('используйте /provider add|set NAME URL [MODEL]')
-                    if fields[0] == 'add':
-                        self.providers.add(fields[1], fields[2], model=fields[3] if len(fields) == 4 else '')
-                    else:
-                        changes = {'url': fields[2]}
-                        if len(fields) == 4:
-                            changes['model'] = fields[3]
-                        self.providers.update(fields[1], **changes)
-                        if self.provider == fields[1]:
-                            await self.switch_provider(fields[1])
-                    con.line(f'Подключение {fields[1]} сохранено; /connect {fields[1]} — ключ, /provider {fields[1]} — выбрать')
-                except (ValueError, OSError) as exc:
-                    con.line(str(exc), err=True)
-            else:
-                try:
-                    await self.switch_provider(arg)
-                except (ValueError, SettingsError, OSError) as exc:
-                    con.line(f"Провайдер: {exc}", err=True)
         elif cmd == "/models":
             try:
                 models, errors = await self.all_models()
@@ -875,6 +781,8 @@ def parse_args(argv):
 async def amain(argv=None, read=input, out=None, err=None) -> int:
     if argv is None:
         argv = sys.argv[1:]
+    if argv and argv[0] in ('provider', 'providers'):
+        return await provider_utility(argv, read, out, err)
     if argv and argv[0] in ('trust', 'doctor', 'config', 'connect', 'data'):
         return await utility(argv, read, out, err)
     args = parse_args(argv)
@@ -923,6 +831,41 @@ def main(argv=None) -> int:
         return asyncio.run(amain(argv))
     except KeyboardInterrupt:
         return 130
+
+
+async def provider_utility(argv, read=input, out=None, err=None):
+    """Команды оболочки используют тот же обработчик, не запуская модель и MCP."""
+    parser = argparse.ArgumentParser(prog='gwagent provider')
+    parser.add_argument('--cwd', default=os.getcwd())
+    parser.add_argument('--settings')
+    parser.add_argument('--providers-file')
+    parser.add_argument('provider_args', nargs='*')
+    options = parser.parse_intermixed_args(argv[1:])
+    workspace = Path(options.cwd).expanduser().resolve()
+    console, app = Console(out, err), None
+    try:
+        if not workspace.is_dir():
+            raise ValueError('Рабочая папка не существует')
+        cli_args = ['--cwd', str(workspace), '--plain']
+        if options.settings:
+            cli_args += ['--settings', options.settings]
+        if options.providers_file:
+            cli_args += ['--providers-file', options.providers_file]
+        parsed = parse_args(cli_args)
+        parsed.management_only = True
+        app = App(parsed, load(workspace, extra=options.settings), workspace, console, read=read)
+        app.session = await app.pick_session()
+        from .provider_commands import ProviderCommands
+        import shlex
+        runner = ProviderCommands(app)
+        await runner.run(shlex.join(['/provider', *options.provider_args]))
+        return 1 if runner.failed else 0
+    except (ValueError, OSError) as exc:
+        console.line(str(exc), err=True)
+        return 2
+    finally:
+        if app:
+            await app.close()
 
 
 async def utility(argv, read=input, out=None, err=None):

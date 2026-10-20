@@ -3,6 +3,7 @@ import {
   BoxRenderable, CodeRenderable, MarkdownRenderable, ScrollBoxRenderable, SyntaxStyle, TextRenderable,
   TextTableRenderable, TextareaRenderable, RGBA, StyledText, type CliRenderer, type KeyEvent, type Renderable,
 } from '@opentui/core';
+import {InputHistory} from './input-history.ts';
 import {analyseResponse, safeText, safeMarkdown, type Highlight, type Table} from './format.ts';
 import {ChoiceList} from './choice.ts';
 import {ApprovalPanel,type Decision} from './approval.ts';
@@ -12,7 +13,8 @@ import {createPicker,menuSpecs,menuShortcuts,type PickerState,type PickerChoice}
 
 export type Command = {type:string; [key:string]:unknown};
 export type AgentEvent = {type:string; [key:string]:any};
-type MenuItem={kind:'command'|'tool';command:string;description:string;arguments:'none'|'optional'|'required';name?:string;usage?:string;permission?:string};
+type MenuItem={kind:'command'|'tool';command:string;label?:string;aliases?:string[];description:string;arguments:'none'|'optional'|'required';name?:string;usage?:string;permission?:string};
+type NavigationFrame={picker?:PickerState;query:string;index:number;key?:string;draft:string};
 const highlightColor = {important:palette.blue,warning:palette.yellow,error:palette.red,success:palette.green};
 const textLimit = 131072;
 
@@ -90,6 +92,7 @@ type ToolCard={name:string;box:BoxRenderable;title:TextRenderable;details:TextRe
 
 export class AgentView {
   readonly root:BoxRenderable;readonly log:ScrollBoxRenderable;readonly editor:TextareaRenderable;
+  private planActions:BoxRenderable;private planReady=false;
   private header:TextRenderable;private status:TextRenderable;private footer:TextRenderable;
   private rail:Sidebar;private prompt:TextRenderable;private mask:TextRenderable;
   private approvalBox:BoxRenderable;private approvalText:TextRenderable;private syntax:SyntaxStyle;
@@ -101,6 +104,7 @@ export class AgentView {
   private expanded=false;private disposed=false;private completionStatus?:string;
   private menu:BoxRenderable;private menuList:ChoiceList;private menuHint:TextRenderable;
   private catalog:MenuItem[]=[];private menuItems:MenuItem[]=[];private menuQuery='';private menuDismissed?:string;
+  private navigation:NavigationFrame[]=[];private pendingNavigation?:NavigationFrame;private restoringNavigation?:NavigationFrame;private navigationDraft?:string;private returnAfterCancel=false;
   private picker?:PickerState;
   private shortcutDraft?:string;
   private paletteOpen=false;private paletteDraft='';
@@ -109,6 +113,9 @@ export class AgentView {
   private thoughts:{box:BoxRenderable;title:TextRenderable;body:TextRenderable;text:string;expanded:boolean}[]=[];
   private thought?:typeof this.thoughts[number];private thoughtsExpanded=false;
   private activityTimer?:ReturnType<typeof setInterval>;private busySince=0;private activity='Подготовка';private retryUntil=0;private frame=0;
+  private history:InputHistory;
+  private clickTimer?:ReturnType<typeof setTimeout>;
+  private clickStart?:{x:number;y:number};
   private requestId='';private dialogDraft?:string;
   private steeringCards=new Map<string,BoxRenderable>();private pendingSteering=new Set<string>();
   private agentMode='build';private nextAgentMode?:string;private sessionInfo?:AgentEvent;private providerName='';
@@ -120,6 +127,7 @@ export class AgentView {
 
   constructor(private renderer:CliRenderer,private send:(command:Command)=>void,private exit:()=>void,
     private writeClipboard?:(text:string)=>Promise<'written'|'attempted'|'unsupported'>){
+    this.history=new InputHistory(send,text=>{this.editor.setText(text);this.editor.gotoBufferEnd();});
     this.syntax=SyntaxStyle.fromStyles({default:{fg:palette.fg},'markup.heading':{fg:palette.blue,bold:true},
       'markup.heading.1':{fg:palette.blue,bold:true},'markup.heading.2':{fg:palette.blue,bold:true},
       'markup.strong':{fg:palette.fg,bold:true},'markup.bold':{fg:palette.fg,bold:true},'markup.link':{fg:palette.blue,underline:true},
@@ -141,10 +149,20 @@ export class AgentView {
     this.menuList.on('selectionChanged',()=>this.menuDescription());
     this.menuList.on('activate',()=>{if(this.dialog?.choices)this.submit();else if(this.picker)this.choosePicker();else this.chooseMenu();});
     this.status=new TextRenderable(renderer,{id:'status',height:1,content:'Подготовка сессии…',fg:palette.muted,flexShrink:0});this.root.add(this.status);
+    this.planActions=new BoxRenderable(renderer,{id:'plan-actions',width:'100%',height:1,flexShrink:0,flexDirection:'row',gap:2,visible:false});
+    this.planActions.add(new TextRenderable(renderer,{id:'plan-build',content:'Перейти в Build · Tab',fg:palette.blue,onMouseDown:event=>{
+      if(event.button!==0||!this.planActions.visible||this.busy||this.dialog||this.pending)return;
+      event.preventDefault();this.switchAgent('build');
+    }}));
+    this.planActions.add(new TextRenderable(renderer,{id:'plan-clarify',content:'Уточнить план',fg:palette.muted,onMouseDown:event=>{
+      if(event.button!==0||!this.planActions.visible||this.busy||this.dialog||this.pending)return;
+      event.preventDefault();this.prompt.content='Уточните требования или задайте вопрос по плану · Enter — отправить';this.editor.focus();
+    }}));
+    this.root.add(this.planActions);
     const composer=new BoxRenderable(renderer,{id:'composer',width:'100%',height:5,flexShrink:0,border:true,borderColor:palette.border,borderStyle:'rounded',paddingX:1,flexDirection:'column'});
     this.prompt=new TextRenderable(renderer,{height:1,content:'Сообщение или /help',fg:palette.blue});composer.add(this.prompt);
     this.editor=new TextareaRenderable(renderer,{id:'message',width:'100%',height:2,placeholder:'Введите задачу…',textColor:palette.fg,backgroundColor:palette.bg,focusedBackgroundColor:palette.bg,cursorColor:palette.blue,
-      keyBindings:[{name:'return',action:'submit'},{name:'return',shift:true,action:'newline'},{name:'a',ctrl:true,action:'select-all'}],onSubmit:()=>this.submit(),onContentChange:()=>{if(this.editor)this.updateMenu();}});composer.add(this.editor);
+      keyBindings:[{name:'return',action:'submit'},{name:'return',shift:true,action:'newline'},{name:'a',ctrl:true,action:'select-all'}],onSubmit:()=>this.submit(),onContentChange:()=>{if(this.editor){this.history.changed(this.editor.plainText);this.updateMenu();}}});composer.add(this.editor);
     this.mask=new TextRenderable(renderer,{content:'',height:2,fg:palette.fg,visible:false});composer.add(this.mask);this.root.add(composer);
     this.footer=new TextRenderable(renderer,{height:1,content:'Enter — отправить · Shift+Enter — строка · Esc — отмена · Ctrl+D — выход',fg:palette.muted,flexShrink:0});this.root.add(this.footer);
     renderer.root.add(this.root);
@@ -155,14 +173,18 @@ export class AgentView {
     this.resizeHandler();this.editor.focus();
   }
 
+  notificationStatus(status:string){if(this.disposed)return;this.footer.content='Enter — отправить · ↑ — история · Esc — отмена · '+status;}
+
   accept(event:AgentEvent){
     if(this.disposed)return;
     if(event.request_id)this.requestId=safeText(event.request_id);
     switch(event.type){
       case 'snapshot':{
+        const changedSession=this.sessionInfo&&this.sessionInfo.id!==event.session.id;
         const s=event.session;this.workspace=safeText(s.workspace);this.rail.update(event);
         s.permissions_mode=event.permissions_mode||s.permissions_mode||'allow_all';this.sessionInfo=s;this.providerName=safeText(event.provider);this.agentMode=s.agent_mode==='plan'?'plan':'build';this.nextAgentMode=event.next_agent_mode||undefined;this.metrics();
-        if(this.picker && this.picker.sessionId!==s.id)this.closePicker();
+        if(changedSession){this.history.reset();this.planReady=false;}
+        if(changedSession || this.picker && this.picker.sessionId!==s.id){this.closePicker();this.resetNavigation();}
         if(Array.isArray(event.catalog))this.catalog=event.catalog.filter((item:any)=>
           item && ['command','tool'].includes(item.kind) && typeof item.command==='string' && item.command.startsWith('/') && typeof item.description==='string');
         this.updateHeader();
@@ -170,7 +192,7 @@ export class AgentView {
           this.clearHistory();
           if(event.history_truncated)this.notice('Показана последняя часть истории. Полная доступна через /export.');
           for(const m of event.history){
-            if(m.role==='user')this.user(m.content||'');
+            if(m.role==='user')this.user(m.content||'',m.message_id);
             else if(m.role==='assistant'){
               if(m.reasoning_content){this.reasoning(m.reasoning_content);this.thought=undefined;}
               if(m.content){const answer=this.answer(m.content,true,m.agent_mode||'build');answer.setMetrics(m.metrics);}else if(m.metrics)this.answer('',true,m.agent_mode||'build').setMetrics(m.metrics);
@@ -181,6 +203,7 @@ export class AgentView {
         this.restoreQueuedInputs(event.pending_inputs);
         break;
       }
+      case 'input_history':this.history.changed(this.editor.plainText);if(this.history.accept(event,this.sessionInfo?.id)&&event.error)this.notice(event.error,'error');break;
       case 'ready':this.ready=true;this.setBusy(false);this.status.content=this.completionStatus||'Готово к запросу';
         if(this.queuedMenu){const command=this.queuedMenu;this.queuedMenu=undefined;this.sendCommand(command);}break;
       case 'agent_mode':this.agentMode=event.mode==='plan'?'plan':'build';this.nextAgentMode=event.next_mode||undefined;this.updateHeader();this.metrics();break;
@@ -195,7 +218,7 @@ export class AgentView {
       }
       case 'dashboard':if(this.sessionInfo&&event.permissions_mode){this.sessionInfo.permissions_mode=event.permissions_mode;this.updateHeader();}this.restoreQueuedInputs(event.pending_inputs);this.rail.update(event);this.metrics();break;
       case 'context':this.retryUntil=0;this.activity='Запрос к модели';this.rail.setContext(event);this.metrics();break;
-      case 'user':this.usage={prompt:0,completion:0};this.user(event.text);break;
+      case 'user':this.planReady=false;this.usage={prompt:0,completion:0};this.user(event.text,event.message_id);break;
       case 'reasoning':this.activity='Модель рассуждает';this.reasoning(event.text);break;
       case 'text':{
         this.activity='Модель отвечает';
@@ -206,12 +229,14 @@ export class AgentView {
       }
       case 'assistant':{const answer=this.active;this.finishAnswer();const completed=answer||this.answer(event.content||'',true);if(event.metrics)completed.setMetrics(event.metrics);this.thought=undefined;break;}
       case 'tool_call':this.activity='Инструмент: '+safeText(event.name);this.tool(event.id,event.name,event.arguments);break;
-      case 'subagent_start':this.activity='Сабагент выполняет задачу';this.tool('child-'+event.session_id,'Сабагент',event.task);break;
+      case 'subagent_start':this.activity='Сабагент · '+(event.role||'worker');this.tool('child-'+event.session_id,'Сабагент · '+(event.role||'worker'),event.task);break;
       case 'subagent_event':{
         const child=event.event;
         if(child.type==='tool_call')this.activity='Сабагент · '+safeText(child.name);
         if(child.type==='reasoning')this.reasoning(child.text);
         if(child.type==='assistant'){this.thought=undefined;if(child.metrics){const card=this.tools.get('child-'+event.session_id);card?.box.add(new TextRenderable(this.renderer,{content:formatMetrics(child.metrics),fg:palette.muted,wrapMode:'word'}));}}
+        if(child.type==='warning'){if(child.retry?.reset_response)this.resetResponse();this.notice('Сабагент: '+child.message,'warning');}
+        if(child.type==='error'&&child.reset_response)this.resetResponse();
         if(child.type==='error')this.notice('Сабагент: '+child.message,'error');
         break;
       }
@@ -233,15 +258,15 @@ export class AgentView {
         if(event.secret){this.editor.blur();this.mask.content='';}else this.editor.focus();break;
       case 'draft':this.dialogDraft=undefined;this.editor.setText(safeText(event.text));this.editor.gotoBufferEnd();break;
       case 'usage':this.rail.usage(Number(event.prompt_tokens));this.usage.prompt+=Number(event.prompt_tokens)||0;this.usage.completion+=Number(event.completion_tokens)||0;this.metrics();break;
-      case 'warning':if(event.retry){this.retryUntil=Date.now()+Number(event.retry.delay)*1000;this.activity='Ожидание повтора · HTTP '+event.retry.status;this.animateActivity();}this.notice(event.message,'warning');break;
-      case 'error':case 'fatal':this.finishAnswer();this.notice(event.message,'error');if(event.type==='fatal'){this.closePicker();this.closePalette();this.dialog=undefined;this.pending=undefined;this.secret='';this.mask.content='';this.mask.visible=false;this.editor.visible=true;this.ready=false;this.closed=true;this.setBusy(false);this.status.content='Не удалось подключиться · Ctrl+D — выход';}break;
+      case 'warning':if(event.retry?.reset_response)this.resetResponse();if(event.retry){this.retryUntil=Date.now()+Number(event.retry.delay)*1000;this.activity='Ожидание повтора · HTTP '+event.retry.status;this.animateActivity();}this.notice(event.message,'warning');break;
+      case 'error':case 'fatal':if(event.reset_response)this.resetResponse();this.finishAnswer();this.notice(event.message,'error');if(event.type==='fatal'){this.closePicker();this.closePalette();this.dialog=undefined;this.pending=undefined;this.secret='';this.mask.content='';this.mask.visible=false;this.editor.visible=true;this.ready=false;this.closed=true;this.setBusy(false);this.status.content='Не удалось подключиться · Ctrl+D — выход';}break;
       case 'notice':this.notice(event.message,event.level==='error'?'error':'important');break;
       case 'table':
         if(Object.hasOwn(menuSpecs,event.selection?.kind))this.openPicker(event);
         else this.addTable(event.title,{columns:event.columns.map(safeText),rows:event.rows.map((r:unknown[])=>r.map(safeText)),omittedRows:0,omittedColumns:0});
         break;
-      case 'done':this.finishAnswer();this.thought=undefined;if(this.activityTimer){clearInterval(this.activityTimer);this.activityTimer=undefined;}this.status.height=1;this.status.fg=palette.muted;this.pending=undefined;this.approvalBox.visible=false;this.permission.visible=false;this.status.content=this.completionStatus=({stop:'Готово',cancelled:'Отменено',error:'Ошибка',budget:'Достигнут бюджет',max_steps:'Лимит шагов',blocked:'Заблокировано'} as Record<string,string>)[event.reason]||safeText(event.reason);break;
-      case 'idle':if(this.dialogDraft!==undefined){this.editor.setText(this.dialogDraft);this.editor.gotoBufferEnd();this.dialogDraft=undefined;}this.dialog=undefined;this.secret='';this.mask.content='';this.mask.visible=false;this.editor.visible=true;this.prompt.content='Сообщение или /help';this.pending=undefined;this.approvalBox.visible=false;this.permission.visible=false;this.setBusy(false);this.shortcutDraft=undefined;this.status.content=this.completionStatus||'Готово к запросу';break;
+      case 'done':this.planReady=event.reason==='stop'&&(event.agent_mode||this.agentMode)==='plan';if(event.reason==='cancelled'&&this.pendingNavigation)this.returnAfterCancel=true;this.finishAnswer();this.thought=undefined;if(this.activityTimer){clearInterval(this.activityTimer);this.activityTimer=undefined;}this.status.height=1;this.status.fg=palette.muted;this.pending=undefined;this.approvalBox.visible=false;this.permission.visible=false;this.status.content=this.completionStatus=({stop:'Готово',cancelled:'Отменено',error:'Ошибка',budget:'Достигнут бюджет',max_steps:'Лимит шагов',blocked:'Заблокировано'} as Record<string,string>)[event.reason]||safeText(event.reason);break;
+      case 'idle':if(this.dialogDraft!==undefined){if(!this.picker){this.editor.setText(this.dialogDraft);this.editor.gotoBufferEnd();}this.dialogDraft=undefined;}this.dialog=undefined;this.secret='';this.mask.content='';this.mask.visible=false;this.editor.visible=true;this.prompt.content='Сообщение или /help';this.pending=undefined;this.approvalBox.visible=false;this.permission.visible=false;this.setBusy(false);this.shortcutDraft=undefined;this.status.content=this.completionStatus||'Готово к запросу';if(this.returnAfterCancel&&this.pendingNavigation){const frame=this.pendingNavigation;this.pendingNavigation=undefined;this.returnAfterCancel=false;this.restoreFrame(frame);}else if(this.pendingNavigation&&!this.picker)this.resetNavigation();break;
     }
     this.updateMenu();
     this.renderer.requestRender();
@@ -258,9 +283,10 @@ export class AgentView {
 
   private updateMenu(){
     if(!this.editor || this.disposed)return;
+    if(this.planActions)this.planActions.visible=this.planReady&&this.agentMode==='plan'&&!this.nextAgentMode&&this.ready&&!this.closed&&!this.busy&&!this.pending&&!this.dialog&&!this.picker&&!this.paletteOpen&&!this.editor.plainText.startsWith('/');
     if(this.dialog?.choices){this.updateDialogChoices();return;}
     if(this.picker){this.updatePicker();return;}
-    this.menu.title='Команды и инструменты';
+    this.menu.title=this.catalog.some(item=>item.label)?'Главное меню':'Команды и инструменты';
     const text=this.editor.plainText;
     if(this.menuDismissed!==undefined && text!==this.menuDismissed)this.menuDismissed=undefined;
     const query=this.paletteOpen?text.toLowerCase():text.startsWith('/')?text.slice(1).toLowerCase():'';
@@ -272,10 +298,10 @@ export class AgentView {
     if(argumentInput){this.menu.visible=false;return;}
     const changed=query!==this.menuQuery;this.menuQuery=query;
     const selected=this.menuList.getSelectedIndex();
-    const score=(item:MenuItem)=>item.command.slice(1)===query?0:(item.name||item.command.slice(1)).startsWith(query)?1:2;
-    this.menuItems=this.catalog.filter(item=>!query || `${item.command} ${item.name||''} ${item.description}`.toLowerCase().includes(query))
+    const score=(item:MenuItem)=>item.command.slice(1)===query||item.aliases?.includes(query)?0:(item.label||item.name||item.command.slice(1)).toLowerCase().startsWith(query)?1:2;
+    this.menuItems=this.catalog.filter(item=>!query || `${item.command} ${item.label||''} ${item.name||''} ${(item.aliases||[]).join(' ')} ${item.description}`.toLowerCase().includes(query))
       .sort((a,b)=>score(a)-score(b));
-    this.menuList.options=this.menuItems.map(item=>({name:item.command+' — '+safeText(item.description).replace(/\s+/g,' '),group:query?'':item.kind==='tool'?'Инструменты':'Команды',badges:item.kind==='tool'?[{text:'инструмент',tone:'info' as const}]:[],value:item}));
+    this.menuList.options=this.menuItems.map(item=>({name:item.label||item.command+' — '+safeText(item.description).replace(/\s+/g,' '),group:query||item.label?'':item.kind==='tool'?'Инструменты':'Команды',badges:item.kind==='tool'?[{text:'инструмент',tone:'info' as const}]:[],value:item}));
     this.menuList.height=Math.min(12,Math.max(1,this.renderer.height-15),Math.max(1,this.menuItems.length+(query?0:2)));
     this.menuList.setSelectedIndex(changed?0:Math.max(0,Math.min(selected,this.menuItems.length-1)));
     this.menu.visible=true;this.menuDescription();this.renderer.requestRender();
@@ -290,12 +316,12 @@ export class AgentView {
       const crossProvider=choice?.provider!==undefined && choice.provider!==picker.currentProvider;
       const active=picker.choices.find(item=>item.key===picker.current);
       const current=active?(active.group?active.group+' / ':'')+active.name:picker.currentLabel;
-      this.menuHint.content=`${picker.kind==='provider'?'Провайдер':'Текущая'}: ${safeText(current)} · найдено: ${count}${count?'':' · совпадений нет'}${crossProvider?' · новая сессия':''}\n↑/↓ — выбор · Enter — ${menuSpecs[picker.kind].action} · Tab — раздел · Esc — отмена`;
+      this.menuHint.content=`${picker.kind==='provider'?'Провайдер':'Текущая'}: ${safeText(current)} · найдено: ${count}${count?'':' · '+(picker.choices.length?'совпадений нет':menuSpecs[picker.kind].empty)}${crossProvider?' · новая сессия':''}\n↑/↓ — выбор · Enter — ${menuSpecs[picker.kind].action} · Tab — раздел · Esc — отмена`;
       return;
     }
     const item=this.menuItems[this.menuList.getSelectedIndex()];
     this.menuHint.content=item
-      ? `${safeText(item.usage||item.command)}${item.kind==='tool'?` · по умолчанию: ${safeText(item.permission)} · открыть параметры`:''}\n↑/↓ — выбор · Enter — открыть · Tab — подставить · Esc — закрыть (${this.menuItems.length})`
+      ? `${safeText(item.label?item.description:item.usage||item.command)}${item.kind==='tool'?` · по умолчанию: ${safeText(item.permission)} · открыть параметры`:''}\n↑/↓ — выбор · Enter — открыть · Tab — подставить · Esc — закрыть (${this.menuItems.length})`
       : 'Совпадений нет. Измените запрос или нажмите Esc.';
   }
 
@@ -303,13 +329,14 @@ export class AgentView {
     const item=this.menuItems[this.menuList.getSelectedIndex()];
     if(!item)return;
     const savedDraft=this.paletteOpen?this.paletteDraft:undefined;
-    const text=item.command+((completeOnly && item.arguments!=='none')||item.arguments==='required'?' ':'');
+    if(item.label&&!completeOnly)this.pendingNavigation={query:this.editor.plainText.replace(/^\//,''),index:this.menuList.getSelectedIndex(),draft:this.paletteOpen?this.paletteDraft:''};
+    const text=item.command+(completeOnly && item.arguments!=='none'?' ':'');
     this.closePalette();this.menuDismissed=text;this.menu.visible=false;
-    if(savedDraft!==undefined && !completeOnly && item.arguments!=='required'){
+    if(savedDraft!==undefined && !completeOnly){
       this.shortcutDraft=savedDraft;this.sendCommand(item.command);return;
     }
     this.editor.setText(text);this.editor.gotoBufferEnd();this.editor.focus();
-    if(!completeOnly && item.arguments!=='required')this.submit();
+    if(!completeOnly)this.submit();
   }
 
   private sendCommand(text:string){
@@ -325,6 +352,7 @@ export class AgentView {
   }
 
   private openPalette(){
+    this.resetNavigation();
     this.closePicker();this.paletteDraft=this.editor.plainText;this.paletteOpen=true;this.menuDismissed=undefined;
     this.editor.setText('');this.prompt.content='Поиск команды или инструмента';this.updateMenu();
   }
@@ -333,6 +361,7 @@ export class AgentView {
     if(!this.paletteOpen)return;
     this.paletteOpen=false;this.menu.visible=false;this.editor.setText(this.paletteDraft);this.editor.gotoBufferEnd();
     this.prompt.content='Сообщение или /help';
+    if(!this.pendingNavigation)this.resetNavigation();
   }
 
   private updateDialogChoices(){
@@ -340,16 +369,25 @@ export class AgentView {
     const initial=this.dialogChoiceId!==dialog.id;this.dialogChoiceId=dialog.id;
     this.menuList.options=dialog.choices.map((choice:any)=>({name:choice.label,description:choice.description,
       disabled:choice.disabled,badges:choice.danger?[{text:'необратимо',tone:'error'}]:[],value:choice}));
-    if(initial)this.menuList.setSelectedIndex(0);
+    if(initial){
+      const index=dialog.default_value===undefined?0:dialog.choices.findIndex((choice:any)=>choice.value===dialog.default_value);
+      this.menuList.setSelectedIndex(Math.max(0,index));
+    }
     this.menuList.height=Math.min(6,Math.max(1,this.renderer.height-19),dialog.choices.reduce((count:number,choice:any)=>count+(choice.description?2:1),0));
     this.menu.title=dialog.question?'Ответьте на вопрос':'Выберите действие';this.menu.visible=true;this.menuDescription();
   }
 
   private openPicker(event:AgentEvent){
     this.closePalette();
-    const picker=createPicker(event,this.shortcutDraft??this.editor.plainText);this.shortcutDraft=undefined;
-    if(!picker.choices.length){this.notice(menuSpecs[picker.kind].empty,'important');return;}
-    this.picker=picker;this.editor.setText('');this.updatePicker();
+    const parent=this.pendingNavigation;
+    if(parent&&!event.selection.replace){this.navigation.push(parent);if(this.navigation.length>32)this.navigation.shift();}
+    if(!event.selection.route&&!parent)this.navigationDraft=undefined;
+    this.navigationDraft??=parent?.draft??this.shortcutDraft??this.editor.plainText;
+    this.pendingNavigation=undefined;
+    const picker=createPicker(event,this.navigationDraft);this.shortcutDraft=undefined;
+    const restore=this.restoringNavigation;this.restoringNavigation=undefined;
+    if(restore){picker.current=restore.key||picker.current;picker.restoreIndex=restore.index;}
+    this.picker=picker;this.editor.setText(restore?.query||'');this.updatePicker();
   }
 
   private updatePicker(){
@@ -364,9 +402,9 @@ export class AgentView {
     const changed=picker.query!==query;picker.query=query;
     this.menuList.options=options;
     const index=options.findIndex(option=>option.value.key===(initial?picker.current:previous));
-    this.menuList.setSelectedIndex(initial?Math.max(0,index):changed?0:Math.max(0,index));
+    this.menuList.setSelectedIndex(initial?Math.max(0,index<0?picker.restoreIndex||0:index):changed?0:Math.max(0,index));
     this.menuList.height=Math.min(20,Math.max(3,this.renderer.height-15),Math.max(1,options.reduce((sum,item)=>sum+(item.description?2:1),0)+new Set(options.map(item=>item.group).filter(Boolean)).size));
-    this.menu.title=menuSpecs[picker.kind].title;this.menu.visible=true;
+    this.menu.title=picker.title||menuSpecs[picker.kind].title;this.menu.visible=true;
     this.prompt.content=menuSpecs[picker.kind].search;
     this.menuDescription();this.renderer.requestRender();
   }
@@ -383,8 +421,9 @@ export class AgentView {
     const picker=this.picker;
     const choice=this.menuList.getSelectedOption()?.value as PickerChoice|undefined;
     if(!picker || !choice || !picker.choices.some(item=>item.key===choice.key))return;
+    if(picker.route)this.pendingNavigation={picker,query:this.editor.plainText,index:this.menuList.getSelectedIndex(),key:choice.key,draft:picker.draft};
     this.closePicker();
-    if(picker.kind==='session'||picker.kind==='session-delete'||picker.kind==='revert'){
+    if(picker.kind==='command'||picker.kind==='session'||picker.kind==='session-delete'||picker.kind==='revert'){
       this.setBusy(true);this.send({type:'select',kind:picker.kind,target:choice.target,session_id:picker.sessionId});
     }else if(choice.command){
       this.sendCommand(choice.command);
@@ -396,6 +435,22 @@ export class AgentView {
     }
   }
 
+  private resetNavigation(){this.navigation=[];this.pendingNavigation=undefined;this.restoringNavigation=undefined;this.navigationDraft=undefined;this.returnAfterCancel=false;}
+
+  private restoreFrame(frame:NavigationFrame){
+    this.closePicker();
+    if(!frame.picker){
+      this.paletteDraft=frame.draft;this.paletteOpen=true;this.editor.setText(frame.query);this.menuDismissed=undefined;this.updateMenu();this.menuList.setSelectedIndex(frame.index);return;
+    }
+    this.restoringNavigation=frame;this.setBusy(true);
+    this.send({type:'navigate',route:frame.picker.route,session_id:frame.picker.sessionId});
+  }
+
+  private backPicker(){
+    const parent=this.navigation.pop();
+    if(parent)this.restoreFrame(parent);else{this.closePicker();this.resetNavigation();}
+  }
+
   private append(item:Renderable){
     this.log.add(item);this.entries.push(item);
     while(this.entries.length>80){
@@ -404,12 +459,33 @@ export class AgentView {
       for(const [id,card] of this.tools)if(card.box===old)this.tools.delete(id);
     }
   }
-  private user(text:string){
+  private user(text:string,messageId?:string){
     const box=new BoxRenderable(this.renderer,{width:'100%',flexShrink:0,border:true,borderStyle:'rounded',borderColor:palette.blue,title:'Вы',paddingX:1});
+    if(messageId)box.onMouse=event=>{
+      const cancel=()=>{if(this.clickTimer)clearTimeout(this.clickTimer);this.clickTimer=undefined;};
+      if(event.type==='down'){
+        if(this.clickTimer){cancel();this.clickStart=undefined;return;}
+        this.clickStart=event.button===0&&!Object.values(event.modifiers).some(Boolean)?{x:event.x,y:event.y}:undefined;
+      }
+      if(event.type==='drag'){cancel();this.clickStart=undefined;}
+      if(event.type==='up'&&this.clickStart){
+        const start=this.clickStart;this.clickStart=undefined;
+        if(event.x!==start.x||event.y!==start.y)return;
+        const session=this.sessionInfo?.id;
+        this.clickTimer=setTimeout(()=>{
+          this.clickTimer=undefined;
+          if(this.disposed||box.isDestroyed||session!==this.sessionInfo?.id||this.renderer.getSelection()?.getSelectedText())return;
+          if(this.busy){this.notice('Редактирование доступно после завершения или отмены запроса');return;}
+          if(this.pendingSteering.has(messageId)){this.notice('Уточнение ещё не применено');return;}
+          if(this.dialog||this.pending)return;
+          this.send({type:'edit_message',session_id:session,message_id:messageId});this.setBusy(true);
+        },250);
+      }
+    };
     box.add(new TextRenderable(this.renderer,{content:safeText(text).slice(0,textLimit),fg:palette.fg,wrapMode:'word'}));this.append(box);return box;
   }
   private queuedInput(id:string,text:string,status='pending'){
-    let card=this.steeringCards.get(id);if(!card){card=this.user(text);this.steeringCards.set(id,card);}
+    let card=this.steeringCards.get(id);if(!card){card=this.user(text,id);this.steeringCards.set(id,card);}
     card.title=status==='pending'?'Вы · уточнение ожидает безопасного шага':'Вы · уточнение учтено';
     if(status==='pending')this.pendingSteering.add(id);else this.pendingSteering.delete(id);
   }
@@ -426,6 +502,16 @@ export class AgentView {
     if(this.timer){clearTimeout(this.timer);this.timer=undefined;}
     if(!this.active)return;
     this.active.update(this.streamingText,false);this.highlights(analyseResponse(this.streamingText.slice(0,textLimit)).highlights);this.renderer.requestRender();
+  }
+  private resetResponse(){
+    if(this.timer){clearTimeout(this.timer);this.timer=undefined;}
+    const discarded=[this.active?.box,this.thought?.box].filter((box):box is BoxRenderable=>!!box);
+    this.active=undefined;this.thought=undefined;this.streamingText='';
+    for(const box of discarded){
+      this.entries=this.entries.filter(entry=>entry!==box);this.answers=this.answers.filter(answer=>answer.box!==box);
+      this.thoughts=this.thoughts.filter(thought=>thought.box!==box);this.log.remove(box);box.destroyRecursively();
+    }
+    this.last=this.answers.at(-1);this.highlights([]);
   }
   private finishAnswer(){
     this.flush();if(this.active){this.active.update(this.streamingText,true);this.active=undefined;}this.streamingText='';
@@ -513,6 +599,7 @@ export class AgentView {
   }
   private setBusy(value:boolean){
     this.busy=value;
+    if(value&&this.planActions)this.planActions.visible=false;
     if(!this.pending&&!this.dialog)this.prompt.content=value?'Уточнение в текущий цикл · Enter — отправить':'Сообщение или /help';
     if(this.activityTimer){clearInterval(this.activityTimer);this.activityTimer=undefined;}
     if(!value && this.ready)this.editor.focus();else if(value && !this.pending && !this.dialog && this.ready)this.editor.focus();
@@ -578,6 +665,10 @@ export class AgentView {
     if(this.busy)this.animateActivity();else this.status.content=message;
     this.renderer.requestRender();
   }
+  private switchAgent(mode:'build'|'plan'){
+    if(!this.ready||this.closed||this.dialog||this.pending)return;
+    this.nextAgentMode=mode;this.send({type:'set_agent',mode});this.updateHeader();this.metrics();this.updateMenu();
+  }
   private onKey(event:KeyEvent){
     const stop=()=>{event.preventDefault();event.stopPropagation();};
     if(event.ctrl && event.name==='c' && (event.shift||!this.dialog?.secret&&this.selectedText())){stop();void this.copyText(this.selectedText()||((this.editor.focused&&this.editor.visible)?this.editor.plainText:'')||this.lastAnswer());return;}
@@ -585,7 +676,7 @@ export class AgentView {
     if(event.ctrl && event.name==='d'){stop();this.exit();return;}
     if(event.ctrl && event.name==='c'){
       if(this.paletteOpen && !this.busy && !this.pending && !this.dialog){stop();this.closePalette();return;}
-      if(this.picker && !this.busy && !this.pending && !this.dialog){stop();this.closePicker();return;}
+      if(this.picker && !this.busy && !this.pending && !this.dialog){stop();this.closePicker();this.resetNavigation();return;}
       stop();if(this.busy||this.pending||this.dialog)this.cancelInput();else this.exit();return;
     }
     if(!this.ready && !this.closed && !this.dialog && !this.pending){
@@ -618,7 +709,7 @@ export class AgentView {
       if(event.name==='up'||event.name==='down'||event.name==='pageup'||event.name==='pagedown'){
         stop();if(event.name==='up'||event.name==='pageup')this.menuList.moveUp(event.name==='pageup'?5:1);else this.menuList.moveDown(event.name==='pagedown'?5:1);this.menuDescription();return;
       }
-      if(event.name==='escape'){stop();this.closePicker();return;}
+      if(event.name==='escape'){stop();this.backPicker();return;}
       if(event.name==='return'){stop();this.choosePicker();return;}
       if(event.name==='tab'){stop();this.menuList.moveGroup(event.shift?-1:1);this.menuDescription();return;}
     }
@@ -627,17 +718,19 @@ export class AgentView {
       if(event.name==='escape'){stop();if(this.paletteOpen)this.closePalette();else{this.menuDismissed=this.editor.plainText;this.menu.visible=false;}return;}
       if((event.name==='return'||event.name==='tab') && this.menuItems.length){stop();this.chooseMenu(event.name==='tab');return;}
     }
+    if(!this.dialog&&!this.pending&&!this.picker&&!this.menu.visible&&this.ready&&!this.closed&&this.editor.focused&&!event.ctrl&&!event.meta&&!event.shift&&(event.name==='up'||event.name==='down')){
+      if(this.history.move(event.name==='up'?'previous':'next',this.sessionInfo?.id,this.editor.plainText)){stop();return;}
+    }
     if(event.name==='escape'&&!event.ctrl&&!event.meta&&this.busy&&!this.dialog&&!this.pending){
       stop();this.cancelInput();return;
     }
     if(!this.dialog && !this.pending && this.ready && !this.busy && !this.closed){
       if(event.ctrl && event.name==='p'){stop();if(this.paletteOpen)this.closePalette();else this.openPalette();return;}
       const command=menuShortcuts[event.name]?.command;
-      if(command){stop();this.closePicker();this.closePalette();this.shortcutDraft=this.editor.plainText;this.sendCommand(command);return;}
+      if(command){stop();this.closePicker();this.closePalette();this.resetNavigation();this.shortcutDraft=this.editor.plainText;this.sendCommand(command);return;}
     }
     if(event.name==='tab'&&!event.ctrl&&!event.meta&&!this.dialog&&!this.picker&&!this.menu.visible&&this.ready&&!this.closed){
-      stop();const mode=(this.nextAgentMode||this.agentMode)==='build'?'plan':'build';this.nextAgentMode=mode;
-      this.send({type:'set_agent',mode});this.updateHeader();this.metrics();return;
+      stop();this.switchAgent((this.nextAgentMode||this.agentMode)==='build'?'plan':'build');return;
     }
     if(event.ctrl && event.name==='e'){stop();this.noticesExpanded=!this.noticesExpanded;for(const card of this.notices)card.detail.visible=this.noticesExpanded;this.renderer.requestRender();return;}
     if(event.ctrl && event.name==='t'){stop();this.thoughtsExpanded=!this.thoughtsExpanded;for(const card of this.thoughts){card.expanded=this.thoughtsExpanded;card.body.visible=card.expanded;this.updateThoughtTitle(card);}return;}
@@ -647,11 +740,13 @@ export class AgentView {
     if(!this.ready){stop();if(this.closed && event.name==='q')this.exit();}
   }
   private clearHistory(){
+    if(this.clickTimer)clearTimeout(this.clickTimer);this.history.reset();
     this.finishAnswer();for(const entry of this.entries){this.log.remove(entry);entry.destroyRecursively();}
     this.steeringCards.clear();this.pendingSteering.clear();
     this.entries=[];this.answers=[];this.tools.clear();this.thoughts=[];this.thought=undefined;this.notices=[];this.active=undefined;this.last=undefined;this.highlights([]);
   }
   async dispose(){
+    if(this.clickTimer)clearTimeout(this.clickTimer);
     this.disposed=true;if(this.timer)clearTimeout(this.timer);if(this.activityTimer)clearInterval(this.activityTimer);this.secret='';
     this.renderer.keyInput.off('keypress',this.keyHandler);this.renderer.keyInput.off('paste',this.pasteHandler);this.renderer.off('resize',this.resizeHandler);
     await this.clipboard?.dispose();

@@ -47,7 +47,7 @@ export class Sidebar extends BoxRenderable{
         chunk(`Окно: ${window.toLocaleString('ru-RU')} ток.\n${origin}\n~${Math.round(used).toLocaleString('ru-RU')} / ${limit.toLocaleString('ru-RU')} ток.\nОценка следующего входа`,palette.muted),
         chunk(this.context?.input_limit_source==='config'?'\nВход ограничен настройками':'',palette.muted),
         chunk(this.lastPrompt!==undefined?`\nПоследний вход: ${this.lastPrompt.toLocaleString('ru-RU')} ток.`:'',palette.muted),
-        chunk(`\nРезерв ответа: ${Number(this.context?.max_output_tokens||0).toLocaleString('ru-RU')}`,palette.muted)]);
+        chunk(`\nРезерв ответа: ${Number(this.context?.max_output_tokens||0)>0?Number(this.context?.max_output_tokens).toLocaleString('ru-RU'):'без ограничения'}`,palette.muted)]);
     }else this.contextText.content='Контекст\nЛимит пока неизвестен';
     const goal=safeText(this.planning.goal||'Появится после первого запроса');
     this.goalHeading.content='Цель'+(goal.length>112?(this.goalExpanded?' · свернуть':' · раскрыть'):'');

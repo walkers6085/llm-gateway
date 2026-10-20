@@ -106,7 +106,7 @@ async def test_cancel_during_backoff_is_immediate_and_history_valid(tmp_path):
         await agent.llm.http.aclose();store.close()
 
 
-async def test_streamed_content_is_not_retried(tmp_path):
+async def test_streamed_content_retries_until_exhausted(tmp_path):
     agent,store,_=make_agent(tmp_path,[],model_retry=FAST);seen=[]
     class Broken(httpx.AsyncByteStream):
         async def __aiter__(self):
@@ -118,8 +118,9 @@ async def test_streamed_content_is_not_retried(tmp_path):
     await agent.llm.http.aclose();agent.llm.http=httpx.AsyncClient(base_url='https://example.test/v1',transport=httpx.MockTransport(handler))
     try:
         events=await run(agent)
-        assert events[-1]['reason']=='error' and len(seen)==1
-        assert not any(e.get('retry') for e in events)
+        assert events[-1]['reason']=='error' and len(seen)==4
+        assert all(e['retry']['reset_response'] for e in events if e.get('retry'))
+        assert not any(m['role']=='assistant' for m in store.messages(agent.session.id))
     finally:
         await agent.llm.http.aclose();store.close()
 
@@ -215,3 +216,104 @@ async def test_structured_error_message_and_sse_429_are_recoverable(tmp_path):
             assert (await run(agent))[-1]['reason']=='stop' and len(seen)==2
         finally:
             await agent.llm.http.aclose();store.close()
+
+
+@pytest.mark.parametrize('fragment', ['content', 'reasoning_content'])
+async def test_remote_protocol_retry_discards_fragment_and_does_not_replay_tool(tmp_path, fragment):
+    from tests.fakes import sse_body
+    seen=[]
+    class Broken(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            chunk={'choices':[{'delta':{fragment:'Оборванный фрагмент', 'tool_calls':[{'index':0,'id':'bad','type':'function','function':{'name':'echo','arguments':'{"text":"не выполнять"'}}]}}]}
+            yield ('data: '+json.dumps(chunk)+'\n\n').encode()
+            raise httpx.RemoteProtocolError('peer closed connection without sending complete message body')
+    def handler(request):
+        seen.append(json.loads(request.content))
+        if len(seen)==1:
+            return httpx.Response(200,content=sse_body({'tool_calls':[tool_call('once','echo',text='один раз')]}),headers={'content-type':'text/event-stream'})
+        if len(seen)==2:
+            return httpx.Response(200,stream=Broken(),headers={'content-type':'text/event-stream'})
+        return httpx.Response(200,content=sse_body({'content':'Полный восстановленный ответ'}),headers={'content-type':'text/event-stream'})
+    agent,store,_=make_agent(tmp_path,[],model_retry=FAST)
+    await agent.llm.http.aclose();agent.llm.http=httpx.AsyncClient(base_url='https://example.test/v1',transport=httpx.MockTransport(handler))
+    try:
+        events=await run(agent)
+        assert events[-1]['reason']=='stop' and len(seen)==3
+        retries=[e for e in events if e.get('retry')]
+        assert len(retries)==1 and retries[0]['retry']['reset_response']
+        assert len([e for e in events if e['type']=='tool_result'])==1
+        assert len(store.tool_runs(agent.session.id))==1
+        history=store.messages(agent.session.id)
+        assert not any('Оборванный фрагмент' in (m.get('content') or '') for m in history)
+        assert history[-1]['content']=='Полный восстановленный ответ'
+        assert all('Оборванный фрагмент' not in json.dumps(request,ensure_ascii=False) for request in seen)
+    finally:
+        await agent.llm.http.aclose();store.close()
+
+
+async def test_unfinished_sse_eof_is_retryable(tmp_path):
+    from tests.fakes import sse_body
+    seen=[]
+    def handler(request):
+        seen.append(request)
+        body=b'data: {"choices":[{"delta":{"content":"broken"}}]}\n\n' if len(seen)==1 else sse_body({'content':'complete'})
+        return httpx.Response(200,content=body,headers={'content-type':'text/event-stream'})
+    agent,store,_=make_agent(tmp_path,[],model_retry=FAST)
+    await agent.llm.http.aclose();agent.llm.http=httpx.AsyncClient(base_url='https://example.test/v1',transport=httpx.MockTransport(handler))
+    try:
+        events=await run(agent)
+        assert len(seen)==2 and events[-1]['reason']=='stop'
+        assert store.messages(agent.session.id)[-1]['content']=='complete'
+    finally:
+        await agent.llm.http.aclose();store.close()
+
+
+async def test_long_first_response_does_not_exhaust_retry_window(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from tests.fakes import sse_body
+    clock=[0.0];seen=[]
+    monkeypatch.setattr('agent.loop.time',SimpleNamespace(monotonic=lambda:clock[0]))
+    class Broken(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+            clock[0]=600.0
+            raise httpx.RemoteProtocolError('peer closed connection')
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200,stream=Broken(),headers={'content-type':'text/event-stream'}) if len(seen)==1 else httpx.Response(200,content=sse_body({'content':'complete'}),headers={'content-type':'text/event-stream'})
+    agent,store,_=make_agent(tmp_path,[],model_retry=FAST)
+    await agent.llm.http.aclose();agent.llm.http=httpx.AsyncClient(base_url='https://example.test/v1',transport=httpx.MockTransport(handler))
+    try:
+        events=await run(agent)
+        assert len(seen)==2 and events[-1]['reason']=='stop'
+    finally:
+        await agent.llm.http.aclose();store.close()
+
+
+async def test_real_http_body_disconnect_is_recovered(tmp_path):
+    from tests.fakes import sse_body
+    attempts=[]
+    async def serve(reader, writer):
+        try:
+            headers=await reader.readuntil(b'\r\n\r\n')
+            length=next(int(line.split(b':',1)[1]) for line in headers.split(b'\r\n') if line.lower().startswith(b'content-length:'))
+            await reader.readexactly(length)
+            attempts.append(True)
+            broken=len(attempts)==1
+            body=b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n' if broken else sse_body({'content':'Ответ восстановлен'})
+            declared=len(body)+1000 if broken else len(body)
+            writer.write(f'HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n'.encode()+body)
+            await writer.drain()
+        finally:
+            writer.close();await writer.wait_closed()
+    server=await asyncio.start_server(serve,'127.0.0.1',0)
+    port=server.sockets[0].getsockname()[1]
+    agent,store,_=make_agent(tmp_path,[],model_retry=FAST)
+    await agent.llm.http.aclose();agent.llm.http=httpx.AsyncClient(base_url=f'http://127.0.0.1:{port}/v1',trust_env=False)
+    try:
+        events=await run(agent)
+        assert len(attempts)==2 and events[-1]['reason']=='stop'
+        assert next(e for e in events if e.get('retry'))['retry']['reset_response']
+        assert store.messages(agent.session.id)[-1]['content']=='Ответ восстановлен'
+    finally:
+        await agent.llm.http.aclose();store.close();server.close();await server.wait_closed()

@@ -261,6 +261,26 @@ async def test_compact_command_after_single_turn(gw):
     store.close()
 
 
+async def test_compact_failure_reports_error_without_changing_context(gw):
+    cfg, ws, db = gw
+    settings = json.loads(cfg.read_text())
+    settings['context_compaction'] = {'mode': 'local'}
+    cfg.write_text(json.dumps(settings))
+    SCRIPT.extend([{'content': 'Подробный ответ ' * 500}, {'status': 401, 'error': 'нет доступа'},
+                   {'content': 'Продолжаю'}])
+    out, err, read = run_cli(['Задача', '/compact', 'Продолжи', '/exit'])
+    code = await amain(['--cwd', str(ws), '--settings', str(cfg)], read=read, out=out, err=err)
+    assert code == 0
+    assert 'Суммаризация контекста текущей моделью' in out.getvalue()
+    assert 'Сводка не создана' in err.getvalue() and '401' in err.getvalue()
+    assert 'Контекст сокращён' not in out.getvalue()
+    store = SessionStore(db)
+    [session] = store.list('local')
+    assert session.summary == '' and session.context_seq == 0
+    assert 'Подробный ответ' in SEEN[-1]['body']['messages'][2]['content']
+    store.close()
+
+
 async def test_plan_mode_and_model_question_in_plain_cli(gw):
     cfg, ws, db = gw
     SCRIPT.extend([{'tool_calls': [tool_call('q', 'question', question='Формат экспорта?', options=['JSON', 'CSV'])]},

@@ -3,6 +3,7 @@ import asyncio
 import io
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -39,11 +40,104 @@ def send(proc, **message):
     proc.stdin.write((json.dumps(message)+'\n').encode())
 
 
+async def choose_command(proc, label=None):
+    _, events = await receive(proc, 'idle')
+    menu = next(event['selection'] for event in events if event['type'] == 'table')
+    assert menu['kind'] == 'command'
+    choice = next(item for item in menu['choices'] if item['label'] == label) if label else menu['choices'][0]
+    send(proc, type='select', kind='command', target=choice['target'], session_id=menu['session_id'])
+    return menu
+
+
 async def stop(proc):
     if proc.returncode is None:
         send(proc, type='shutdown')
         await asyncio.wait_for(proc.wait(), 5)
     assert proc.returncode == 0, await proc.stderr.read()
+
+
+async def test_every_catalog_command_opens_selection_without_model_or_credentials(gw, tmp_path):
+    proc = await launch(gw, tmp_path, {'GW_TOKEN': '', 'ZAI_API_KEY': '', 'ZAI_CODING_API_KEY': '',
+                                      'MISTRAL_API_KEY': '', 'ZHIPU_API_KEY': ''})
+    try:
+        _, events = await receive(proc, 'ready')
+        snapshot = next(event for event in events if event['type'] == 'snapshot')
+        session = snapshot['session']['id']
+        commands = [item['command'] for item in snapshot['catalog']]
+        assert len(commands) == 13 and '/providers' in commands and '/permissions' in commands
+        assert all(item.get('label') and item['kind'] == 'command' for item in snapshot['catalog'])
+        assert not any(command.startswith('/provider ') for command in commands)
+        for command in commands:
+            send(proc, type='submit', text=command)
+            _, events = await receive(proc, 'idle')
+            assert not any(event['type'] in ('error', 'input_request') for event in events), (command, events)
+            menu = next((event for event in events if event['type'] == 'table'), None)
+            assert menu is not None and menu.get('selection'), (command, events)
+            assert menu['selection']['session_id'] == session
+        assert not any('messages' in row.get('body', {}) for row in SEEN), 'меню не должны вызывать модель'
+    finally:
+        await stop(proc)
+
+
+async def test_command_menu_validates_selection_and_executes_only_after_choice(gw, tmp_path):
+    proc = await launch(gw, tmp_path)
+    try:
+        _, events = await receive(proc, 'ready')
+        original = next(event['session']['id'] for event in events if event['type'] == 'snapshot')
+        send(proc, type='submit', text='/new')
+        _, events = await receive(proc, 'idle')
+        menu = next(event['selection'] for event in events if event['type'] == 'table')
+        assert menu['session_id'] == original
+        send(proc, type='select', kind='command', target='поддельный пункт', session_id=original)
+        _, events = await receive(proc, 'idle')
+        assert any(event['type'] == 'error' for event in events)
+        send(proc, type='select', kind='command', target=menu['choices'][0]['target'], session_id=original)
+        _, events = await receive(proc, 'idle')
+        current = next(event['session']['id'] for event in events if event['type'] == 'snapshot')
+        assert current != original
+        send(proc, type='select', kind='command', target=menu['choices'][0]['target'], session_id=original)
+        _, events = await receive(proc, 'idle')
+        assert any(event['type'] == 'error' and 'устарел' in event['message'] for event in events)
+    finally:
+        await stop(proc)
+
+
+async def test_compact_notices_survive_snapshot_and_failure_can_be_retried(gw, tmp_path):
+    cfg, _, _ = gw
+    settings = json.loads(cfg.read_text())
+    settings['model_retry'] = {'initial_delay': 0, 'max_delay': 0}
+    cfg.write_text(json.dumps(settings))
+    SCRIPT.extend([{'content': 'Старый ответ ' * 500}, {'status': 401, 'error': 'нет доступа'},
+                   {'status': 502, 'error': 'временная ошибка'},
+                   {'content': 'Сводка: проверить проект'}, {'content': 'Продолжение'}])
+    proc = await launch(gw, tmp_path)
+    try:
+        await receive(proc, 'ready')
+        send(proc, type='submit', text='Проверить проект')
+        await receive(proc, 'idle')
+        send(proc, type='submit', text='/compact')
+        await choose_command(proc, 'Составить сводку текущей моделью')
+        _, events = await receive(proc, 'idle')
+        assert any(e['type'] == 'notice' and 'Суммаризация' in e['message'] for e in events)
+        assert any(e['type'] == 'notice' and e.get('level') == 'error' and '401' in e['message'] for e in events)
+        snapshot = next(e for e in events if e['type'] == 'snapshot')
+        assert 'history' not in snapshot
+        assert snapshot['session']['context_seq'] == 0
+        send(proc, type='submit', text='/compact')
+        await choose_command(proc, 'Составить сводку текущей моделью')
+        _, events = await receive(proc, 'idle')
+        assert any(e['type'] == 'notice' and 'сводка создана моделью' in e['message'] for e in events)
+        retry = next(e for e in events if e.get('retry'))
+        assert retry['type'] == 'warning'
+        assert retry['retry']['purpose'] == 'compaction'
+        assert retry['retry']['attempt'] == 1 and retry['retry']['status'] == 502
+        snapshot = next(e for e in events if e['type'] == 'snapshot')
+        assert 'history' not in snapshot and snapshot['session']['context_seq'] > 0
+        send(proc, type='submit', text='Продолжи')
+        await receive(proc, 'idle')
+        assert 'Сводка: проверить проект' in SEEN[-1]['body']['messages'][0]['content']
+    finally:
+        await stop(proc)
 
 
 async def test_bridge_session_tables_permissions_cancel_and_shutdown(gw, tmp_path):
@@ -59,7 +153,7 @@ async def test_bridge_session_tables_permissions_cancel_and_shutdown(gw, tmp_pat
             send(proc, type='submit', text=command)
             _, events = await receive(proc, 'idle')
             table = next(e for e in events if e['type']=='table')
-            assert table['columns'] and isinstance(table['rows'],list)
+            assert table.get('selection') and isinstance(table['rows'],list)
         send(proc, type='submit', text='Запиши x')
         request, _ = await receive(proc, 'permission_request')
         assert request['id']=='write' and not (ws/'x').exists()
@@ -89,13 +183,13 @@ async def test_bridge_connect_dialog_cancellation_does_not_hang(gw,tmp_path):
     proc=await launch(gw,tmp_path)
     try:
         await receive(proc,'ready')
-        send(proc,type='submit',text='/connect')
+        send(proc,type='submit',text='/connect gateway')
         event,_=await receive(proc,'input_request')
         assert event['prompt']
         assert 'URL API' in event['prompt']
         send(proc,type='answer',id=event['id'],value='')
         event,_=await receive(proc,'input_request')
-        assert [choice['value'] for choice in event.get('choices',[])]==['bearer','mtls','basic','none']
+        assert [choice['value'] for choice in event.get('choices',[])]==['bearer','mtls','basic','none','env']
         send(proc,type='cancel')
         await receive(proc,'idle')
         send(proc,type='submit',text='/tools')
@@ -131,6 +225,35 @@ def test_launcher_fallback_and_explicit_errors(monkeypatch,capsys):
     assert '--tui' in capsys.readouterr().err
 
 
+def test_launcher_refreshes_sources_without_reinstall(monkeypatch,tmp_path):
+    source=tui.assets()
+    monkeypatch.setenv('GWAGENT_HOME',str(tmp_path/'home'))
+    target=tmp_path/'home/cache/tui/deps'
+    (target/'node_modules/@opentui/core').mkdir(parents=True)
+    (target/'node_modules/@opentui/core/package.json').write_text('{}')
+    for name in ('package.json','bun.lock'):
+        shutil.copy2(source/name,target/name)
+    assert tui.installed(source)==target
+    (target/'src').mkdir()
+    (target/'src/main.ts').write_text('устаревший интерфейс')
+    tui.sync(source,target)
+    assert (target/'src/main.ts').read_text()==(source/'src/main.ts').read_text()
+
+
+def test_launcher_does_not_check_bun_version(monkeypatch,capsys,tmp_path):
+    monkeypatch.setenv('GWAGENT_HOME',str(tmp_path/'home'))
+    monkeypatch.setattr(sys.stdin,'isatty',lambda:True)
+    monkeypatch.setattr(sys.stdout,'isatty',lambda:True)
+    monkeypatch.setattr(tui,'bun_binary',lambda:None)
+    assert tui.dispatch(['--tui'])==2
+    error=capsys.readouterr().err
+    assert '1.3.8' not in error and 'Bun' in error
+    monkeypatch.setattr(tui,'bun_binary',lambda:'/mock/bun')
+    assert tui.dispatch(['--tui'])==2
+    error=capsys.readouterr().err
+    assert '1.3.8' not in error and 'gwagent tui install' in error
+
+
 def test_launcher_install_and_forwarding(monkeypatch,tmp_path):
     source=tui.assets()
     monkeypatch.setenv('XDG_CACHE_HOME',str(tmp_path))
@@ -157,7 +280,7 @@ async def test_bridge_connect_stores_secret_without_echo(gw,tmp_path):
     secret='test-secret-never-echo-9812'
     try:
         await receive(proc,'ready')
-        send(proc,type='submit',text='/connect')
+        send(proc,type='submit',text='/connect gateway')
         event,_=await receive(proc,'input_request')
         assert not event['secret'] and 'URL API' in event['prompt']
         send(proc,type='answer',id=event['id'],value='')
@@ -257,16 +380,31 @@ async def test_slash_catalog_matches_enabled_builtin_and_mcp_without_model(gw,tm
         catalog=snapshot['catalog']
         commands=[e['command'] for e in catalog if e['kind']=='command']
         names=[e['name'] for e in catalog if e['kind']=='tool']
-        assert '/connect' in commands and '/provider add' in commands and '/tools' in commands
-        assert 'read_file' in names and 'shell' not in names and 'write_file' not in names
-        assert 'mcp__test__echo' in names
+        assert len(commands) == 13 and '/providers' in commands and '/tools' in commands
+        assert names == []
+        send(proc, type='submit', text='/tools')
+        _, rows = await receive(proc, 'idle')
+        names = [item['key'] for item in next(event['selection']['choices'] for event in rows if event['type'] == 'table')]
+        assert 'read_file' in names and 'mcp__test__echo' in names and 'shell' not in names
         assert not SEEN
         for name in ('read_file','mcp__test__echo'):
             send(proc,type='submit',text='/tools '+name)
             _,events=await receive(proc,'idle')
-            assert any(e['type']=='table' and e['rows'] for e in events)
-            assert any(e['type']=='notice' and name in e['message'] for e in events)
+            menu = next(e['selection'] for e in events if e['type'] == 'table')
+            assert menu['kind'] == 'command' and name in menu['title']
+            description = next(item for item in menu['choices'] if item['label'] == 'Описание')
+            send(proc, type='select', kind='command', target=description['target'], session_id=menu['session_id'])
+            _, events = await receive(proc, 'idle')
+            assert any(e['type'] == 'notice' and description['description'] in e['message'] for e in events)
             assert not any(e['type'] in ('tool_call','permission_request','user') for e in events)
+        send(proc, type='submit', text='/mcp test')
+        _, events = await receive(proc, 'idle')
+        menu = next(event['selection'] for event in events if event['type'] == 'table')
+        assert menu['kind'] == 'command'
+        tool = next(item for item in menu['choices'] if item['label'] == 'mcp__test__echo')
+        send(proc, type='select', kind='command', target=tool['target'], session_id=menu['session_id'])
+        _, events = await receive(proc, 'idle')
+        assert any('mcp__test__echo' in event.get('selection', {}).get('title', '') for event in events)
         send(proc,type='submit',text='/tools shell')
         _,events=await receive(proc,'idle')
         assert any(e['type']=='error' for e in events)
@@ -361,11 +499,10 @@ async def test_models_from_all_providers_switch_together_and_preserve_old_histor
         _,events=await receive(proc,'idle')
         assert any(e['type']=='error' and 'устарел' in e['message'] for e in events)
         send(proc,type='submit',text='/provider')
-        _,events=await receive(proc,'idle')
-        selection=next(e['selection'] for e in events if e['type']=='table')
-        assert selection['kind']=='provider' and selection['provider']=='second'
-        assert next(c for c in selection['choices'] if c['provider']=='disabled')['enabled'] is False
-        send(proc,type='select',kind='provider',provider='first',session_id=second)
+        menu=await choose_command(proc,'Посмотреть')
+        assert {item['label'] for item in menu['choices']} >= {'Посмотреть','Добавить','Изменить','Удалить'}
+        await choose_command(proc,'first')
+        await choose_command(proc,'Использовать')
         _,events=await receive(proc,'idle')
         assert next(e['provider'] for e in events if e['type']=='snapshot')=='first'
     finally:await stop(proc)
@@ -387,6 +524,7 @@ async def test_sessions_picker_resume_workspace_guard_and_confirmed_delete(gw,tm
         victim=store.create('local',model='alpha',workspace=str(ws))
         outdated=store.create('local',model='alpha',workspace=str(ws),profile='provider:glm',endpoint_hash='old-endpoint')
         send(proc,type='submit',text='/sessions')
+        await choose_command(proc, 'Посмотреть и продолжить')
         _,events=await receive(proc,'idle')
         selection=next(e['selection'] for e in events if e['type']=='table')
         assert selection['kind']=='session' and selection['current']==initial
@@ -405,7 +543,8 @@ async def test_sessions_picker_resume_workspace_guard_and_confirmed_delete(gw,tm
         _,events=await receive(proc,'idle')
         snapshot=next(e for e in events if e['type']=='snapshot')
         assert snapshot['session']['id']==old.id
-        assert snapshot['history']==[{'role':'user','content':'Сохранённая история'}]
+        assert len(snapshot['history']) == 1
+        assert snapshot['history'][0] == {'role': 'user', 'content': 'Сохранённая история', 'message_id': 'seq:1'}
         for answer in ('n','y'):
             send(proc,type='submit',text='/delete')
             _,events=await receive(proc,'idle')
@@ -439,6 +578,7 @@ async def test_revert_picker_edit_and_file_rollback_without_model_call(gw,tmp_pa
         assert next(e['session']['title'] for e in events if e['type']=='snapshot')=='Первая задача'
         count=len(SEEN)
         send(proc,type='submit',text='/revert')
+        await choose_command(proc, 'Изменить сообщение или откатить')
         _,events=await receive(proc,'idle')
         table=next(e for e in events if e['type']=='table')
         choice=table['selection']['choices'][0]
@@ -511,7 +651,9 @@ async def test_switch_agent_without_model_and_queued_switch_waits_for_running_tu
         assert mode['mode'] == 'plan' and not SEEN
         snapshot = next(e for e in events if e['type'] == 'snapshot')
         assert snapshot['session']['agent_mode'] == 'plan'
-        names = {row['name'] for row in snapshot['catalog'] if row['kind'] == 'tool'}
+        send(proc, type='submit', text='/tools')
+        _, events = await receive(proc, 'idle')
+        names = {item['key'] for item in next(e['selection']['choices'] for e in events if e['type'] == 'table')}
         assert 'question' in names and 'write_file' not in names
         send(proc, type='set_agent', mode='build'); await receive(proc, 'agent_mode')
         send(proc, type='submit', text='Построй файл')
@@ -600,15 +742,85 @@ async def test_pending_steering_survives_cancel_and_process_restart(gw, tmp_path
         await stop(proc)
 
 
+async def test_provider_section_navigation_back_reopens_window_and_rejects_stale_route(gw, tmp_path):
+    home = tmp_path / 'agent-home'
+    home.mkdir(parents=True, exist_ok=True)
+    (home / 'providers.json').write_text(json.dumps({'default': 'first', 'selected': False, 'providers': {
+        'first': {'url': 'https://example.test/v1', 'token_env': 'GW_TOKEN', 'model': 'alpha', 'models': []}}}))
+    proc = await launch(gw, tmp_path)
+    try:
+        await receive(proc, 'ready')
+        send(proc, type='submit', text='/providers')
+        menu = await choose_command(proc, 'Посмотреть')
+        assert menu['route'] == '/providers'
+        await choose_command(proc, 'first')
+        _, events = await receive(proc, 'idle')
+        page = next(e['selection'] for e in events if e['type'] == 'table')
+        assert page['route'] == '/_ui/provider/view first'
+        send(proc, type='navigate', route=page['route'], session_id=page['session_id'])
+        _, events = await receive(proc, 'idle')
+        again = next(e['selection'] for e in events if e['type'] == 'table')
+        assert again['route'] == page['route']
+        assert [c['label'] for c in again['choices']] == ['Сведения', 'Использовать', 'Дополнительно']
+        send(proc, type='navigate', route='/providers/unknown', session_id=again['session_id'])
+        _, events = await receive(proc, 'idle')
+        assert any(e['type'] == 'error' and 'устарело' in e['message'] for e in events)
+    finally:
+        await stop(proc)
+
+
+async def test_provider_section_pages_add_edit_and_remove(gw, tmp_path):
+    proc = await launch(gw, tmp_path)
+    try:
+        await receive(proc, 'ready')
+        send(proc, type='submit', text='/providers')
+        await choose_command(proc, 'Добавить')
+        menu = await choose_command(proc, 'Base URL и токен')
+        assert {c['label'] for c in menu['choices']} == {'Base URL и токен', 'Base URL и сертификат'}
+        for value in ('second', 'https://example.test/v1', 'token-1'):
+            request, _ = await receive(proc, 'input_request')
+            send(proc, type='answer', id=request['id'], value=value)
+        _, events = await receive(proc, 'idle')
+        assert not any(e['type'] == 'error' for e in events), events
+        assert 'token-1' not in json.dumps(events)
+        registry = json.loads((tmp_path / 'agent-home/providers.json').read_text())
+        assert registry['providers']['second']['url'] == 'https://example.test/v1'
+        send(proc, type='submit', text='/providers')
+        await choose_command(proc, 'Изменить')
+        await choose_command(proc, 'second')
+        menu = await choose_command(proc, 'Заменить Base URL')
+        assert {c['label'] for c in menu['choices']} == {'Заменить Base URL', 'Заменить токен'}
+        request, _ = await receive(proc, 'input_request')
+        assert request['prompt'].startswith('Новый Base URL')
+        send(proc, type='answer', id=request['id'], value='https://changed.test/v1')
+        _, events = await receive(proc, 'idle')
+        assert not any(e['type'] == 'error' for e in events), events
+        registry = json.loads((tmp_path / 'agent-home/providers.json').read_text())
+        assert registry['providers']['second']['url'] == 'https://changed.test/v1'
+        send(proc, type='submit', text='/providers')
+        await choose_command(proc, 'Удалить')
+        await choose_command(proc, 'second')
+        request, _ = await receive(proc, 'input_request')
+        assert 'подключение second' in request['prompt']
+        send(proc, type='answer', id=request['id'], value='y')
+        _, events = await receive(proc, 'idle')
+        assert not any(e['type'] == 'error' for e in events), events
+        registry = json.loads((tmp_path / 'agent-home/providers.json').read_text())
+        assert 'second' not in registry['providers']
+    finally:
+        await stop(proc)
+
+
 async def test_provider_wizard_edit_manage_and_cancel_are_interactive(gw, tmp_path):
     proc = await launch(gw, tmp_path)
     try:
         await receive(proc, 'ready')
         send(proc, type='submit', text='/provider')
         table, _ = await receive(proc, 'table')
-        assert any(c.get('command') == '/provider add' for c in table['selection']['choices'])
+        assert [c['label'] for c in table['selection']['choices']] == ['Посмотреть', 'Добавить', 'Изменить', 'Удалить']
         await receive(proc, 'idle')
         send(proc, type='submit', text='/provider add')
+        await choose_command(proc)
         for value in ('local', 'https://example.test/v1', 'none'):
             request, _ = await receive(proc, 'input_request')
             send(proc, type='answer', id=request['id'], value=value)
@@ -655,6 +867,7 @@ async def test_opencode_import_model_settings_and_export_dialogs(gw,tmp_path):
     try:
         await receive(proc,'ready')
         send(proc,type='submit',text='/provider import')
+        await choose_command(proc)
         for value in (str(source),'n','y'):
             request,_=await receive(proc,'input_request')
             send(proc,type='answer',id=request['id'],value=value)
@@ -663,7 +876,7 @@ async def test_opencode_import_model_settings_and_export_dialogs(gw,tmp_path):
         assert next(e['provider'] for e in events if e['type']=='snapshot')=='custom'
         assert 'ui-import-hidden-key' not in json.dumps(events)
         send(proc,type='submit',text='/provider model custom chat')
-        for value in ('Понятное имя','8192','256','.4','.8','low'):
+        for value in ('Понятное имя','8448','8192','256','.4','.8','low'):
             request,_=await receive(proc,'input_request')
             send(proc,type='answer',id=request['id'],value=value)
         _,events=await receive(proc,'idle')
@@ -671,6 +884,7 @@ async def test_opencode_import_model_settings_and_export_dialogs(gw,tmp_path):
         assert next(e['context']['max_input_tokens'] for e in events if e['type']=='snapshot')==8192
         output=tmp_path/'output.json'
         send(proc,type='submit',text='/provider export')
+        await choose_command(proc)
         request,_=await receive(proc,'input_request');send(proc,type='answer',id=request['id'],value='custom')
         request,_=await receive(proc,'input_request');send(proc,type='answer',id=request['id'],value=str(output))
         _,events=await receive(proc,'idle')
@@ -729,3 +943,154 @@ async def test_cancel_command_after_completed_model_turn():
     with pytest.raises(asyncio.CancelledError):
         await bridge.work
     assert completed.done() and not completed.cancelled()
+
+
+async def test_provider_missing_arguments_and_management_menu_preserve_session(gw, tmp_path):
+    proc = await launch(gw, tmp_path)
+    try:
+        _, events = await receive(proc, 'ready')
+        original = next(event['session']['id'] for event in events if event['type'] == 'snapshot')
+        send(proc, type='submit', text='/provider edit')
+        await choose_command(proc, 'glm')
+        request, _ = await receive(proc, 'input_request')
+        send(proc, type='answer', id=request['id'], value='')
+        request, _ = await receive(proc, 'input_request')
+        assert request['default_value'] == 'env'
+        send(proc, type='answer', id=request['id'], value='env')
+        request, _ = await receive(proc, 'input_request')
+        send(proc, type='answer', id=request['id'], value='ZAI_API_KEY')
+        _, events = await receive(proc, 'idle')
+        assert not any(event['type'] == 'error' for event in events)
+        assert next(event['session']['id'] for event in events if event['type'] == 'snapshot') == original
+        send(proc, type='submit', text='/provider manage')
+        await choose_command(proc, 'glm')
+        _, events = await receive(proc, 'idle')
+        menu = next(event['selection'] for event in events if event['type'] == 'table')
+        assert menu['kind'] == 'provider-actions'
+        action = next(item for item in menu['choices'] if item['key'] == 'disable')
+        assert not action['disabled']
+        send(proc, type='submit', text=action['command'])
+        _, events = await receive(proc, 'idle')
+        assert not any(event['type'] == 'error' for event in events)
+        data = json.loads((tmp_path/'agent-home/providers.json').read_text())
+        assert not data['providers']['glm']['enabled']
+        send(proc, type='submit', text='/provider enable')
+        await choose_command(proc, 'glm')
+        _, events = await receive(proc, 'idle')
+        assert not any(event['type'] == 'error' for event in events)
+        send(proc, type='submit', text='/provider edit a b')
+        _, events = await receive(proc, 'idle')
+        assert any(event['type'] == 'error' and 'аргументы' in event['message'] for event in events)
+        send(proc, type='submit', text='/provider list')
+        await receive(proc, 'idle')
+    finally:
+        await stop(proc)
+
+
+async def test_input_history_and_click_edit_protocol(gw, tmp_path):
+    proc = await launch(gw, tmp_path)
+    try:
+        _, events = await receive(proc, 'ready')
+        session = next(e['session']['id'] for e in events if e['type'] == 'snapshot')
+        SCRIPT.append({'content': 'Готово'})
+        send(proc, type='submit', text='Первая строка\nВторая строка')
+        _, events = await receive(proc, 'idle')
+        user = next(e for e in events if e['type'] == 'user')
+        send(proc, type='input_history', id='h1', session_id=session, direction='previous')
+        history, _ = await receive(proc, 'input_history')
+        assert history['message_id'] == user['message_id']
+        assert history['text'] == 'Первая строка\nВторая строка'
+        send(proc, type='input_history', id='h2', session_id=session, direction='next', cursor=history['message_id'])
+        boundary, _ = await receive(proc, 'input_history')
+        assert boundary['boundary'] == 'draft'
+        send(proc, type='input_history', id='h3', session_id='чужая', direction='previous')
+        error, _ = await receive(proc, 'input_history')
+        assert error['id'] == 'h3' and error['error']
+        send(proc, type='edit_message', session_id=session, message_id=user['message_id'])
+        dialog, _ = await receive(proc, 'input_request')
+        assert dialog['choices'][0]['value'] == 'message'
+        send(proc, type='answer', id=dialog['id'], value='message')
+        _, events = await receive(proc, 'idle')
+        assert next(e['text'] for e in events if e['type'] == 'draft') == history['text']
+        send(proc, type='edit_message', session_id=session, message_id='несуществующее')
+        _, events = await receive(proc, 'idle')
+        assert any(e['type'] == 'error' for e in events)
+    finally:
+        await stop(proc)
+
+
+def test_history_full_text_pending_and_boundaries(tmp_path):
+    from types import SimpleNamespace
+    from agent.store import SessionStore
+    from agent.cli import App, OWNER
+    store = SessionStore(tmp_path / 'history.db')
+    try:
+        session = store.create(OWNER, workspace=str(tmp_path))
+        original = 'Полный исходный текст\n' + 'я' * 22000
+        store.add_message(session.id, {'role': 'user', 'content': 'Текст после хука'},
+                          {'input_id': 'original', 'user_input': original})
+        store.add_message(session.id, {'role': 'user', 'content': 'Служебное сообщение'}, {'request_id': 'r'})
+        app = SimpleNamespace(session=session, store=store)
+        app.revert_messages = lambda: App.revert_messages(app)
+        bridge = Bridge.__new__(Bridge)
+        bridge.ready, bridge.app = True, app
+        events = []
+        bridge.emit = events.append
+        bridge.history_input({'id': '1', 'session_id': session.id, 'direction': 'previous'})
+        assert events[-1]['text'] == original and events[-1]['message_id'] == 'original'
+        bridge.history_input({'id': '2', 'session_id': session.id, 'direction': 'previous', 'cursor': 'original'})
+        assert events[-1]['boundary'] == 'oldest'
+        store.enqueue_input(session.id, 'request', 'pending', 'Ожидающее уточнение')
+        bridge.history_input({'id': 'pending', 'session_id': session.id, 'direction': 'previous'})
+        assert events[-1]['message_id'] == 'pending' and events[-1]['text'] == 'Ожидающее уточнение'
+        store.reject_input('pending')
+        store.add_message(session.id, {'role': 'user', 'content': 'я' * 300000})
+        bridge.history_input({'id': '3', 'session_id': session.id, 'direction': 'previous'})
+        assert 'слишком большое' in events[-1]['error'] and 'text' not in events[-1]
+    finally:
+        store.close()
+
+
+async def test_click_edit_busy_guard_keeps_active_request(gw, tmp_path):
+    proc = await launch(gw, tmp_path)
+    try:
+        _, events = await receive(proc, 'ready')
+        session = next(e['session']['id'] for e in events if e['type'] == 'snapshot')
+        SCRIPT.append({'content': 'Готово'})
+        send(proc, type='submit', text='Запрос')
+        user, _ = await receive(proc, 'user')
+        send(proc, type='edit_message', session_id=session, message_id=user['message_id'])
+        notice, events = await receive(proc, 'notice')
+        assert 'после завершения' in notice['message']
+        assert not any(e['type'] == 'idle' for e in events)
+        await receive(proc, 'idle')
+    finally:
+        await stop(proc)
+
+
+async def test_statistics_and_session_names_without_model(gw, tmp_path):
+    proc = await launch(gw, tmp_path, {'GW_TOKEN': ''})
+    try:
+        await receive(proc, 'ready')
+        send(proc, type='submit', text='/stats')
+        await choose_command(proc, 'Текущая сессия')
+        _, events = await receive(proc, 'idle')
+        stats = next(e for e in events if e['type'] == 'table' and e.get('title') == 'Статистика')
+        assert ['Всего токенов', '0'] in stats['rows']
+        send(proc, type='submit', text='/rename')
+        await choose_command(proc, 'Переименовать')
+        question, _ = await receive(proc, 'input_request')
+        send(proc, type='answer', id=question['id'], value='Понятное название проекта')
+        _, events = await receive(proc, 'idle')
+        snapshot = next(e for e in events if e['type'] == 'snapshot')
+        assert snapshot['session']['title'] == 'Понятное название проекта'
+        assert snapshot['session']['title_auto'] is False
+        send(proc, type='submit', text='/sessions')
+        await choose_command(proc, 'Посмотреть и продолжить')
+        _, events = await receive(proc, 'idle')
+        sessions = next(e['selection'] for e in events if e['type'] == 'table')
+        current = next(item for item in sessions['choices'] if item['current'])
+        assert current['title'] == 'Понятное название проекта'
+        assert current['messages'] == current['tokens'] == 0
+    finally:
+        await stop(proc)

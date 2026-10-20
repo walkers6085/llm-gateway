@@ -19,7 +19,7 @@ venv/bin/uvicorn --factory gateway.app:create_app --host 0.0.0.0 --port 7700
 ./gwtoken create|list|revoke|usage|agent        # токены; agent <имя> <профиль>|--off
 GW_TOKEN=gw-… ./gwagent [-p "задача"]           # CLI-агент; оба скрипта сами перезапускаются из venv/
 node --test tests/test_chat.mjs                 # тест веб-чата (Node, не pytest)
-bun run --cwd tui typecheck && bun run --cwd tui test   # TUI (нужен Bun ≥ 1.3.8)
+bun run --cwd tui typecheck && bun run --cwd tui test   # TUI (нужен Bun; версия не проверяется)
 python -m pip wheel --no-deps --wheel-dir /tmp/got-w .   # проверка упаковки
 ```
 - Установка dev-зависимостей: `pip install -r requirements-dev.txt -c requirements.lock` (runtime — `requirements.txt`. pytest отделён). CI (`.github/workflows/tests.yml`): bun typecheck+test → pytest → chat-node → wheel → `git diff --exit-code`.

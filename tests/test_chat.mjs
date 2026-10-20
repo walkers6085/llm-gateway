@@ -10,7 +10,7 @@ class Element {
   querySelector(selector){return this.parts[selector]??=new Element();}
   querySelectorAll(){return [new Element(),new Element(),new Element()];}
   addEventListener(kind,handler){this.listeners[kind]=handler;}
-  scrollIntoView(){} remove(){} focus(){}
+  scrollIntoView(){} remove(){this.removed=true;} focus(){}
 }
 function setup(saved={}) {
   const elements={}, storage=new Map(Object.entries(saved));
@@ -58,4 +58,16 @@ test('SSE принимает многострочный JSON и завершаю
   const {context,run}=setup();context.response=new Response('data: {"value":\ndata: 42}\n\ndata: [DONE]');
   const values=await run('(async()=>{const out=[];for await(const e of readSSE(response))out.push(e);return out})()');
   assert.equal(values[0].value,42);assert.equal(values[1].stream_done,true);
+});
+test('агент: оборванный ответ удаляется перед повтором',async()=>{
+  const {context,elements,run}=setup();elements.model.value='model';elements.token.value='dummy';
+  context.fetch=async(url,options)=>url.endsWith('/messages')?sse([
+    {type:'text',text:'Оборванный'},
+    {type:'warning',message:'Повтор',retry:{reset_response:true}},
+    {type:'text',text:'Полный ответ'}, {type:'assistant'}, {type:'done',reason:'stop'},
+  ]):Response.json({id:'s1'});
+  await run('sendAgent("задача")');
+  const answers=elements.log.children.filter(el=>el.className==='msg assistant');
+  assert.equal(answers.length,2);assert.equal(answers[0].removed,true);
+  assert(answers[1].innerHTML.includes('Полный ответ'));assert(!answers[1].innerHTML.includes('Оборванный'));
 });

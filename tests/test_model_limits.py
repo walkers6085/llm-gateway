@@ -27,8 +27,9 @@ def test_model_limits_are_individual_and_manual_cap_is_separate():
     assert resolve(DEFAULTS, 'glm-4.7-flash')['context_window'] == 200000
     api = {'mistral-small-latest': {'context_window': 262144}}
     limits = resolve(DEFAULTS, 'mistral-small-latest', api)
-    assert limits['context_source'] == 'api' and limits['max_input_tokens'] == 262144-1024
-    assert limits['max_turn_tokens'] > limits['max_input_tokens']
+    assert limits['context_source'] == 'api' and limits['max_input_tokens'] == 262144
+    assert limits['max_output_tokens'] == 0 and limits['output_unlimited']
+    assert limits['max_turn_tokens'] == 0
     capped = resolve(merge(DEFAULTS, {'max_input_tokens': 50000}), 'mistral-small-latest', api)
     assert capped['context_window'] == 262144 and capped['max_input_tokens'] == 50000
     assert capped['input_limit_source'] == 'config'
@@ -36,9 +37,15 @@ def test_model_limits_are_individual_and_manual_cap_is_separate():
                                                            'options': {'api_model': 'mistral-small-latest'}}}})
     assert resolve(explicit, 'alias', api)['context_window'] == 8192
     assert resolve(explicit, 'alias', api)['max_input_tokens'] == 7680
+    assert not resolve(explicit, 'alias', api)['output_unlimited']
     unknown = resolve(DEFAULTS, 'unknown')
     assert not unknown['context_known'] and unknown['context_source'] == 'fallback'
+    assert unknown['context_window'] == 120000 and unknown['max_input_tokens'] == 120000
+    assert resolve(DEFAULTS, 'small', {'small': {'context_window': 32768}})['context_window'] == 32768
     assert resolve(merge(DEFAULTS, {'max_input_tokens': 500000}), 'unknown')['max_input_tokens'] == 500000
+    limited = resolve(merge(DEFAULTS, {'max_output_tokens': 2048}), 'unknown')
+    assert limited['max_output_tokens'] == 2048 and not limited['output_unlimited']
+    assert limited['max_input_tokens'] == 120000-2048
 
 
 async def test_catalog_alias_metadata_and_provider_isolation():
@@ -82,11 +89,31 @@ async def test_provider_metadata_controls_actual_loop_and_context_panel(tmp_path
     agent, store, _ = make_agent(tmp_path, [{'content': 'Готово'}])
     agent.model_metadata = {'alpha': {'context_window': 200000}}
     context = next(event for event in await run(agent) if event['type'] == 'context')
-    assert context['context_window'] == 200000 and context['max_input_tokens'] == 198976
+    assert context['context_window'] == 200000 and context['max_input_tokens'] == 200000
+    assert context['max_output_tokens'] == 0
     assert context['context_source'] == 'api'
     status = agent.context_status()
     assert status['context_window'] == 200000
     assert status['estimated_tokens'] < len(json.dumps(store.messages(agent.session.id)).encode()) + 3000
+    await agent.llm.http.aclose()
+    store.close()
+
+
+async def test_output_limit_off_omits_max_tokens_and_asks_for_brief_answer(tmp_path):
+    seen = []
+    agent, store, _ = make_agent(tmp_path, [{'content': 'готово'}], seen)
+    await run(agent, 'привет')
+    assert 'max_tokens' not in seen[-1]
+    assert 'кратко' in seen[-1]['messages'][0]['content']
+    await agent.llm.http.aclose()
+    store.close()
+
+
+async def test_output_limit_set_sends_max_tokens(tmp_path):
+    seen = []
+    agent, store, _ = make_agent(tmp_path, [{'content': 'готово'}], seen, max_output_tokens=2048)
+    await run(agent, 'привет')
+    assert seen[-1]['max_tokens'] == 2048
     await agent.llm.http.aclose()
     store.close()
 
@@ -125,7 +152,7 @@ async def test_model_selection_uses_metadata_before_chat_and_keeps_providers_sep
             assert bridge.dashboard_data()['context']['context_window'] == 128000
             await bridge.app.choose_model('second', 'shared')
             assert bridge.dashboard_data()['context']['context_window'] == 262144
-            assert bridge.dashboard_data()['context']['max_input_tokens'] == 261120
+            assert bridge.dashboard_data()['context']['max_input_tokens'] == 262144
             await bridge.app.model_client()
             assert bridge.app.agent is None
             assert bridge.app.get_model_metadata()['shared']['context_window'] == 262144
@@ -144,3 +171,42 @@ async def test_large_window_is_not_blocked_by_old_turn_budget(tmp_path):
     assert not any(event['type'] == 'warning' for event in events)
     await agent.llm.http.aclose()
     store.close()
+
+
+def test_turn_budget_is_only_explicit():
+    assert resolve(DEFAULTS, 'small', {'small': {'context_window': 4096}})['max_turn_tokens'] == 0
+    settings = merge(DEFAULTS, {'max_turn_tokens': 500, 'model_profiles': {'alpha': {'max_turn_tokens': 0}}})
+    assert resolve(settings, 'alpha')['max_turn_tokens'] == 0
+    assert resolve(settings, 'other')['max_turn_tokens'] == 500
+
+
+async def test_long_turn_and_summary_have_no_implicit_budget(tmp_path):
+    from agent.compaction import compact
+    from agent.tracing import current
+    from tests.fakes import tool_call
+    agent, store, _ = make_agent(tmp_path, [
+        {'tool_calls': [tool_call('echo', 'echo', text='продолжить')]},
+        {'content': 'Рабочая сводка'},
+        {'content': 'Завершено'},
+    ], context_compaction={'mode': 'model'})
+    original = agent._model_events
+    async def high_usage(*args, **kwargs):
+        async for event in original(*args, **kwargs):
+            if event['type'] == 'message':
+                event = {**event, 'usage': (600000, 10)}
+            yield event
+    agent._model_events = high_usage
+    original_echo = agent.registry.get('echo').run
+    async def echo_and_compact(args, ctx):
+        assert current.get().budget['spent'] > 480000
+        assert await compact(agent, 120000, manual=True)
+        return await original_echo(args, ctx)
+    agent.registry.get('echo').run = echo_and_compact
+    try:
+        events = await run(agent)
+        assert events[-1]['reason'] == 'stop'
+        assert any(e['type'] == 'tool_result' and e['ok'] for e in events)
+        assert agent.last_compaction['method'] == 'model'
+    finally:
+        await agent.llm.http.aclose()
+        store.close()

@@ -49,4 +49,15 @@ class Todo(Tool):
         return json.dumps({'todos': args.get('items', state['todos'])}, ensure_ascii=False)
 
 
-TOOLS = [Goal, Todo]
+class Statistics(Tool):
+    plan_safe = True
+    name = 'statistics'
+    description = 'Прочитать статистику текущей сессии: токены, вызовы моделей, время, инструменты, ошибки и повторы. Только агрегаты без текста запросов.'
+    default_permission = 'allow'
+    parameters = {'type': 'object', 'properties': {}, 'additionalProperties': False}
+
+    async def run(self, args, ctx):
+        return json.dumps(ctx.extra['statistics'](), ensure_ascii=False)
+
+
+TOOLS = [Goal, Todo, Statistics]

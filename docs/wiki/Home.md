@@ -22,9 +22,9 @@ shell, сеть, MCP), права и хуки решают, что можно, �
 ## Инструменты
 - [tools/files.md](tools/files.md) — `read_file`, `write_file`, `edit_file`, `list_dir`, `glob`, `grep`
 - [tools/question.md](tools/question.md) — `question`, уточняющие вопросы пользователя
-- [tools/planning.md](tools/planning.md) — `goal`, `todo`, цель и задачи сессии
+- [tools/planning.md](tools/planning.md) — `goal`, `todo`, `statistics`, цель, задачи и статистика сессии
 - [tools/shell.md](tools/shell.md) — `shell`
-- [tools/web.md](tools/web.md) — `web_fetch`, `http_request`, `web_search`, защита от SSRF
+- [tools/web.md](tools/web.md) — `web_fetch`, `http_request`, `web_search`, `inspect`, защита от SSRF
 
 ## Интерфейсы
 - [server-api.md](server-api.md) — агент на сервере: `/agent/*`, поток событий SSE

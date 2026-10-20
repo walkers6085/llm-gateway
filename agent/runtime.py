@@ -8,11 +8,11 @@ from .loop import Agent, Approver
 from .mcp import MCPManager
 from .settings import SettingsError
 from .store import Session, SessionStore
-from .tools import files, shell, web, planning, question
+from .tools import files, shell, web, planning, question, inspection
 from .tools.base import Registry, Tool
 from .tools.subagent import Subagent
 
-BUILTIN: dict[str, type[Tool]] = {cls.name: cls for cls in files.TOOLS + shell.TOOLS + web.TOOLS + planning.TOOLS + question.TOOLS}
+BUILTIN: dict[str, type[Tool]] = {cls.name: cls for cls in files.TOOLS + shell.TOOLS + web.TOOLS + planning.TOOLS + question.TOOLS + inspection.TOOLS}
 
 
 def builtin_tools(enabled: list[str]) -> list[Tool]:

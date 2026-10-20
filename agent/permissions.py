@@ -10,9 +10,10 @@ from fnmatch import fnmatchcase
 from urllib.parse import urlsplit
 
 from .tools.base import Tool
+from .tools.subagent import Subagent, SAFE_ROLES
 
 ALLOW, ASK, DENY = "allow", "ask", "deny"
-READ_ONLY_TOOLS = frozenset({"read_file", "list_dir", "glob", "grep", "web_fetch", "web_search", "goal", "todo", "question"})
+READ_ONLY_TOOLS = frozenset({"read_file", "list_dir", "glob", "grep", "web_fetch", "web_search", "goal", "todo", "question", "statistics", "inspect", "subagent"})
 MODES = ("default", "allow_all", "read_only")
 
 
@@ -58,6 +59,8 @@ class Permissions:
         """→ (allow|ask|deny, причина). hook_decision — решение хука PreToolUse, если он его вернул."""
         if self.mode == "read_only" and tool.name not in READ_ONLY_TOOLS:
             return DENY, "инструмент недоступен в строгом режиме read_only"
+        if self.mode == 'read_only' and isinstance(tool, Subagent) and args.get('role', 'worker') not in SAFE_ROLES:
+            return DENY, 'read_only допускает только explorer/reviewer'
         rule = self._first(self.deny, tool, args)
         if rule:
             return DENY, f"запрещено правилом {rule}"
@@ -77,7 +80,7 @@ class Permissions:
             return ALLOW, "инструмент чтения"
         if self.mode == "allow_all":
             return ALLOW, "режим allow_all"
-        if tool.default_permission == ALLOW:
+        if tool.default_permission == ALLOW or isinstance(tool, Subagent) and args.get('role') in SAFE_ROLES:
             return ALLOW, "разрешено по умолчанию"
         return self._ask(tool, "требует подтверждения")
 

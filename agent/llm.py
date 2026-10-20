@@ -91,8 +91,9 @@ class LLMClient:
                      temperature: float | None = None) -> AsyncIterator[dict]:
         """События: {"type": "text", "text"} … и в конце {"type": "message", "message", "usage", "finish_reason"}."""
         streaming = self.options.get('stream', True)
-        body: dict = {"model": self.options.get("api_model") or model, "messages": messages, "stream": streaming,
-                      self.options.get('max_tokens_field', 'max_tokens'): self.max_tokens}
+        body: dict = {"model": self.options.get("api_model") or model, "messages": messages, "stream": streaming}
+        if self.max_tokens > 0:
+            body[self.options.get('max_tokens_field', 'max_tokens')] = self.max_tokens
         if streaming and self.options.get('usage', True):
             body['stream_options'] = {'include_usage': True}
         if tools and not self.options.get('tools', True):
@@ -142,7 +143,8 @@ class LLMClient:
             received = 0
             async for payload in data_events(resp):
                 received += len(payload.encode())
-                if received > min(16*1024*1024, self.max_tokens*1024+1048576):
+                limit = 16*1024*1024 if self.max_tokens <= 0 else min(16*1024*1024, self.max_tokens*1024+1048576)
+                if received > limit:
                     raise LLMError(502, 'слишком большой ответ модели')
                 payload = payload.strip()
                 if payload == "[DONE]":
@@ -173,7 +175,7 @@ class LLMClient:
                         calls.add(delta["tool_calls"])
                     finish = choice.get("finish_reason") or finish
             if not done and finish is None:
-                raise LLMError(502, 'незавершённый SSE: нет finish_reason или [DONE]')
+                raise LLMError(502, 'незавершённый SSE: нет finish_reason или [DONE]', retryable=True)
             check_finish(finish, bool(calls.calls))
             check_calls(calls.result())
             yield {"type": "message", "message": _assistant("".join(text), calls.result(), "".join(reasoning)),

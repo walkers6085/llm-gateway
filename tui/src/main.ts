@@ -1,6 +1,7 @@
 /** Один локальный Python-процесс на сессию; закрытие терминала завершает его работу. */
 import {createCliRenderer} from '@opentui/core';
 import {terminalInput} from './terminal-input.ts';
+import {Notifications,localPopup} from './notifications.ts';
 import {AgentView} from './view.ts';
 
 export async function main(args=process.argv.slice(2)):Promise<number>{
@@ -16,6 +17,10 @@ export async function main(args=process.argv.slice(2)):Promise<number>{
     if(child && !stopping && typeof child.stdin==='object' && child.stdin!==null && 'write' in child.stdin)
       child.stdin.write(JSON.stringify(value)+'\n');
   };
+  const notifications=new Notifications({title:text=>renderer.setTerminalTitle(text),
+    popup:async(title,body,sound)=>{const status=await localPopup(title,body,sound,(body,title)=>renderer.triggerNotification(body,title));view.notificationStatus(status);return status;}});
+  const focus=()=>notifications.setFocus(true),blur=()=>notifications.setFocus(false);
+  renderer.on('focus',focus);renderer.on('blur',blur);
   const view=new AgentView(renderer,send,resolveExit);
   const signal=()=>resolveExit();
   process.on('SIGTERM',signal);process.on('SIGINT',signal);process.on('SIGHUP',signal);
@@ -38,7 +43,8 @@ export async function main(args=process.argv.slice(2)):Promise<number>{
           let event:unknown;
           try{event=JSON.parse(line);}catch{throw new Error('неверный JSON события');}
           if(!event || typeof event!=='object' || !('type' in event) || typeof event.type!=='string')throw new Error('неверное событие');
-          view.accept(event as any);
+          notifications.accept(event as any);view.accept(event as any);
+          view.notificationStatus(notifications.status);
         }
         if(buffer.length>1048576)throw new Error('слишком большое событие');
       }
@@ -56,6 +62,7 @@ export async function main(args=process.argv.slice(2)):Promise<number>{
       if(!await wait(2000)){child.kill('SIGTERM');if(!await wait(1000))child.kill('SIGKILL');}
       await child.exited;
     }
+    renderer.off('focus',focus);renderer.off('blur',blur);
     try{await view.dispose();}finally{try{renderer.destroy();await renderer.closed;}finally{input.dispose();}}
     process.off('SIGTERM',signal);process.off('SIGINT',signal);process.off('SIGHUP',signal);
   }

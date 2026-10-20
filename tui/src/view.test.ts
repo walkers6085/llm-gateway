@@ -99,10 +99,10 @@ test('слеш открывает меню, фильтр выбирает ком
     setup.mockInput.pressEnter();expect(sent.at(-1)).toEqual({type:'submit',text:'/tools read_file'});
     view.accept({type:'idle'});
     await setup.mockInput.typeText('/provider');setup.mockInput.pressEnter();
-    expect(view.editor.plainText).toBe('/provider add ');
-    expect(sent).toHaveLength(2); // обязательные аргументы не отправляются автоматически
+    expect(sent.at(-1)).toEqual({type:'submit',text:'/provider add'});
+    view.accept({type:'idle'});
     view.editor.setText('');await setup.mockInput.typeText('/con');setup.mockInput.pressTab();
-    expect(view.editor.plainText).toBe('/connect ');expect(sent).toHaveLength(2);
+    expect(view.editor.plainText).toBe('/connect ');expect(sent).toHaveLength(3);
     await setup.mockInput.typeText('local');setup.mockInput.pressEnter();
     expect(sent.at(-1)).toEqual({type:'submit',text:'/connect local'});
   }finally{view.dispose();await setup.dispose();}
@@ -196,6 +196,53 @@ test('пустой каталог и смена сессии не меняют �
   }finally{view.dispose();await setup.dispose();}
 });
 
+test('все команды открываются по Enter независимо от обязательных аргументов; /providers и /permissions доступны без модели',async()=>{
+  const setup=await createTestRenderer({width:110,height:34,exitOnCtrlC:false});
+  const sent:Command[]=[];const view=new AgentView(setup.renderer,c=>sent.push(c),()=>{});
+  const commands=[
+    {kind:'command',command:'/providers',description:'Провайдеры',arguments:'optional'},
+    {kind:'command',command:'/permissions',description:'Разрешения',arguments:'optional'},
+    {kind:'command',command:'/export',description:'Экспорт',arguments:'required'},
+  ];
+  try{
+    view.accept({type:'snapshot',session:{id:'offline',model:'',workspace:'/tmp'},provider:'gateway',catalog:commands});
+    view.accept({type:'ready'});
+    for(const item of commands){
+      view.editor.setText('Черновик');setup.mockInput.pressKey('p',{ctrl:true});
+      await setup.mockInput.typeText(item.command.slice(1));setup.mockInput.pressEnter();
+      expect(sent.at(-1)).toEqual({type:'submit',text:item.command});
+      view.accept({type:'table',title:'Действия',columns:[],rows:[],selection:{kind:'command',title:'Действия',session_id:'offline',choices:[
+        {key:'action',target:'action',label:'Выбрать действие'},
+      ]}});view.accept({type:'idle'});await setup.flush();
+      expect(setup.renderer.root.findDescendantById('command-menu')?.visible).toBe(true);
+      setup.mockInput.pressEscape();await Bun.sleep(30);
+      expect(view.editor.plainText).toBe('Черновик');
+    }
+    expect(sent).toHaveLength(3);
+  }finally{view.dispose();await setup.dispose();}
+});
+
+test('общее меню действий: заголовок, недоступные пункты, выбор и пустые окна остаются интерактивными',async()=>{
+  const setup=await createTestRenderer({width:110,height:34,exitOnCtrlC:false});
+  const sent:Command[]=[];const view=new AgentView(setup.renderer,c=>sent.push(c),()=>{});
+  try{
+    readyWithCatalog(view);view.editor.setText('Черновик');
+    view.accept({type:'table',title:'Экспорт сессии',columns:[],rows:[],selection:{kind:'command',title:'Экспорт сессии',session_id:'offline',choices:[
+      {key:'unavailable',target:'unavailable',label:'Недоступно',disabled:true},
+      {key:'export',target:'export',label:'Сохранить историю в JSON'},
+    ]}});await setup.flush();
+    expect(setup.captureCharFrame()).toContain('Экспорт сессии');
+    setup.mockInput.pressEnter();
+    expect(sent.at(-1)).toEqual({type:'select',kind:'command',target:'export',session_id:'offline'});
+    view.accept({type:'idle'});
+    view.accept({type:'table',title:'MCP',columns:[],rows:[],selection:{kind:'mcp',session_id:'offline',choices:[]}});
+    await setup.flush();expect(setup.renderer.root.findDescendantById('command-menu')?.visible).toBe(true);
+    expect(setup.captureCharFrame()).toContain('MCP-серверы не настроены');
+    setup.mockInput.pressEnter();expect(sent).toHaveLength(1);
+    setup.mockInput.pressEscape();await Bun.sleep(30);expect(view.editor.plainText).toBe('Черновик');
+  }finally{view.dispose();await setup.dispose();}
+});
+
 
 test('общий каталог различает одинаковые модели провайдеров и переключает пару',async()=>{
   const setup=await createTestRenderer({width:100,height:34,exitOnCtrlC:false});
@@ -246,7 +293,7 @@ test('единые сессии: поиск, недоступная папка, 
     readyWithCatalog(view);view.editor.setText('Сохранить этот черновик');setup.mockInput.pressKey('F4');
     expect(sent.at(-1)).toEqual({type:'submit',text:'/sessions'});
     view.accept(event);view.accept({type:'idle'});await setup.flush();
-    expect(setup.captureCharFrame()).toContain('Выбор сессии');expect(setup.captureCharFrame()).toContain('Доработка CLI');
+    expect(setup.captureCharFrame()).toContain('Сессии · история работы');expect(setup.captureCharFrame()).toContain('Доработка CLI');
     expect(setup.captureCharFrame()).toContain('недоступно');
     setup.mockInput.pressEscape();await Bun.sleep(50);expect(view.editor.plainText).toBe('Сохранить этот черновик');
     setup.mockInput.pressKey('F4');view.accept(event);view.accept({type:'idle'});
@@ -303,7 +350,7 @@ test('горячая клавиша при запуске не теряется 
     readyWithCatalog(view);expect(sent.at(-1)).toEqual({type:'submit',text:'/sessions'});
     view.accept({type:'table',rows:[],selection:{kind:'session',session_id:'offline',current:'offline',choices:[
       {id:'offline',title:'Текущая',model:'alpha',provider:'gateway',workspace:'/tmp',updated:1,enabled:true},
-    ]}});view.accept({type:'idle'});await setup.flush();expect(setup.captureCharFrame()).toContain('Выбор сессии');
+    ]}});view.accept({type:'idle'});await setup.flush();expect(setup.captureCharFrame()).toContain('Сессии · история работы');
   }finally{view.dispose();await setup.dispose();}
 });
 
@@ -437,4 +484,125 @@ test('режим доступа виден в заголовке, меню пе�
     view.accept({type:'idle'});await setup.flush();
     expect(setup.captureCharFrame()).toContain('Только чтение');expect(view.editor.plainText).toBe('Мой черновик');
   }finally{view.dispose();await setup.dispose();}
+});
+
+test('управление провайдером: недоступные действия пропускаются, авторизация выбирает сохранённый способ',async()=>{
+  const setup=await createTestRenderer({width:115,height:42});const sent:Command[]=[];
+  const view=new AgentView(setup.renderer,c=>sent.push(c),()=>{});
+  try{
+    view.accept({type:'snapshot',session:{id:'providers',workspace:'/tmp'},provider:'local'});view.accept({type:'ready'});
+    view.editor.setText('Черновик');
+    view.accept({type:'table',title:'local',columns:[],rows:[],selection:{kind:'provider-actions',session_id:'providers',choices:[
+      {key:'remove',label:'Удалить',disabled:true,command:'/provider remove local',group:'local'},
+      {key:'edit',label:'Изменить URL и авторизацию',command:'/provider edit local',group:'local'},
+    ]}});
+    await setup.flush();setup.mockInput.pressEnter();
+    expect(sent.at(-1)).toEqual({type:'submit',text:'/provider edit local'});
+    view.accept({type:'input_request',id:'auth-env',prompt:'Способ подключения (Enter — env)',default_value:'env',choices:[
+      {label:'Bearer',value:'bearer'},{label:'Ключ из окружения',value:'env'},
+    ]});
+    await setup.flush();setup.mockInput.pressEnter();
+    expect(sent.at(-1)).toEqual({type:'answer',id:'auth-env',value:'env'});
+    view.accept({type:'idle'});expect(view.editor.plainText).toBe('Черновик');
+  }finally{view.dispose();await setup.dispose();}
+});
+
+test('↑ возвращает историю, ручной ввод отменяет запоздалый ответ',async()=>{
+  const setup=await createTestRenderer({width:100,height:30});const sent:Command[]=[];
+  const view=new AgentView(setup.renderer,c=>sent.push(c),()=>{});
+  try{
+    view.accept({type:'snapshot',session:{id:'s',workspace:'/tmp'}});view.accept({type:'ready'});
+    setup.mockInput.pressArrow('up');await setup.flush();
+    expect(sent.at(-1)?.type).toBe('input_history');
+    const request=sent.at(-1)!;
+    view.accept({...request,type:'input_history',message_id:'m',text:'Полный\nтекст'});
+    expect(view.editor.plainText).toBe('Полный\nтекст');
+    setup.mockInput.pressArrow('down');await setup.flush();
+    view.accept({...sent.at(-1),type:'input_history',boundary:'draft'});expect(view.editor.plainText).toBe('');
+    setup.mockInput.pressArrow('up');await setup.flush();const stale=sent.at(-1)!;
+    view.editor.setText('Новый текст');view.accept({...stale,type:'input_history',text:'Старый текст'});
+    expect(view.editor.plainText).toBe('Новый текст');
+  }finally{await view.dispose();setup.renderer.destroy();}
+});
+
+test('клик по своему сообщению: задержка, двойной клик, выделение и занятость',async()=>{
+  const setup=await createTestRenderer({width:100,height:30});const sent:Command[]=[];
+  const view=new AgentView(setup.renderer,c=>sent.push(c),()=>{});
+  const pause=()=>new Promise(resolve=>setTimeout(resolve,300));
+  try{
+    view.accept({type:'snapshot',session:{id:'s',workspace:'/tmp'},history:[{role:'user',content:'Текст пользователя',message_id:'m'}]});view.accept({type:'ready'});
+    await setup.flush();
+    const lines=setup.captureCharFrame().split('\n');const row=lines.findIndex(line=>line.includes('Текст пользователя'));
+    expect(row).toBeGreaterThan(0);const column=lines[row].indexOf('Текст');
+    await setup.mockMouse.click(column+1,row);await pause();
+    expect(sent.at(-1)).toEqual({type:'edit_message',session_id:'s',message_id:'m'});
+    view.accept({type:'idle'});sent.length=0;
+    await setup.mockMouse.click(column+1,row);await setup.mockMouse.click(column+1,row);await pause();expect(sent).toHaveLength(0);
+    setup.renderer.clearSelection();
+    await setup.mockMouse.drag(column,row,column+5,row);await pause();expect(sent).toHaveLength(0);
+    setup.renderer.clearSelection();
+    view.editor.setText('Следующий запрос');view.submit();sent.length=0;
+    await setup.mockMouse.click(column+1,row);await pause();expect(sent).toHaveLength(0);
+  }finally{await view.dispose();setup.renderer.destroy();}
+});
+
+test('сессии: активная группа, понятное название, метрики и даты',async()=>{
+  const setup=await createTestRenderer({width:120,height:35});const view=new AgentView(setup.renderer,()=>{},()=>{});
+  try{
+    view.accept({type:'snapshot',session:{id:'active',workspace:'/tmp'}});view.accept({type:'ready'});
+    view.accept({type:'table',selection:{kind:'session',current:'active',session_id:'active',choices:[
+      {id:'active',title:'Исправить подключение GLM',model:'glm-4.7',workspace:'/tmp',provider:'zai',updated:Date.now()/1000,messages:5,tokens:12000,tokens_known:true,current:true,enabled:true},
+      {id:'old',title:'Проверить статистику',model:'alpha',workspace:'/tmp',provider:'local',updated:Date.now()/1000,messages:2,enabled:true},
+    ]}});view.accept({type:'idle'});await setup.flush();
+    const frame=setup.captureCharFrame();expect(frame).toContain('Активная сессия');expect(frame).toContain('Сегодня');
+    expect(frame).toContain('Исправить подключение GLM');expect(frame).toContain('5 сообщ.');expect(frame).toContain('12 000 ток.');
+  }finally{await view.dispose();setup.renderer.destroy();}
+});
+
+test('после Plan: уточнение сохраняет черновик, переход меняет только режим',async()=>{
+  const setup=await createTestRenderer({width:110,height:34});const sent:Command[]=[];
+  const view=new AgentView(setup.renderer,c=>sent.push(c),()=>{});
+  const find=(id:string):any=>view.root.findDescendantById(id);
+  try{
+    view.accept({type:'snapshot',session:{id:'s',workspace:'/tmp',agent_mode:'plan'}});view.accept({type:'ready'});
+    expect(find('plan-actions').visible).toBe(false);
+    view.accept({type:'user',text:'Составь план'});view.accept({type:'assistant',content:'План готов'});
+    view.accept({type:'done',reason:'stop',agent_mode:'plan'});view.accept({type:'idle'});
+    view.editor.setText('Нужно сохранить совместимость');await setup.flush();
+    expect(setup.captureCharFrame()).toContain('Перейти в Build');expect(setup.captureCharFrame()).toContain('Уточнить план');
+    const clarify=find('plan-clarify');await setup.mockMouse.click(clarify.x+1,clarify.y);await setup.flush();
+    expect(view.editor.plainText).toBe('Нужно сохранить совместимость');expect(view.editor.focused).toBe(true);expect(sent).toHaveLength(0);
+    const build=find('plan-build');await setup.mockMouse.click(build.x+1,build.y);await setup.flush();
+    expect(sent).toEqual([{type:'set_agent',mode:'build'}]);expect(view.editor.plainText).toBe('Нужно сохранить совместимость');
+    view.accept({type:'agent_mode',mode:'build'});await setup.flush();expect(find('plan-actions').visible).toBe(false);
+    view.accept({type:'agent_mode',mode:'plan'});view.accept({type:'done',reason:'error'});view.accept({type:'idle'});
+    expect(find('plan-actions').visible).toBe(false);
+  }finally{await view.dispose();setup.renderer.destroy();}
+});
+
+test('переход Plan скрыт в вопросе и при смене сессии',async()=>{
+  const setup=await createTestRenderer({width:110,height:34});const sent:Command[]=[];
+  const view=new AgentView(setup.renderer,c=>sent.push(c),()=>{});
+  try{
+    view.accept({type:'snapshot',session:{id:'s',workspace:'/tmp',agent_mode:'plan'}});view.accept({type:'ready'});
+    view.accept({type:'done',reason:'stop',agent_mode:'plan'});view.accept({type:'idle'});
+    expect(view.root.findDescendantById('plan-actions')?.visible).toBe(true);
+    view.accept({type:'input_request',id:'q',question:true,prompt:'Какой вариант?',choices:[{label:'Первый',value:'one'}]});
+    expect(view.root.findDescendantById('plan-actions')?.visible).toBe(false);
+    view.accept({type:'idle'});view.accept({type:'snapshot',session:{id:'other',workspace:'/tmp',agent_mode:'plan'}});
+    expect(view.root.findDescendantById('plan-actions')?.visible).toBe(false);
+  }finally{await view.dispose();setup.renderer.destroy();}
+});
+
+test('повтор после обрыва убирает только текущий ответ и reasoning',async()=>{
+  const setup=await createTestRenderer({width:110,height:34});const view=new AgentView(setup.renderer,()=>{},()=>{});
+  try{
+    view.accept({type:'snapshot',session:{id:'s',workspace:'/tmp'}});view.accept({type:'ready'});
+    view.accept({type:'assistant',content:'Сохранённый ответ'});
+    view.accept({type:'reasoning',text:'Оборванная мысль'});view.accept({type:'text',text:'Оборванный фрагмент'});await setup.flush();
+    view.accept({type:'warning',message:'Повтор',retry:{attempt:1,delay:0,status:502,reset_response:true}});
+    view.accept({type:'text',text:'Восстановленный ответ'});view.accept({type:'assistant',content:'Восстановленный ответ'});await setup.flush();
+    const frame=setup.captureCharFrame();expect(frame).toContain('Сохранённый ответ');expect(frame).toContain('Восстановленный ответ');
+    expect(frame).not.toContain('Оборванный фрагмент');expect(frame).not.toContain('Reasoning');
+  }finally{await view.dispose();setup.renderer.destroy();}
 });

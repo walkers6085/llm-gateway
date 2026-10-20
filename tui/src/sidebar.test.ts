@@ -32,6 +32,19 @@ test('правая панель: контекст, последний вход, 
   }finally{view.dispose();await setup.dispose();}
 });
 
+test('без предела ответа панель показывает «без ограничения»',async()=>{
+  const setup=await createTestRenderer({width:125,height:52});const view=new AgentView(setup.renderer,()=>{},()=>{});
+  try{
+    view.accept({type:'snapshot',session:{id:'free',model:'alpha',workspace:'/tmp'},provider:'test',
+      context:{estimated_tokens:1000,max_input_tokens:131072,max_output_tokens:0,context_window:131072,context_source:'catalog'},
+      planning:{goal:'',todos:[]},mcp:[]});
+    view.accept({type:'ready'});await setup.flush();
+    const frame=setup.captureCharFrame();
+    expect(frame).toContain('Резерв ответа: без');
+    expect(frame).not.toContain('Резерв ответа: 0');
+  }finally{view.dispose();await setup.dispose();}
+});
+
 test('длинные цель и задачи раскрываются заголовками; активный пункт виден в свёрнутом списке',async()=>{
   const setup=await createTestRenderer({width:125,height:52});const view=new AgentView(setup.renderer,()=>{},()=>{});
   try{

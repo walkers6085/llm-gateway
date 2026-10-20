@@ -36,7 +36,7 @@
 6. Умолчание инструмента: `read_file`, `list_dir`, `glob`, `grep`, `web_search` — **allow**; остальные
    (`write_file`, `edit_file`, `shell`, `web_fetch`, `http_request`, все MCP) — **ask**.
 
-Режим `read_only` допускает только встроенные read_file/list_dir/glob/grep/web_fetch/web_search/goal/todo/question. Явное ask для них превращается в deny; обычные вызовы чтения разрешены. Shell, запись, http_request, MCP и subagent запрещены даже при allow/always и разрешающем хуке.
+Режим `read_only` допускает только встроенные read_file/list_dir/glob/grep/web_fetch/web_search/goal/todo/question/statistics/inspect и безопасные роли subagent. Явное ask для них превращается в deny; обычные вызовы чтения разрешены. Shell, запись, http_request, MCP и роль worker запрещены даже при allow/always и разрешающем хуке.
 
 ## Режимы (`permissions.mode`)
 
@@ -76,9 +76,9 @@
 
 ## Делегация
 
-`subagent` по умолчанию требует `ask`; правило `deny` действует как для других инструментов.
+`subagent` с ролью worker по умолчанию требует `ask`; explorer/reviewer имеют allow; правило `deny` действует как для других инструментов.
 Дочерняя задача наследует конфигурацию прав и копию allow_rules родителя; её инструменты
-проходят обычные PreToolUse и подтверждения. В read_only делегация запрещена независимо от allow-правил.
+проходят обычные PreToolUse и подтверждения. В read_only разрешены только explorer/reviewer; worker запрещён независимо от allow-правил.
 
 В OpenTUI подтверждение показывает действие и команду отдельно от вариантов ответа.
 Стрелки/Tab, Enter и левая кнопка мыши выбирают ответ; Esc отказывает. Изначально выбран
@@ -95,7 +95,7 @@
 В режиме агента plan действует отдельное ограничение до PreToolUse: допускаются только
 инструменты с Tool.plan_safe=True. Встроенные чтение/поиск файлов, web_fetch/web_search,
 goal/todo/question отмечены безопасными для планирования. Shell, запись/редактирование,
-http_request, subagent и MCP не включены. Разрешения allow_all/always не снимают ограничение.
+http_request и MCP не включены. subagent разрешён только с ролями explorer/reviewer; inspect выполняет структурированные проверки без shell. Разрешения allow_all/always не снимают ограничение.
 Это ограничение вызовов модели; настроенные владельцем SessionStart/UserPromptSubmit и
 другие внешние хуки продолжают выполняться как настроены.
 
@@ -106,3 +106,12 @@ allow_all`, `/permissions default`, `/permissions read_only` меняют тек
 Смена заблокирована до завершения текущего запроса. Суффикс `save` или пункт сохранения
 записывает выбор в пользовательский settings.json. Режим хранится отдельно от build/plan,
 показан в заголовке TUI и переживает восстановление сессии. Старые сессии наследуют настройки.
+
+`statistics` — инструмент чтения агрегатов текущей сессии, умолчание **allow**,
+plan_safe=True. Входит в встроенный разрешённый набор read_only. Доступ к другой
+сессии или другому владельцу через его аргументы не предусмотрен.
+
+`inspect` — allow по умолчанию и plan_safe=True; действует проверка workspace и сетевая
+SSRF-политика. Для subagent доступны точные правила по роли, например
+`deny: ["subagent(reviewer)"]`. Роль повторно проверяется после PreToolUse: хук
+не может разрешить worker в Plan/read_only.

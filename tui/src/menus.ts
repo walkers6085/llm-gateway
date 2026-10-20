@@ -2,11 +2,13 @@
 import {badgeForTag,type Badge} from './theme.ts';
 
 export const menuSpecs={
+  command:{title:'Выберите действие',search:'Поиск действия',empty:'Нет доступных действий. Esc — закрыть.',action:'выбрать'},
+  'provider-actions':{title:'Управление провайдером',search:'Поиск действия',empty:'Нет доступных действий.',action:'открыть'},
   permissions:{title:'Режим доступа к инструментам',search:'Поиск режима',empty:'Нет режимов.',action:'выбрать'},
   revert:{title:'Изменить прошлое сообщение',search:'Поиск по вашим сообщениям',empty:'Нет сообщений для изменения.',action:'выбрать'},
   model:{title:'Выбор модели · все провайдеры',search:'Поиск по провайдеру, модели и тегам',empty:'Провайдер не вернул доступных моделей. Выбор модели не изменён.',action:'переключить'},
   provider:{title:'Выбор провайдера',search:'Поиск провайдера',empty:'Нет доступных провайдеров.',action:'переключить'},
-  session:{title:'Выбор сессии',search:'Поиск по названию, модели, папке или ID',empty:'Сохранённых сессий пока нет.',action:'продолжить'},
+  session:{title:'Сессии · история работы',search:'Поиск по названию, модели, папке или ID',empty:'Сохранённых сессий пока нет.',action:'продолжить'},
   'session-delete':{title:'Удаление сессии',search:'Поиск сессии для удаления',empty:'Нет сессий для удаления.',action:'выбрать'},
   tool:{title:'Инструменты',search:'Поиск инструмента или описания',empty:'Инструменты отключены.',action:'параметры'},
   mcp:{title:'MCP-серверы',search:'Поиск сервера или инструмента',empty:'MCP-серверы не настроены.',action:'подробнее'},
@@ -14,7 +16,7 @@ export const menuSpecs={
 export const menuShortcuts:Record<string,{command:string;label:string}>={f1:{command:'/help',label:'команды'},f2:{command:'/models',label:'модели'},f3:{command:'/provider',label:'пров.'},f4:{command:'/sessions',label:'сессии'}};
 export type MenuKind=keyof typeof menuSpecs;
 export type PickerChoice={key:string;name:string;label:string;description?:string;group?:string;badges?:Badge[];disabled?:boolean;model?:string;provider?:string|null;target?:string;command?:string};
-export type PickerState={choices:PickerChoice[];kind:MenuKind;current:string;currentProvider?:string|null;currentLabel:string;sessionId:string;draft:string;query?:string};
+export type PickerState={choices:PickerChoice[];kind:MenuKind;title?:string;route?:string;restoreIndex?:number;current:string;currentProvider?:string|null;currentLabel:string;sessionId:string;draft:string;query?:string};
 
 export function createPicker(event:any,draft:string):PickerState{
   const selection=event.selection,kind=selection.kind as MenuKind;
@@ -30,25 +32,28 @@ export function createPicker(event:any,draft:string):PickerState{
         description:bounds+(item.display_name&&item.display_name!==item.model?item.model+' · ':'')+(item.available?'': 'Из конфига · API недоступен'),badges:[...tags.map(badgeForTag),...(item.available?[]:[{text:'API недоступен',tone:'warning' as const}])]};
     }
     if(kind==='provider')return {key:JSON.stringify([item.provider]),provider:item.provider,name:item.label,label:`${item.label} / ${item.model||''}`,
-      description:item.model?'Модель: '+item.model:'Модель не выбрана',group:'Подключения',disabled:item.enabled===false,badges:[]};
+      description:[item.description,item.model?'Модель: '+item.model:'Модель не выбрана'].filter(Boolean).join(' · '),group:'Подключения',disabled:item.enabled===false,badges:(item.tags||[]).map(badgeForTag)};
     if(kind==='revert')return {key:item.key,target:item.target,name:item.label.split('\n')[0].slice(0,140)||'(пустое сообщение)',label:item.label,description:item.description,group:item.group};
     if(kind==='session'||kind==='session-delete'){
       const updated=typeof item.updated==='number'?new Date(item.updated*1000).toLocaleString('ru-RU',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}):'';
+      const now=new Date();const day=new Date(item.updated*1000);
+      const period=day.toDateString()===now.toDateString()?'Сегодня':day.toDateString()===new Date(now.getFullYear(),now.getMonth(),now.getDate()-1).toDateString()?'Вчера':'Ранее';
+      const tokens=item.tokens_known?Number(item.tokens||0).toLocaleString('ru-RU'):'н/д';
       return {key:item.id,target:item.id,name:item.title||'(без названия)',label:`${item.title} ${item.model} ${item.provider} ${item.workspace} ${item.id}`,
-        description:`${item.model||'без модели'} · ${updated} · ${item.workspace} · ${item.id}`,group:item.enabled?'Этот проект':'Другие / недоступные',disabled:!item.enabled,
-        badges:[{text:item.provider||'gateway',tone:'info'}]};
+        description:`${updated} · ${item.messages||0} сообщ. · ${tokens} ток. · ${item.model||'без модели'} · ${item.workspace} · ${item.id.slice(0,8)}`,group:item.current?'Активная сессия':item.enabled?period:'Другие проекты',disabled:!item.enabled,
+        badges:[{text:item.provider||'gateway',tone:'info'},...(item.agent_mode==='plan'?[{text:'plan',tone:'warning' as const}]:[])]};
     }
-    return {key:item.key,name:item.label,label:`${item.label} ${item.description||''}`,description:item.description,group:item.group||(kind==='mcp'?'Серверы':'Инструменты'),
-      command:item.command,badges:(item.tags||[]).map((tag:string)=>({text:tag,tone:tag==='ошибка'?'error':tag==='ask'?'warning':tag==='allow'||tag==='OK'?'success':'info'}))};
+    return {key:item.key,name:item.label,label:`${item.label} ${item.description||''}`,description:item.description,group:item.group||(kind==='mcp'?'Серверы':kind==='provider-actions'?'Действия с подключением':kind==='command'?'Действия':kind==='permissions'?'Режимы доступа':'Инструменты'),
+      command:item.command,target:item.target,disabled:item.disabled,badges:(item.tags||[]).map((tag:string)=>({text:tag,tone:tag==='ошибка'?'error':tag==='ask'?'warning':tag==='allow'||tag==='OK'?'success':'info'}))};
   }):[...new Set<string>((event.rows||[]).map((row:any[])=>row[0]).filter((value:unknown)=>typeof value==='string' && value.length>0))]
     .map(model=>({key:model,name:model,label:model,model}));
   if(choices.some(choice=>choice.group)){
     const groups=new Map<string,PickerChoice[]>();
     for(const choice of choices){const key=choice.group||'';if(!groups.has(key))groups.set(key,[]);groups.get(key)!.push(choice);}
     const ordered=[...groups.values()];
-    if(kind==='session'||kind==='session-delete')ordered.sort((a,b)=>Number(!!a[0]?.disabled)-Number(!!b[0]?.disabled));
+    if(kind==='session'||kind==='session-delete')ordered.sort((a,b)=>Number(!!a[0]?.disabled)-Number(!!b[0]?.disabled)||(a[0]?.key===selection.current?-1:b[0]?.key===selection.current?1:0));
     choices.splice(0,choices.length,...ordered.flatMap(group=>kind==='model'?group.sort((a,b)=>Number(!!b.badges?.some(tag=>tag.text.toLowerCase()==='free'))-Number(!!a.badges?.some(tag=>tag.text.toLowerCase()==='free'))):group));
   }
   const current=entries?(kind==='provider'?JSON.stringify([selection.provider]):kind==='model'?JSON.stringify([selection.provider,selection.current]):selection.current||''):selection.current||'';
-  return {choices,kind,current,currentProvider:selection.provider,currentLabel:kind==='provider'?(selection.provider||'gateway (настройки)'):(selection.current||'не выбрана'),sessionId:selection.session_id,draft};
+  return {choices,kind,title:selection.title,route:selection.route,current,currentProvider:selection.provider,currentLabel:kind==='session'||kind==='session-delete'?(entries?.find((item:any)=>item.id===selection.current)?.title||'не выбрана'):kind==='provider'?(selection.provider||'gateway (настройки)'):(selection.current||'не выбрана'),sessionId:selection.session_id,draft};
 }

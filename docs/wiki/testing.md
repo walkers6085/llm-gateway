@@ -194,7 +194,7 @@ builtin/MCP без модели, отсутствие выключенных и�
 счётчик, отсутствие дублей и возврат текста при гонке с завершением. Тест разрешений
 обновлён: Enter во время генерации теперь отправляет уточнение, сохраняя модальный черновик.
 
-TUI проверяется в CI на Bun 1.3.8 и 1.3.14: установка из lockfile, проверка типов и все тесты с настоящим нативным рендерером. Минимальная проверенная версия проекта — 1.3.8, несмотря на более высокий engines.bun у @opentui/core.
+TUI проверяется в CI на Bun 1.3.8 и 1.3.14: установка из lockfile, проверка типов и все тесты с настоящим нативным рендерером. Минимальная проверенная версия проекта — 1.3.8, несмотря на более высокий engines.bun у @opentui/core; сам launcher версию Bun не проверяет.
 
 Мастер провайдера: tests/test_providers.py проверяет отмену без частичных записей, сохранение прежнего ключа, смену URL, восстановление при ошибке записи и настоящее соединение mTLS. tests/test_tui.py проверяет диалоги добавления/изменения, отключение, включение, удаление и отмену, tui/src/view.test.ts — запуск действий из меню.
 
@@ -212,3 +212,71 @@ agent/retry.py и agent/context.py → tests/test_retry_cleanup.py → request-p
 Сводка через модель: tests/test_model_compaction.py → agent/compaction.py, store.py, loop.py → [обработка запросов](request-processing.md), [сессии](sessions.md). Проверяются части истории, лимиты, резервный вариант, отмена, трассировка и отказ от устаревшего результата. Строгие права и глобальный стандарт проверяются tests/test_permissions.py; сохранение и блокировка записи через меню — tests/test_tui.py и tui/src/view.test.ts.
 
 Окна моделей: tests/test_model_limits.py → agent/model_limits.py, llm.py, cli.py, loop.py → [обработка запросов](request-processing.md), [настройки](settings.md). Проверяются форматы API, aliases, ручные ограничения, разные провайдеры с одинаковым ID, выбор до первого чата, необязательный каталог, общий бюджет и оценка токенов. Панель окна и источника — tui/src/sidebar.test.ts.
+
+Команды провайдеров: tests/test_provider_commands.py → agent/provider_commands.py, cli.py,
+providers.py → [провайдеры](providers.md), [CLI](cli.md). Проверяются кавычки/табуляция,
+отсутствующие аргументы, сохранение выбора, проверка только GET models, reload с изоляцией
+истории нового адреса, отмена после последнего поля до записи, команды оболочки без Bun/LLM.
+Реальные диалоги моста и меню без имени — tests/test_tui.py; сохранённые способы авторизации,
+недоступные пункты и черновики — tui/src/view.test.ts. Basic/mTLS с дополнительным Bearer
+при редактировании — tests/test_providers.py.
+
+Регрессии ручного `/compact`: tests/test_model_compaction.py проверяет включение последнего завершённого хода, вызов модели при локальном режиме автосжатия, восстановление полной истории после прежних выдержек, повтор 429 и отсутствие изменения checkpoint при ошибке/таймауте/отсутствии подключения. tests/test_cli.py::test_compact_failure_reports_error_without_changing_context проверяет сообщение об ошибке и продолжение чата через настоящий локальный шлюз.
+
+`tests/test_tui.py::test_compact_notices_survive_snapshot_and_failure_can_be_retried` проверяет JSONL-мост: начало суммаризации, сохранение контекста при 401, повторную успешную команду и отсутствие history в snapshot, чтобы UI не стирал результат.
+
+Регрессии видимости повторов суммаризации: tests/test_model_compaction.py проверяет уведомление до повторной попытки 429/502, а также выход из автосжатия во время backoff без изменения checkpoint и повторного запроса. JSONL-тест /compact в tests/test_tui.py проверяет warning.retry при 502 перед успешной сводкой.
+
+Единые меню: `agent/tui_commands.py`, `agent/tui_backend.py`, `tui/src/menus.ts` и `tui/src/view.ts`
+→ `tests/test_tui.py`, `tui/src/view.test.ts` → [TUI](tui.md).
+`test_every_catalog_command_opens_selection_without_model_or_credentials` открывает каждую
+команду и справку каждого инструмента без модели/ключа и проверяет интерактивный selection;
+`test_command_menu_validates_selection_and_executes_only_after_choice` проверяет отложенное
+создание сессии, поддельный пункт и устаревшую сессию.
+`test_provider_section_pages_add_edit_and_remove` проходит страницы раздела «Провайдеры»:
+добавление с готовым способом авторизации, замена Base URL и токена по отдельности и удаление
+с подтверждением.
+`test_provider_section_navigation_back_reopens_window_and_rejects_stale_route` проверяет
+возврат по маршруту: прежнее окно открывается снова, а неизвестный маршрут отвергается.
+
+Запуск TUI: `tests/test_tui.py::test_launcher_refreshes_sources_without_reinstall` проверяет,
+что установленный кэш переиспользуется после правки файлов интерфейса и обновляется без сети;
+`test_launcher_does_not_check_bun_version` проверяет, что версия Bun не проверяется, а ошибка
+называет настоящую причину — нет Bun или не выполнен `gwagent tui install`. Кадры OpenTUI проверяют Enter при
+обязательных аргументах, `/providers` и `/permissions`, общий заголовок, отключённые пункты,
+пустое окно и восстановление черновика по Esc.
+
+`tests/test_model_limits.py` проверяет резервное окно 120000, вычет токенов ответа и сохранение меньшего реального окна API (32768), а также приоритет известных моделей и ручных ограничений.
+
+Лимит ответа: `tests/test_model_limits.py::test_output_limit_off_omits_max_tokens_and_asks_for_brief_answer` проверяет, что при `max_output_tokens: 0` поле `max_tokens` не отправляется, а система-промпт просит отвечать кратко; `test_output_limit_set_sends_max_tokens` — что положительный предел возвращается в запрос. `test_model_limits_are_individual_and_manual_cap_is_separate` проверяет `output_unlimited` и вход, равный всему окну при снятом пределе.
+
+История ввода и её устаревшие ответы проверяются в
+`tui/src/input-history.test.ts`, фоновый режим и дедупликация уведомлений —
+в `tui/src/notifications.test.ts` с подставным адаптером без реальных звуков.
+JSONL истории и редактирования проверяет `tests/test_tui.py`.
+
+Регрессия max_turn_tokens: tests/test_model_limits.py проверяет отсутствие скрытого
+бюджета для длинного цикла и сводки после большого расхода, а также приоритет профиля.
+Явный положительный лимит сохраняется в tests/test_compaction.py.
+
+Названия и статистику покрывает tests/test_statistics.py: восстановление из истории,
+сохранение ручного имени, изоляция владельцев, отсутствие двойного учёта usage,
+ошибки/повторы и доступ инструмента statistics в plan/read_only. tests/test_tui.py
+проверяет меню статистики и переименование без модели, tui/src/view.test.ts — группы,
+названия и метрики списка сессий. Изменение runtime-реестра проверяется также тестами прав.
+
+Исследовательский Plan проверяется tests/test_plan_roles.py: видимость ролей, запрет
+записи explorer/reviewer из обоих режимов, защита от смены роли хуком, фильтрация
+служебных сессий, конкретное действие после inspect, HEAD против локального HTTP-сервера
+и сохранение SSRF/workspace ограничений. Совместимость worker, отмену, timeout и общий
+бюджет продолжают проверять tests/test_tracing_reasoning.py и tests/test_agent_api.py.
+
+Переход после Plan проверяется tui/src/view.test.ts: переключается только режим,
+черновик сохраняется, вопрос и смена сессии скрывают действия. tests/test_plan_roles.py
+проверяет инструкции о переходе и уточнениях; ожидание ответа question и продолжение
+того же цикла покрыты tests/test_agent_modes.py.
+
+tests/test_retry_cleanup.py воспроизводит RemoteProtocolError после текста/reasoning,
+обрыв Content-Length настоящим локальным HTTP-сервером, незавершённый SSE и длинную
+первую попытку. Проверяется отсутствие повторного выполнения завершённого инструмента
+и сохранения неподтверждённых вызовов. TUI и tests/test_chat.mjs проверяют очистку фрагмента.

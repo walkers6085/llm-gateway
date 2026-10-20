@@ -172,9 +172,9 @@ class ProviderManager:
         if name == self.config['default']:
             raise ValueError('сначала выберите другой провайдер по умолчанию через use')
         identity = self.identity(name)
-        del self.config['providers'][name]
-        self.save()
-        self.credentials.delete(identity)
+        candidate = copy.deepcopy(self.config)
+        del candidate['providers'][name]
+        self.save_connections(candidate, {}, remove_ids=[identity])
 
     def use(self, name, model=None):
         provider = self.get(name)
@@ -183,7 +183,7 @@ class ProviderManager:
             provider['model'] = model
         self.save()
 
-    def configure(self, name=None, read=input, password=getpass.getpass, *, default_url=None, default_model=''):
+    def prepare_connection(self, name=None, read=input, password=getpass.getpass, *, default_url=None, default_model='', activate=True, auth_kind=None):
         """Собрать подключение целиком до изменения реестра и учётных данных."""
         try:
             adding = name is None
@@ -203,13 +203,15 @@ class ProviderManager:
             self._validate_candidate(candidate)
             old_secret = self.credentials.get(self.identity(name)) if previous else {}
             same_endpoint = old_secret.get('endpoint_hash') == hashlib.sha256(entry['url'].encode()).hexdigest()
-            default_kind = 'mtls' if entry.get('tls', {}).get('cert') else 'bearer'
-            kind = read(f'Способ подключения [bearer/basic/none/mtls] (Enter — {default_kind}): ').strip() or default_kind
+            default_kind = 'mtls' if entry.get('tls', {}).get('cert') else ('env' if entry.get('token_env') else old_secret.get('type') or ('none' if entry.get('auth') == 'none' else 'bearer'))
+            kind = auth_kind or read(f'Способ подключения [bearer/basic/none/mtls/env] (Enter — {default_kind}): ').strip() or default_kind
             pasted_token = kind if kind.startswith('gw-') else ''
             if pasted_token:
                 kind = 'bearer'
-            if kind not in ('bearer', 'basic', 'none', 'mtls'):
-                raise ValueError('Выберите bearer — API-ключ, mtls — клиентский сертификат, basic — логин/пароль, none — без авторизации')
+            else:
+                kind = kind.lower()
+            if kind not in ('bearer', 'basic', 'none', 'mtls', 'env'):
+                raise ValueError('Выберите bearer — API-ключ, mtls — клиентский сертификат, basic — логин/пароль, none — без авторизации, env — ключ из переменной окружения')
             secret = {'type': 'none' if kind == 'mtls' else kind,
                       'endpoint_hash': hashlib.sha256(entry['url'].encode()).hexdigest()}
             old_tls = entry.get('tls', {})
@@ -221,8 +223,12 @@ class ProviderManager:
                 if not secret['token']:
                     raise ValueError('Пустой ключ; подключение не сохранено')
             elif kind == 'basic':
-                secret['username'] = read('Логин: ').strip()
-                secret['password'] = password('Пароль (ввод скрыт): ')
+                retain = same_endpoint and old_secret.get('type') == 'basic'
+                username = old_secret.get('username', '') if retain else ''
+                secret['username'] = read('Логин' + (f' (Enter — {username})' if username else '') + ': ').strip() or username
+                retain = retain and secret['username'] == username
+                value = password('Пароль (ввод скрыт' + ('; Enter — сохранить прежний' if retain else '') + '): ')
+                secret['password'] = value or (old_secret.get('password', '') if retain else '')
                 if not secret['username'] or not secret['password']:
                     raise ValueError('Нужны логин и пароль; подключение не сохранено')
             elif kind == 'mtls':
@@ -240,19 +246,62 @@ class ProviderManager:
                         tls[key] = str(path)
                 if not tls.get('cert'):
                     raise ValueError('Нужен файл клиентского сертификата PEM')
-                secret['key_password'] = password('Пароль приватного ключа (ввод скрыт; Enter — без пароля): ')
+                retain = same_endpoint and tls.get('key') == old_tls.get('key') and tls.get('cert') == old_tls.get('cert')
+                saved = old_secret.get('key_password', '') if retain else ''
+                value = password('Пароль приватного ключа (ввод скрыт; Enter — ' + ('сохранить прежний, - — убрать' if saved else 'без пароля') + '): ')
+                secret['key_password'] = '' if value == '-' else value or saved
+                if same_endpoint and old_secret.get('type') in ('bearer', 'basic'):
+                    secret.update({key: old_secret[key] for key in ('type', 'token', 'username', 'password') if key in old_secret})
                 context = ssl.create_default_context(cafile=tls.get('ca'))
                 try:
                     context.load_cert_chain(tls['cert'], tls.get('key'), secret['key_password'] or (lambda: ''))
                 except (ssl.SSLError, OSError) as exc:
                     raise ValueError('Не удалось загрузить сертификат и ключ: проверьте PEM, соответствие ключа и пароль') from exc
                 entry['tls'] = tls
-            candidate['default'], candidate['selected'] = name, True
-            entry.update(auth='stored', token_env='', enabled=True)
-            self._save_connection(candidate, name, secret)
-            return name
+            if kind == 'env':
+                variable = read(f'Переменная окружения с API-ключом (Enter — {entry.get("token_env") or "API_KEY"}): ').strip() or entry.get('token_env') or 'API_KEY'
+                entry.update(auth='env', token_env=variable)
+                secret = {'type': 'none', 'endpoint_hash': secret['endpoint_hash']}
+            else:
+                entry.update(auth='stored', token_env='')
+            if activate:
+                candidate['default'], candidate['selected'] = name, True
+                entry['enabled'] = True
+            self._validate_candidate(candidate)
+            return name, candidate, secret
         except (EOFError, KeyboardInterrupt):
             raise ValueError('Настройка подключения отменена; изменения не сохранены') from None
+
+    def prepare_change(self, name, field, value):
+        """Изменить только выбранное поле, сохранив профили моделей и остальные настройки."""
+        candidate = copy.deepcopy(self.config)
+        entry = candidate['providers'][name]
+        secret = copy.deepcopy(self.credentials.get(self.identity(name)))
+        old_hash = hashlib.sha256(entry['url'].rstrip('/').encode()).hexdigest()
+        if field == 'url':
+            entry['url'] = value.strip().rstrip('/')
+            if entry['url'] != self.get(name)['url'].rstrip('/'):
+                # Старый API-ключ нельзя автоматически отправить на другой сервер.
+                certificate_only = entry.get('tls', {}).get('cert') and secret.get('type', 'none') == 'none'
+                secret.setdefault('type', 'none')
+                secret['endpoint_hash'] = hashlib.sha256(entry['url'].encode()).hexdigest() if certificate_only else old_hash
+                entry.update(auth='stored', token_env='')
+        elif field == 'token':
+            if not value.strip():
+                raise ValueError('Пустой токен; изменения не сохранены')
+            secret = {key: val for key, val in secret.items() if key == 'key_password'}
+            secret.update(type='bearer', token=value.strip(), endpoint_hash=old_hash)
+            entry.update(auth='stored', token_env='')
+        else:
+            raise ValueError('Выберите замену Base URL или токена')
+        self._validate_candidate(candidate)
+        return candidate, secret
+
+    def configure(self, name=None, read=input, password=getpass.getpass, *, default_url=None, default_model=''):
+        name, candidate, secret = self.prepare_connection(name, read, password,
+            default_url=default_url, default_model=default_model)
+        self._save_connection(candidate, name, secret)
+        return name
 
     def _validate_candidate(self, candidate):
         previous = self.config
@@ -266,7 +315,7 @@ class ProviderManager:
         identity = candidate['providers'][name].get('id') or 'legacy:' + name
         self.save_connections(candidate, {identity: secret})
 
-    def save_connections(self, candidate, secrets):
+    def save_connections(self, candidate, secrets, *, remove_ids=()):
         self._validate_candidate(candidate)
         with file_lock(self.path):
             if digest(self.path) != self._revision:
@@ -274,13 +323,17 @@ class ProviderManager:
             with file_lock(self.credentials.path):
                 existed = self.credentials.path.exists()
                 previous = self.credentials.read()
+                updated = {**previous, **secrets}
+                for identity in remove_ids:
+                    updated.pop(identity, None)
+                credentials_changed = bool(secrets) or updated != previous
                 try:
-                    if secrets:
-                        write_json(self.credentials.path, {**previous, **secrets})
+                    if credentials_changed:
+                        write_json(self.credentials.path, updated)
                         self.credentials.read()
                     write_json(self.path, candidate)
                 except Exception:
-                    if secrets:
+                    if credentials_changed:
                         if existed:
                             write_json(self.credentials.path, previous)
                         else:
@@ -290,7 +343,7 @@ class ProviderManager:
             self._revision = digest(self.path)
             self._saved = copy.deepcopy(candidate)
 
-    def configure_model(self, name, model=None, read=input):
+    def prepare_model(self, name, model=None, read=input, *, include_context=False):
         self.get(name)
         try:
             model = model or read('ID модели (как в API): ').strip()
@@ -300,7 +353,10 @@ class ProviderManager:
             profile = copy.deepcopy(provider.get('model_profiles', {}).get(model, {}))
             label = provider.get('model_names', {}).get(model, model)
             display = read(f'Название модели (Enter — {label}): ').strip() or label
-            for key, label in (('max_input_tokens', 'Лимит входного контекста'), ('max_output_tokens', 'Максимум токенов ответа')):
+            fields = [('max_input_tokens', 'Лимит входа (0 — авто)'), ('max_output_tokens', 'Максимум токенов ответа (0 — без ограничения)')]
+            if include_context:
+                fields.insert(0, ('context_window', 'Полное окно контекста (вход и ответ)'))
+            for key, label in fields:
                 value = read(f'{label} (Enter — {profile.get(key, "наследовать")}, - — наследовать): ').strip()
                 if value == '-':
                     profile.pop(key, None)
@@ -321,11 +377,15 @@ class ProviderManager:
             provider['models'] = list(dict.fromkeys([*provider['models'], model]))
             candidate = copy.deepcopy(self.config);candidate['providers'][name] = provider
             self._validate_candidate(candidate)
-            self.config = candidate
-            self.save()
-            return model
+            return model, candidate
         except (EOFError, KeyboardInterrupt):
             raise ValueError('Настройка модели отменена; изменения не сохранены') from None
+
+    def configure_model(self, name, model=None, read=input):
+        model, candidate = self.prepare_model(name, model, read)
+        self.config = candidate
+        self.save()
+        return model
 
 
     def connect(self, name, read=input, password=getpass.getpass):

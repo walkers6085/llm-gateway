@@ -210,3 +210,48 @@ def test_wizard_invalid_certificate_and_failed_save_keep_old_credentials(tmp_pat
         manager.configure('local', read=lambda _: next(answers), password=lambda _: 'new-token')
     assert before == (manager.path.read_bytes(), manager.credentials.path.read_bytes())
     assert manager.connection().token == 'original-token'
+
+
+def test_edit_basic_keeps_password_only_for_same_endpoint(tmp_path):
+    manager = ProviderManager(tmp_path/'providers.json')
+    values = iter(['https://example.test/v1', 'basic', 'tester'])
+    manager.configure('local', read=lambda _: next(values), password=lambda _: 'saved-password')
+    values = iter(['', '', ''])
+    manager.configure('local', read=lambda _: next(values), password=lambda _: '')
+    assert manager.credentials.get(manager.identity('local'))['password'] == 'saved-password'
+    values = iter(['https://different.test/v1', 'basic', 'tester'])
+    with pytest.raises(ValueError, match='пароль'):
+        manager.configure('local', read=lambda _: next(values), password=lambda _: '')
+    assert manager.get('local')['url'] == 'https://example.test/v1'
+
+
+def test_edit_mtls_preserves_additional_bearer_auth(tmp_path, pki, upstream_url):
+    manager = ProviderManager(tmp_path/'providers.json')
+    values = iter([upstream_url, 'mtls', pki['client_cert'], pki['client_key'], pki['ca']])
+    manager.configure('secure', read=lambda _: next(values), password=lambda _: '')
+    identity = manager.identity('secure')
+    secret = manager.credentials.get(identity)
+    manager.credentials.set(identity, {**secret, 'type': 'bearer', 'token': 'saved-bearer'})
+    values = iter(['', '', '', '', ''])
+    manager.configure('secure', read=lambda _: next(values), password=lambda _: '')
+    connection = manager.connection('secure')
+    assert connection.token == 'saved-bearer' and connection.tls['cert'] == pki['client_cert']
+
+
+def test_remove_rolls_back_credentials_when_registry_write_fails(tmp_path, monkeypatch):
+    import agent.providers as module
+    manager = ProviderManager(tmp_path/'providers.json')
+    values = iter(['https://example.test/v1', 'bearer'])
+    manager.configure('local', read=lambda _: next(values), password=lambda _: 'preserved-secret')
+    manager.use('gateway')
+    original = module.write_json
+    def failing(path, value):
+        if path == manager.path:
+            raise OSError('ошибка записи реестра')
+        return original(path, value)
+    monkeypatch.setattr(module, 'write_json', failing)
+    with pytest.raises(OSError):
+        manager.remove('local')
+    assert manager.get('local')['url'] == 'https://example.test/v1'
+    assert manager.credentials.get(manager.identity('local'))['token'] == 'preserved-secret'
+    assert 'local' in json.loads(manager.path.read_text())['providers']

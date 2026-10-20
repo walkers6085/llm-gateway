@@ -81,7 +81,7 @@ async def test_plain_answer(tmp_path):
     assert types(evs) == ["context", "text", "usage", "assistant", "done"]
     assert evs[-1]["reason"] == "stop"
     assert [m["role"] for m in store.messages(agent.session.id)] == ["user", "assistant"]
-    assert store.get(agent.session.id).title == "привет"
+    assert store.get(agent.session.id).title == "вторая строка"
     sent = seen[0]["messages"]
     assert sent[0]["role"] == "system" and str(tmp_path) in sent[0]["content"]
     assert {t["function"]["name"] for t in seen[0]["tools"]} == {"echo", "danger", "fail", "slow"}

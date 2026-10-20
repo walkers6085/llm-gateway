@@ -365,6 +365,7 @@ async function sendAgent(text) {
   let el = null, answer = "", prompt = 0, completion = 0;
   const started = performance.now();
   const handle = (ev) => {
+    if (ev.reset_response || ev.retry?.reset_response) { if (el) el.remove(); el = null; answer = ""; }
     switch (ev.type) {
       case "text":
         if (!el) { el = addMessage("assistant", ""); answer = ""; }

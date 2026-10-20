@@ -4,9 +4,10 @@ import hashlib
 import json
 from pathlib import Path
 
+from .data import location
 from .storage import file_lock, write_json
 
-DEFAULT_FILE = '~/.config/gwagent/trust.json'
+DEFAULT_FILE = None
 
 
 def fingerprint(path):
@@ -15,7 +16,7 @@ def fingerprint(path):
 
 class TrustStore:
     def __init__(self, path=None):
-        self.path = Path(path or DEFAULT_FILE).expanduser()
+        self.path = Path(path or DEFAULT_FILE or location('trust.json')).expanduser()
 
     def trusted(self, project, content=None):
         project = Path(project).resolve()

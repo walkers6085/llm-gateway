@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from agent.providers import ProviderManager
+from agent.data import location
 
 from .client import BenchClient
 from .runner import Context, build_config, compare, make_report, run_all, save_report
@@ -57,7 +58,7 @@ def main():
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--config")
     parser.add_argument("--set", action="append", default=[])
-    parser.add_argument("--output", default="data/bench")
+    parser.add_argument("--output", default=str(location("bench")))
     parser.add_argument("--compare", nargs="+", metavar="REPORT.json")
     parser.add_argument("--list", action="store_true")
     args = parser.parse_args()

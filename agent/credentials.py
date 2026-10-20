@@ -4,9 +4,10 @@ import json
 import os
 from pathlib import Path
 
+from .data import home, location
 from .storage import file_lock, write_json
 
-DEFAULT_FILE = '~/.config/gwagent/auth.json'
+DEFAULT_FILE = None
 _SECRETS = set()
 _PROTECTED = set()
 
@@ -30,12 +31,14 @@ def protect(path):
 
 def protected(path):
     path = Path(path).resolve()
-    return path in _PROTECTED or path == Path(DEFAULT_FILE).expanduser().resolve()
+    root = home()
+    internal = path == root or path.is_relative_to(root) and path.relative_to(root).parts[0] != 'workspaces'
+    return internal or path in _PROTECTED or path == Path(DEFAULT_FILE or location('auth.json')).expanduser().resolve()
 
 
 class Credentials:
     def __init__(self, path=None):
-        self.path = Path(path or DEFAULT_FILE).expanduser()
+        self.path = Path(path or DEFAULT_FILE or location('auth.json')).expanduser()
         protect(self.path)
 
     def read(self):

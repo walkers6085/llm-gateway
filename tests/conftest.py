@@ -60,6 +60,7 @@ def make(gateway_settings):
 
 @pytest.fixture(autouse=True)
 def isolated_user_config(tmp_path, monkeypatch):
+    monkeypatch.setenv('GWAGENT_HOME', str(tmp_path / 'agent-home'))
     from agent import trust, providers, settings, credentials
     monkeypatch.setattr(trust, 'DEFAULT_FILE', str(tmp_path / 'user/trust.json'))
     monkeypatch.setattr(providers, 'DEFAULT_FILE', str(tmp_path / 'user/providers.json'))

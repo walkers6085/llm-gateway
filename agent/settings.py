@@ -1,7 +1,7 @@
 """Настройки агента в JSON.
 
 CLI собирает настройки из слоёв (каждый следующий главнее):
-  DEFAULTS → ~/.config/gwagent/settings.json → <проект>/.gwagent/settings.json → --settings <файл>
+  DEFAULTS → $GWAGENT_HOME/settings.json → <проект>/.gwagent/settings.json → --settings <файл>
 Сервер читает config/agent.json: {"profiles": {"<имя>": {…те же ключи…}}}, каждый профиль
 накладывается на DEFAULTS. Словари сливаются рекурсивно, списки и скаляры заменяются целиком.
 Полная справка по ключам — docs/wiki/settings.md.
@@ -9,13 +9,13 @@ CLI собирает настройки из слоёв (каждый следу
 
 import copy
 import json
-import os
 from pathlib import Path
 
 from .schema import SchemaError, validate
+from .data import expand_home, location
 from .trust import TrustStore
 
-USER_SETTINGS = Path("~/.config/gwagent/settings.json")
+USER_SETTINGS = None
 PROJECT_SETTINGS = Path(".gwagent/settings.json")
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -56,7 +56,7 @@ DEFAULTS: dict = {
         "executable": "/bin/bash",
         "timeout": 120,
         "max_timeout": 600,
-        "env_passthrough": ["PATH", "HOME", "LANG", "LC_ALL", "TERM", "TZ", "USER"],
+        "env_passthrough": ["PATH", "HOME", "LANG", "LC_ALL", "TERM", "TZ", "USER", "GWAGENT_HOME"],
         "env": {},
     },
     "network": {
@@ -79,8 +79,8 @@ DEFAULTS: dict = {
     "mcp": {"timeout": 60, "servers": {}},
     "hooks": {},
     "gateway": {"url": "http://127.0.0.1:7700/v1", "token_env": "GW_TOKEN"},
-    "sessions": {"db": "~/.local/share/gwagent/sessions.db"},
-    "workspace_root": "data/workspaces",
+    "sessions": {"db": "$GWAGENT_HOME/sessions.db"},
+    "workspace_root": "$GWAGENT_HOME/workspaces",
 }
 
 HOOK_EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"]
@@ -181,10 +181,10 @@ def load(project_dir: str | Path | None = None, extra: str | Path | None = None,
          overrides: dict | None = None, user_file: Path | None = None) -> dict:
     """Настройки CLI: все слои, затем `overrides` (флаги командной строки)."""
     result = copy.deepcopy(DEFAULTS)
-    layers = [(user_file or USER_SETTINGS).expanduser()]
+    layers = [Path(user_file or USER_SETTINGS or location('settings.json')).expanduser()]
     if project_dir is not None:
         project_file = Path(project_dir) / PROJECT_SETTINGS
-        if project_file.is_file():
+        if project_file.is_file() and project_file.resolve() != layers[0].resolve():
             content = project_file.read_bytes()
             if not TrustStore().trusted(project_dir, content):
                 raise SettingsError("проектный конфиг не доверен или изменён; выполните gwagent trust в этой папке")
@@ -227,7 +227,7 @@ def load_profiles(path: str | Path) -> dict[str, dict]:
 
 def expand(path: str, base: str | Path | None = None) -> Path:
     """`~` и переменные окружения; относительный путь — от `base`."""
-    p = Path(os.path.expandvars(path)).expanduser()
+    p = Path(expand_home(path)).expanduser()
     if not p.is_absolute() and base is not None:
         p = Path(base) / p
     return p
@@ -248,7 +248,7 @@ def explain(project_dir=None, extra=None):
     from .credentials import redact
     result = load(project_dir, extra=extra)
     sources = {key: 'DEFAULTS' for key in flat_keys(result)}
-    paths = [USER_SETTINGS.expanduser()]
+    paths = [Path(USER_SETTINGS or location('settings.json')).expanduser()]
     if project_dir is not None: paths.append(Path(project_dir) / PROJECT_SETTINGS)
     if extra: paths.append(Path(extra).expanduser())
     for path in paths:

@@ -16,6 +16,7 @@ from collections import deque
 import httpx
 
 from .streaming import data_events
+from .data import expand_home, home
 from .tools.base import Tool, ToolContext, ToolError, ToolResult
 
 log = logging.getLogger("gwagent.mcp")
@@ -32,7 +33,7 @@ class MCPError(Exception):
 def subst(value):
     """`${VAR}` / `$VAR` из окружения в строках (рекурсивно в списках и словарях)."""
     if isinstance(value, str):
-        return os.path.expandvars(value)
+        return expand_home(value)
     if isinstance(value, list):
         return [subst(v) for v in value]
     if isinstance(value, dict):
@@ -59,7 +60,7 @@ class StdioTransport:
         return self.proc is not None and self.proc.returncode is None and not self.read_failed
 
     async def start(self) -> None:
-        env = {**os.environ, **subst(self.cfg.get("env", {}))}
+        env = {**os.environ, "GWAGENT_HOME": str(home()), **subst(self.cfg.get("env", {}))}
         try:
             self.proc = await asyncio.create_subprocess_exec(
                 subst(self.cfg["command"]), *subst(self.cfg.get("args", [])),

@@ -211,6 +211,10 @@ class Bridge:
 
     async def table_command(self, text):
         app = self.app
+        if text == '/data':
+            from .data import paths
+            self.emit({'type': 'table', 'title': 'Каталог данных', 'columns': ['Файл', 'Путь'], 'rows': [[name, path] for name, path in paths().items()]})
+            return True
         if text == '/revert':
             messages = app.revert_messages()
             self.revert_revision = app.store.revision(app.session.id)

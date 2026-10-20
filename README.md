@@ -103,7 +103,7 @@ gwagent trust                          # если в проекте есть .gw
 gwagent
 ```
 
-Подключения — ~/.config/gwagent/providers.json, секреты — отдельный auth.json (0600),
+Подключения — ~/.gwagent/providers.json, секреты — отдельный auth.json (0600),
 сертификаты остаются файлами. Добавление записи не меняет активный провайдер; нужен use.
 В агенте доступны /connect, /compact, /export и /delete. Подробнее:
 [провайдеры](docs/wiki/providers.md), [CLI](docs/wiki/cli.md), [результат аудита](docs/wiki/technical-debt.md).
@@ -124,3 +124,5 @@ gwagent
 карточками инструментов и скрытым вводом ключей. После установки `gwagent` выбирает
 TUI в интерактивном терминале; `--plain` сохраняет обычный CLI, `-p ... --json` — скриптовый режим.
 [Управление и ограничения](docs/wiki/tui.md).
+
+Единый каталог агента — `~/.gwagent`; другой путь: `GWAGENT_HOME=/srv/gwagent ./gwagent`. Расположение файлов: `./gwagent data`; перенос старых настроек и истории: `./gwagent data migrate` (после завершения других CLI, без перезаписи существующих файлов). [Подробнее](docs/wiki/data.md).

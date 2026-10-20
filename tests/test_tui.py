@@ -16,6 +16,7 @@ from tests.fakes import SCRIPT, SEEN, tool_call
 async def launch(gw, tmp_path, env_overrides=None):
     cfg, ws, _ = gw
     env = dict(os.environ, HOME=str(tmp_path / 'home'), XDG_CONFIG_HOME=str(tmp_path / 'config'))
+    env['GWAGENT_HOME'] = str(tmp_path / 'agent-home')
     env.update(env_overrides or {})
     return await asyncio.create_subprocess_exec(sys.executable, '-m', 'agent.tui_backend', '--settings', str(cfg),
         '--cwd', str(ws), env=env, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
@@ -167,7 +168,7 @@ async def test_bridge_connect_stores_secret_without_echo(gw,tmp_path):
         send(proc,type='answer',id=event['id'],value=secret)
         _,events=await receive(proc,'idle')
         assert secret not in json.dumps(events)
-        auth=tmp_path/'home/.config/gwagent/auth.json'
+        auth=tmp_path/'agent-home/auth.json'
         assert secret in auth.read_text()
         assert auth.stat().st_mode & 0o777 == 0o600
     finally:
@@ -312,7 +313,7 @@ async def test_models_from_all_providers_switch_together_and_preserve_old_histor
     from agent.store import SessionStore
     cfg,_,db=gw
     url=json.loads(cfg.read_text())['gateway']['url']
-    home=tmp_path/'home/.config/gwagent';home.mkdir(parents=True)
+    home=tmp_path/'agent-home';home.mkdir(parents=True)
     providers={name:{'url':url,'token_env':'GW_TOKEN','model':model,'models':[]}
                for name,model in [('first','alpha'),('second','beta')]}
     providers['broken']={'url':url,'token_env':'UNSET_CATALOG_KEY_9356','model':'cached','models':['cached']}
@@ -630,7 +631,7 @@ async def test_provider_wizard_edit_manage_and_cancel_are_interactive(gw, tmp_pa
         assert 'подключение glm' in request['prompt']
         send(proc, type='answer', id=request['id'], value='y')
         await receive(proc, 'idle')
-        registry = tmp_path / 'home/.config/gwagent/providers.json'
+        registry = tmp_path / 'agent-home/providers.json'
         assert 'glm' not in json.loads(registry.read_text())['providers']
         send(proc, type='submit', text='/provider add temporary')
         request, _ = await receive(proc, 'input_request')

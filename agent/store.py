@@ -1,7 +1,7 @@
 """Сессии агента в SQLite.
 
 Сервер держит их в той же базе, что и токены (`data/gateway.db`), CLI — в
-`~/.local/share/gwagent/sessions.db`. Сообщения хранятся в формате OpenAI
+`$GWAGENT_HOME/sessions.db`. Сообщения хранятся в формате OpenAI
 (`{"role": …, "content": …, "tool_calls": …, "tool_call_id": …}`) и отдаются модели как есть.
 Схема и миграции — docs/wiki/sessions.md.
 """

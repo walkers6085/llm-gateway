@@ -8,6 +8,8 @@ import subprocess
 import sys
 import sysconfig
 
+from .data import home, location
+
 
 def assets():
     for path in (Path(__file__).resolve().parent.parent / 'tui',
@@ -26,11 +28,11 @@ def cache_path(source):
     for path in sorted([source / 'package.json', source / 'bun.lock', *source.glob('src/*.ts')]):
         digest.update(path.name.encode())
         digest.update(path.read_bytes())
-    return Path(os.environ.get('XDG_CACHE_HOME', Path.home() / '.cache')) / 'gwagent/tui' / digest.hexdigest()[:20]
+    return location('cache/tui') / digest.hexdigest()[:20]
 
 
 def installed(source):
-    for path in (source, cache_path(source)):
+    for path in (cache_path(source),):
         if (path / 'node_modules/@opentui/core/package.json').is_file():
             return path
     return None
@@ -41,6 +43,7 @@ def install():
     bun = bun_binary()
     if not bun:
         raise ValueError('установите Bun >= 1.3.8: https://bun.sh; затем gwagent tui install')
+    home().mkdir(parents=True, exist_ok=True, mode=0o700)
     target = cache_path(source)
     target.mkdir(parents=True, exist_ok=True)
     shutil.copytree(source / 'src', target / 'src', dirs_exist_ok=True)
@@ -59,7 +62,7 @@ def dispatch(argv):
             if argv[1:] != ['install']:
                 raise ValueError('использование: gwagent tui install')
             return install()
-        if argv and argv[0] in ('trust', 'doctor', 'config', 'connect'):
+        if argv and argv[0] in ('trust', 'doctor', 'config', 'connect', 'data'):
             return None
         from .cli import parse_args
         args = parse_args(argv)

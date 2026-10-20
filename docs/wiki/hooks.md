@@ -10,7 +10,7 @@
 
 ```json
 "hooks": {
-  "PreToolUse":  [{"matcher": "shell", "command": "~/.config/gwagent/hooks/check_shell.py", "timeout": 10}],
+  "PreToolUse":  [{"matcher": "shell", "command": "~/.gwagent/hooks/check_shell.py", "timeout": 10}],
   "PostToolUse": [{"matcher": "write_file|edit_file", "command": "ruff format \"$(jq -r .tool_input.path)\""}],
   "SessionStart": [{"command": "cat .gwagent/context.md | jq -Rs '{additional_context: .}'"}]
 }

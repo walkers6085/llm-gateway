@@ -46,9 +46,9 @@ gwbench --provider corp --suites tools,structured,chain --quick
 
 ## Хранение
 
-- `~/.config/gwagent/providers.json`: URL, стабильный `id`, модель, `token_env`, настройки TLS,
+- `~/.gwagent/providers.json`: URL, стабильный `id`, модель, `token_env`, настройки TLS,
   справочный список `models`, необязательные теги `tags`, флаг `enabled` и `options` возможностей API.
-- `~/.config/gwagent/auth.json`: секреты по стабильному ID подключения; `agent/credentials.py`.
+- `~/.gwagent/auth.json`: секреты по стабильному ID подключения; `agent/credentials.py`.
 - При нестандартном `--file FILE` auth.json находится рядом с ним. Потребители принимают
   `--providers-file FILE`.
 - Запись атомарная с fsync, блокировкой и правами 0600. Новые каталоги создаются с 0700;
@@ -190,3 +190,5 @@ chat/completions. CLI: `add ... --tag MODEL=TAG1,TAG2` и `update NAME --tag MOD
 или отключить: сначала выберите другой. Редактирование в чате создаёт новую сессию
 для выбранного подключения, история старого адреса не передаётся новому серверу.
 Старый явный синтаксис `/provider add|set NAME URL [MODEL]` сохранён для работы с реестром.
+
+Все стандартные пути провайдеров и auth.json находятся в GWAGENT_HOME (по умолчанию ~/.gwagent); --providers-file/--file остаются явным исключением. Для переноса со старого ~/.config/gwagent используйте `gwagent data migrate`; относительные TLS-пути при переносе сохраняют назначение через преобразование в абсолютные. [Единое хранилище](data.md).

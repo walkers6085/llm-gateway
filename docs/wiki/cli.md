@@ -11,8 +11,8 @@ MCP-серверы и хуки — **на машине, где запущен gw
 
 ```bash
 export GW_TOKEN=gw-…                                   # токен от ./gwtoken create
-mkdir -p ~/.config/gwagent
-echo '{"gateway": {"url": "http://192.168.0.159:7700/v1"}}' > ~/.config/gwagent/settings.json
+mkdir -p ~/.gwagent
+echo '{"gateway": {"url": "http://192.168.0.159:7700/v1"}}' > ~/.gwagent/settings.json
 cd ~/projects/demo && /home/deb/llm-gateway/gwagent    # или ln -s …/gwagent ~/.local/bin/
 ```
 
@@ -79,8 +79,8 @@ Ctrl+C на вопросе — отказ и отмена запроса. В р�
 
 ## Где что лежит
 
-- настройки: `~/.config/gwagent/settings.json`, `<папка>/.gwagent/settings.json` ([settings.md](settings.md));
-- сессии: `~/.local/share/gwagent/sessions.db` (`sessions.db`), владелец `local` ([sessions.md](sessions.md)).
+- настройки: `~/.gwagent/settings.json`, `<папка>/.gwagent/settings.json` ([settings.md](settings.md));
+- сессии: `~/.gwagent/sessions.db` (`sessions.db`), владелец `local` ([sessions.md](sessions.md)).
 
 ## Примеры
 
@@ -280,3 +280,13 @@ build выполняет изменения с обычными правами. 
 старыми подключениями; удаление с подтверждением, для текущего/default сначала смените провайдера.
 Из оболочки тот же мастер запускается через `gwagent connect NAME` или `gwproviders connect NAME`.
 Подробнее: [провайдеры](providers.md#пошаговый-мастер-и-управление).
+
+
+### Единый каталог данных
+
+`GWAGENT_HOME=/srv/gwagent ./gwagent` использует один каталог для настроек, провайдеров,
+секретов, доверия проектам, сессий и кэша TUI. По умолчанию — `~/.gwagent`.
+`gwagent data` или `gwagent data show` печатает расположение файлов без их содержимого; в чате та же информация доступна через `/data`.
+`gwagent data migrate` явно копирует старые файлы из ~/.config и ~/.local/share;
+перед переносом закройте работающие CLI. Существующие файлы не перезаписываются.
+Подробности и ограничения: [единое хранилище](data.md).

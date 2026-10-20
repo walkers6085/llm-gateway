@@ -20,7 +20,7 @@ gwagent --tui --cwd ~/projects/demo
 ```
 
 Установка копирует исходники интерфейса из checkout/установленного wheel в
-`${XDG_CACHE_HOME:-~/.cache}/gwagent/tui/<hash>` и запускает
+`$GWAGENT_HOME/cache/tui/<hash>` и запускает
 `bun install --frozen-lockfile --ignore-scripts`. Системные каталоги пакета не изменяются.
 Хеш включает исходники и lockfile; после обновления пакета повторите `tui install`.
 При запуске зависимостей из сети не устанавливается.
@@ -437,3 +437,7 @@ Esc/Ctrl+C отменяют мастер без частично сохранё�
 текущего/default запрещены до выбора другого подключения.
 Реализация: `agent/providers.py` (единый мастер), `agent/cli.py` (команды),
 `agent/tui_backend.py` (диалоги и действия), `tui/src/menus.ts` (общие списки и команды).
+
+Каталог кэша TUI теперь входит в [единое хранилище](data.md). Launcher использует только установленный там кэш; node_modules в checkout предназначен для разработки. После изменения GWAGENT_HOME повторите `gwagent tui install`; XDG_CACHE_HOME не меняет расположение этого кэша.
+
+`/data` открывает таблицу путей общего хранилища без содержимого ключей и конфигураций (agent/tui_backend.py).

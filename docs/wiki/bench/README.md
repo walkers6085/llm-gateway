@@ -7,11 +7,11 @@
 GW_TOKEN=gw-… venv/bin/python -m bench --model MODEL --quick
 venv/bin/python -m bench --list
 venv/bin/python -m bench --model MODEL --suites needle,reasoning --set needle.lengths='[2048,8192]'
-venv/bin/python -m bench --compare data/bench/first.json data/bench/second.json
+venv/bin/python -m bench --compare ~/.gwagent/bench/first.json ~/.gwagent/bench/second.json
 ```
 
 `--url` по умолчанию `http://127.0.0.1:7700/v1`; авторизация из `GW_TOKEN`.
-`--output` — каталог JSON и Markdown (по умолчанию `data/bench`, исключён из git).
+`--output` — каталог JSON и Markdown (по умолчанию `$GWAGENT_HOME/bench` в едином каталоге агента).
 Запуски расходуют токены выбранного сервера. Реальные замеры нужно запускать отдельно,
 когда шлюз настроен. Сервис CLI не включает.
 

@@ -32,6 +32,7 @@ from .store import Session, SessionStore, task_title
 
 OWNER = "local"
 COMMANDS = [
+    {'command': '/data', 'description': 'Показать каталог настроек и данных', 'arguments': 'none'},
     {'command': '/mode', 'description': 'Выбрать агента build или plan', 'arguments': 'optional', 'usage': '/mode [build|plan]'},
     {'command': '/revert', 'description': 'Изменить прошлое сообщение или откатить файлы', 'arguments': 'none'},
     {'command': '/agent', 'description': 'Поручить задачу сабагенту', 'arguments': 'required', 'usage': '/agent задача'},
@@ -58,6 +59,7 @@ COMMANDS = [
     {'command': '/exit', 'description': 'Завершить работу', 'arguments': 'none'},
 ]
 HELP = """Команды:
+  /data              показать единый каталог данных
   /mode [build|plan]  показать или сменить активного агента
   /revert            выбрать прошлое сообщение и режим отката
   /agent задача      запустить отдельного сабагента
@@ -537,7 +539,10 @@ class App:
         arg = arg.strip()
         if cmd in ("/exit", "/quit", "/q"):
             return "exit"
-        if cmd == '/connect':
+        if cmd == '/data':
+            from .data import home, paths
+            con.line(json.dumps({'home': str(home()), 'paths': paths()}, ensure_ascii=False, indent=2))
+        elif cmd == '/connect':
             try:
                 name = arg or self.provider or self.providers.config['default']
                 self.configure_provider(name, read=self.read)
@@ -754,7 +759,7 @@ def parse_args(argv):
 async def amain(argv=None, read=input, out=None, err=None) -> int:
     if argv is None:
         argv = sys.argv[1:]
-    if argv and argv[0] in ('trust', 'doctor', 'config', 'connect'):
+    if argv and argv[0] in ('trust', 'doctor', 'config', 'connect', 'data'):
         return await utility(argv, read, out, err)
     args = parse_args(argv)
     console = Console(out, err, as_json=args.json)
@@ -816,6 +821,15 @@ async def utility(argv, read=input, out=None, err=None):
     workspace = Path(args.cwd).expanduser().resolve()
     console = Console(out, err)
     try:
+        if argv[0] == 'data':
+            from .data import home, paths, migrate
+            if args.action == 'migrate':
+                copied = migrate()
+                console.line('Перенесено: ' + (', '.join(copied) or 'старые файлы не найдены'))
+            elif args.action != 'show':
+                raise ValueError('использование: gwagent data [show|migrate]')
+            console.line(json.dumps({'home': str(home()), 'paths': paths()}, ensure_ascii=False, indent=2))
+            return 0
         if argv[0] == 'connect':
             settings = load(workspace, extra=args.settings)
             manager = ProviderManager(args.providers_file)

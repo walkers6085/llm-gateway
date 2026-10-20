@@ -20,9 +20,10 @@ import httpx
 
 from .credentials import Credentials, protect, redact, register
 from .schema import validate
+from .data import location
 from .storage import digest, file_lock, write_json
 
-DEFAULT_FILE = '~/.config/gwagent/providers.json'
+DEFAULT_FILE = None
 DEFAULT_CONFIG = {'default': 'gateway', 'selected': False, 'providers': {
     'gateway': {'url': 'http://127.0.0.1:7700/v1', 'token_env': 'GW_TOKEN', 'model': '', 'models': []},
     'glm': {'url': 'https://api.z.ai/api/paas/v4', 'token_env': 'ZAI_API_KEY',
@@ -74,7 +75,7 @@ class Connection:
 
 class ProviderManager:
     def __init__(self, path=None, auth_file=None):
-        self.path = Path(path or DEFAULT_FILE).expanduser()
+        self.path = Path(path or DEFAULT_FILE or location('providers.json')).expanduser()
         self.credentials = Credentials(auth_file or self.path.with_name('auth.json'))
         self._revision = digest(self.path)
         self.config = json.loads(self.path.read_text()) if self.path.exists() else copy.deepcopy(DEFAULT_CONFIG)
@@ -343,7 +344,7 @@ def tags_line(provider):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Менеджер OpenAI-совместимых провайдеров')
-    parser.add_argument('--file', default=DEFAULT_FILE)
+    parser.add_argument('--file', default=None, help='реестр провайдеров; по умолчанию GWAGENT_HOME/providers.json')
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('list')
     for command in ('add', 'update'):

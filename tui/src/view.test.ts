@@ -382,3 +382,24 @@ test('копирование: выделение редактора и выво�
     await setup.flush();expect(copied.length).toBe(count);
   }finally{await view.dispose();await setup.dispose();}
 });
+
+
+test('меню провайдеров открывает мастер добавления и редактирования',async()=>{
+  const setup=await createTestRenderer({width:115,height:40});const sent:Command[]=[];
+  const view=new AgentView(setup.renderer,c=>sent.push(c),()=>{});
+  try{
+    view.accept({type:'ready'});
+    view.accept({type:'table',title:'/provider',selection:{kind:'provider',provider:'local',session_id:'s',choices:[
+      {provider:'local',label:'local',enabled:true},
+      {label:'Добавить провайдера',command:'/provider add',group:'Управление'},
+      {label:'Изменить local',command:'/provider edit local',group:'Управление'},
+    ]}});
+    await setup.mockInput.typeText('Добавить');setup.mockInput.pressEnter();
+    expect(sent.at(-1)).toEqual({type:'submit',text:'/provider add'});
+    view.accept({type:'idle'});
+    view.accept({type:'table',title:'/provider',selection:{kind:'provider',provider:'local',choices:[
+      {label:'Изменить local',command:'/provider edit local',group:'Управление'},
+    ]}});
+    setup.mockInput.pressEnter();expect(sent.at(-1)).toEqual({type:'submit',text:'/provider edit local'});
+  }finally{view.dispose();await setup.dispose();}
+});

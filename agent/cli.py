@@ -39,7 +39,11 @@ COMMANDS = [
     {'command': '/help', 'description': 'Справка по командам', 'arguments': 'none'},
     {'command': '/connect', 'description': 'Настроить провайдера и сохранить ключ', 'arguments': 'optional', 'usage': '/connect [имя]'},
     {'command': '/provider', 'description': 'Показать или выбрать провайдера', 'arguments': 'optional', 'usage': '/provider [имя]'},
-    {'command': '/provider add', 'description': 'Добавить подключение', 'arguments': 'required', 'usage': '/provider add NAME URL [MODEL]'},
+    {'command': '/provider add', 'description': 'Добавить подключение', 'arguments': 'optional', 'usage': '/provider add [NAME]'},
+    {'command': '/provider edit', 'description': 'Изменить URL и способ подключения', 'arguments': 'required', 'usage': '/provider edit NAME'},
+    {'command': '/provider enable', 'description': 'Включить подключение', 'arguments': 'required', 'usage': '/provider enable NAME'},
+    {'command': '/provider disable', 'description': 'Отключить подключение', 'arguments': 'required', 'usage': '/provider disable NAME'},
+    {'command': '/provider remove', 'description': 'Удалить подключение и сохранённые ключи', 'arguments': 'required', 'usage': '/provider remove NAME'},
     {'command': '/provider set', 'description': 'Изменить URL и модель подключения', 'arguments': 'required', 'usage': '/provider set NAME URL [MODEL]'},
     {'command': '/model', 'description': 'Показать или выбрать модель', 'arguments': 'optional', 'usage': '/model [имя]'},
     {'command': '/models', 'description': 'Модели всех провайдеров и переключение', 'arguments': 'none'},
@@ -59,7 +63,10 @@ HELP = """Команды:
   /agent задача      запустить отдельного сабагента
   /logs [request_id]  журнал запросов, моделей и инструментов
   /connect [имя]     настроить подключение и сохранить ключ/пароль
-  /provider add|set NAME URL [MODEL]  добавить/изменить подключение без модели
+  /provider add [NAME]  пошагово добавить подключение
+  /provider edit NAME   изменить URL, ключ или сертификат
+  /provider enable|disable|remove NAME  управление подключениями
+  /provider set NAME URL [MODEL]  изменить адрес и модель
   /compact           сократить контекст, сохранив историю
   /export FILE       экспорт текущей сессии
   /delete ID         удалить другую сессию
@@ -242,14 +249,23 @@ class App:
         self.console.line(f"Модель: {model}; провайдер: {provider or 'gateway (настройки)'}")
 
     def configure_provider(self, name, read=input, password=getpass.getpass):
-        if name not in self.providers.config['providers']:
-            url = read('URL API (с /v1): ').strip()
-            model = read('Модель (Enter — выбрать позже): ').strip()
-            self.providers.add(name, url, model=model)
-        elif name == 'gateway' and not self.providers.path.exists():
-            self.providers.update(name, url=self.settings['gateway']['url'], model=self.base_model)
-        self.providers.connect(name, read=read, password=password)
-        self.providers.use(name)
+        return self.providers.configure(name, read=read, password=password,
+            default_url=self.settings['gateway']['url'] if name == 'gateway' and not self.providers.path.exists() else None,
+            default_model=self.base_model if name == 'gateway' else '')
+
+    def manage_provider(self, action, name, read=input):
+        if action != 'enable' and (name == self.provider or name == self.providers.config['default']):
+            raise ValueError('Сначала выберите другой провайдер; текущее подключение нельзя отключить или удалить')
+        self.providers.get(name)
+        if action == 'remove':
+            if read(f'Удалить подключение {name} и его сохранённые ключи? [y/N]: ').strip().lower() not in ('y', 'да'):
+                return
+            self.providers.remove(name)
+        elif action in ('enable', 'disable'):
+            self.providers.update(name, enabled=action == 'enable')
+        else:
+            raise ValueError('Доступны enable, disable, remove')
+        self.console.line(f'Подключение {name}: ' + {'remove': 'удалено', 'enable': 'включено', 'disable': 'отключено'}[action])
 
     async def start(self) -> None:
         if self.settings["mcp"]["servers"]:
@@ -626,6 +642,27 @@ class App:
                 con.line(f"Текущий провайдер: {self.provider or '(gateway из настроек)'}")
                 for name, provider in self.providers.config["providers"].items():
                     con.line(f"  {name}: {provider['url']} · {provider['model'] or '(без модели)'}")
+            elif arg == 'add' or (arg.startswith(('add ', 'edit ')) and len(arg.split()) == 2):
+                fields = arg.split()
+                name = fields[1] if len(fields) == 2 else None
+                try:
+                    if fields[0] == 'edit':
+                        self.providers.get(name)
+                    elif name and name in self.providers.config['providers']:
+                        raise ValueError('Провайдер уже существует; используйте /provider edit ' + name)
+                    name = self.configure_provider(name, read=self.read)
+                    await self.switch_provider(name)
+                    con.line('Подключение сохранено и выбрано')
+                except (ValueError, OSError) as exc:
+                    con.line(redact(str(exc)), err=True)
+            elif arg.startswith(('enable ', 'disable ', 'remove ')):
+                try:
+                    action, name = arg.split()
+                    self.manage_provider(action, name, read=self.read)
+                except (EOFError, KeyboardInterrupt):
+                    con.line('Изменение подключения отменено', err=True)
+                except (ValueError, OSError) as exc:
+                    con.line(redact(str(exc)), err=True)
             elif arg.startswith(('add ', 'set ')):
                 fields = arg.split()
                 try:
@@ -783,12 +820,9 @@ async def utility(argv, read=input, out=None, err=None):
             settings = load(workspace, extra=args.settings)
             manager = ProviderManager(args.providers_file)
             name = args.provider or args.action or manager.config['default']
-            if name not in manager.config['providers']:
-                manager.add(name, read('URL API (с /v1): ').strip(), model=read('Модель (Enter — выбрать позже): ').strip())
-            elif name == 'gateway' and not manager.path.exists():
-                manager.update(name, url=settings['gateway']['url'], model=settings['model'])
-            manager.connect(name, read=read)
-            manager.use(name)
+            manager.configure(name, read=read,
+                default_url=settings['gateway']['url'] if name == 'gateway' and not manager.path.exists() else None,
+                default_model=settings['model'] if name == 'gateway' else '')
             console.line('Учётные данные сохранены; запуск чата: gwagent')
             return 0
         if argv[0] == 'trust':

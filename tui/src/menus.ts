@@ -19,6 +19,7 @@ export function createPicker(event:any,draft:string):PickerState{
   const selection=event.selection,kind=selection.kind as MenuKind;
   const entries=Array.isArray(selection.choices)?selection.choices:undefined;
   const choices:PickerChoice[]=entries?entries.map((item:any):PickerChoice=>{
+    if(kind==='provider'&&item.command)return {key:item.command,command:item.command,name:item.label,label:item.label+' '+(item.description||''),description:item.description,group:item.group||'Управление'};
     if(kind==='model'){
       const tags=(item.tags||[]).map(String);
       return {key:JSON.stringify([item.provider,item.model]),provider:item.provider,model:item.model,name:item.model,group:item.provider_name,

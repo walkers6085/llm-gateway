@@ -160,13 +160,15 @@ class Bridge:
             event.update({key: value for key, value in (trace or {}).items() if key in ('request_id', 'span_id')})
         if choices is not None:
             event['choices'] = choices
-        elif not question_id and not secret and '[bearer/basic/none]' in prompt:
+        elif not question_id and not secret and ('[bearer/basic/none]' in prompt or '[bearer/basic/none/mtls]' in prompt):
             event['choices'] = [{'value': 'bearer', 'label': 'Bearer', 'description': 'API-ключ'},
                                 {'value': 'basic', 'label': 'Basic', 'description': 'Логин и пароль'},
                                 {'value': 'none', 'label': 'Без авторизации'}]
+            if '[bearer/basic/none/mtls]' in prompt:
+                event['choices'].insert(1, {'value': 'mtls', 'label': 'Клиентский сертификат', 'description': 'mTLS: сертификат PEM и приватный ключ'})
         elif not question_id and not secret and '[y/N]' in prompt:
             event['choices'] = [{'value': 'n', 'label': 'Отмена'},
-                                {'value': 'y', 'label': 'Удалить историю', 'danger': True}]
+                                {'value': 'y', 'label': 'Удалить подключение и ключи' if 'подключение' in prompt else 'Удалить историю', 'danger': True}]
         self.emit(event)
         try:
             return await future
@@ -255,6 +257,14 @@ class Bridge:
             rows = [[c['label'], c['model'], 'включён' if c['enabled'] else 'отключён'] for c in choices]
             self.offered_providers = {c['provider'] for c in choices if c['enabled']}
             self.selection_sessions['provider'] = app.session.id
+            choices.append({'label': 'Добавить провайдера', 'command': '/provider add', 'description': 'Имя → URL → ключ или сертификат', 'group': 'Управление'})
+            for name, provider in app.providers.config['providers'].items():
+                choices.append({'label': f'Изменить {name}', 'command': f'/provider edit {name}', 'description': provider['url'], 'group': 'Управление'})
+                action = 'disable' if provider.get('enabled', True) else 'enable'
+                if action == 'enable' or name not in (app.provider, app.providers.config['default']):
+                    choices.append({'label': ('Отключить ' if action == 'disable' else 'Включить ') + name, 'command': f'/provider {action} {name}', 'group': 'Управление'})
+                if name not in (app.provider, app.providers.config['default']):
+                    choices.append({'label': f'Удалить {name}', 'command': f'/provider remove {name}', 'group': 'Управление'})
         elif text == '/tools':
             columns = ['Инструмент', 'Разрешение', 'Описание']
             tools = list(make_registry(app.settings, app.mcp, agent_mode=app.session.agent_mode).tools.values())
@@ -387,16 +397,30 @@ class Bridge:
                 cmd, _, arg = text.partition(' ')
                 if await self.table_command(text):
                     return
-                if cmd == '/connect':
-                    name = arg.strip() or self.app.provider or self.app.providers.config['default']
+                provider_fields = arg.split() if cmd == '/provider' else []
+                wizard = cmd == '/connect' or cmd == '/provider' and (arg == 'add' or len(provider_fields) == 2 and provider_fields[0] in ('add', 'edit'))
+                if wizard:
+                    if cmd == '/connect':
+                        name = arg.strip() or self.app.provider or self.app.providers.config['default']
+                    else:
+                        name = provider_fields[1] if len(provider_fields) == 2 else None
+                        if provider_fields[0] == 'edit':
+                            self.app.providers.get(name)
+                        elif name and name in self.app.providers.config['providers']:
+                            raise ValueError('Провайдер уже существует; используйте /provider edit ' + name)
                     def read(prompt):
                         return asyncio.run_coroutine_threadsafe(self.dialog(prompt), self.loop).result()
                     def password(prompt):
                         return asyncio.run_coroutine_threadsafe(self.dialog(prompt, secret=True), self.loop).result()
-                    await asyncio.to_thread(self.app.configure_provider, name, read=read, password=password)
+                    name = await asyncio.to_thread(self.app.configure_provider, name, read=read, password=password)
                     await self.app.switch_provider(name)
                     self.snapshot(history=True)
                     self.emit({'type': 'notice', 'message': 'Учётные данные сохранены; подключение выбрано'})
+                elif cmd == '/provider' and len(provider_fields) == 2 and provider_fields[0] in ('enable', 'disable', 'remove'):
+                    def read(prompt):
+                        return asyncio.run_coroutine_threadsafe(self.dialog(prompt), self.loop).result()
+                    await asyncio.to_thread(self.app.manage_provider, provider_fields[0], provider_fields[1], read=read)
+                    self.snapshot()
                 elif cmd == '/delete':
                     session = self.app.store.find(arg.strip(), owner=OWNER) if arg.strip() else None
                     if session is None or session.id == self.app.session.id:

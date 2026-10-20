@@ -137,3 +137,76 @@ def test_connect_interrupted_input_preserves_credentials(tmp_path, stage, error)
         manager.connect('gateway', read=interrupted if stage == 'kind' else lambda _: 'bearer', password=interrupted)
     assert manager.credentials.path.read_bytes() == before
     assert manager.connection('gateway').token == 'old-test-token'
+
+
+def test_wizard_add_edit_and_cancel_preserve_both_files(tmp_path):
+    manager = ProviderManager(tmp_path / 'providers.json')
+    answers = iter(['local', 'https://example.test/v1', 'bearer'])
+    assert manager.configure(read=lambda _: next(answers), password=lambda _: 'wizard-secret') == 'local'
+    identity = manager.identity('local')
+    assert manager.connection().token == 'wizard-secret'
+    assert 'wizard-secret' not in manager.path.read_text()
+    before = manager.path.read_bytes(), manager.credentials.path.read_bytes()
+    def cancel(_):
+        raise EOFError
+    answers = iter(['https://changed.test/v1', 'bearer'])
+    with pytest.raises(ValueError, match='отменена'):
+        manager.configure('local', read=lambda _: next(answers), password=cancel)
+    assert before == (manager.path.read_bytes(), manager.credentials.path.read_bytes())
+    answers = iter(['', 'bearer'])
+    manager.configure('local', read=lambda _: next(answers), password=lambda _: '')
+    assert manager.identity('local') == identity and manager.connection().token == 'wizard-secret'
+    answers = iter(['https://changed.test/v1', 'bearer'])
+    with pytest.raises(ValueError, match='Пустой ключ'):
+        manager.configure('local', read=lambda _: next(answers), password=lambda _: '')
+    assert before == (manager.path.read_bytes(), manager.credentials.path.read_bytes())
+
+
+def test_wizard_cancel_new_and_invalid_url_do_not_save(tmp_path):
+    manager = ProviderManager(tmp_path / 'providers.json')
+    def cancel(_):
+        raise EOFError
+    answers = iter(['https://example.test/v1', 'bearer'])
+    with pytest.raises(ValueError, match='отменена'):
+        manager.configure('new', read=lambda _: next(answers), password=cancel)
+    assert 'new' not in manager.config['providers'] and not manager.path.exists()
+    assert not manager.credentials.path.exists()
+    with pytest.raises(ValueError, match='HTTP'):
+        manager.configure('new', read=lambda _: 'ftp://invalid', password=cancel)
+    assert not manager.path.exists()
+
+
+async def test_wizard_mtls_real_upstream_and_switch_to_token(tmp_path, pki, upstream_url):
+    manager = ProviderManager(tmp_path / 'providers.json')
+    answers = iter([upstream_url, 'mtls', pki['client_cert'], pki['client_key'], pki['ca']])
+    manager.configure('secure', read=lambda _: next(answers), password=lambda _: '')
+    connection = manager.connection()
+    assert connection.token == '' and connection.tls['cert'] == pki['client_cert']
+    assert await manager.models()  # Настоящее соединение с CERT_REQUIRED.
+    answers = iter(['', 'bearer'])
+    manager.configure('secure', read=lambda _: next(answers), password=lambda _: 'replacement-token')
+    assert not manager.connection().tls and manager.connection().token == 'replacement-token'
+
+
+def test_wizard_invalid_certificate_and_failed_save_keep_old_credentials(tmp_path, monkeypatch):
+    import agent.providers as module
+    manager = ProviderManager(tmp_path / 'providers.json')
+    answers = iter(['https://example.test/v1', 'bearer'])
+    manager.configure('local', read=lambda _: next(answers), password=lambda _: 'original-token')
+    before = manager.path.read_bytes(), manager.credentials.path.read_bytes()
+    bad = tmp_path / 'bad.pem';bad.write_text('не сертификат')
+    answers = iter(['', 'mtls', str(bad), '', ''])
+    with pytest.raises(ValueError, match='сертификат'):
+        manager.configure('local', read=lambda _: next(answers), password=lambda _: '')
+    assert before == (manager.path.read_bytes(), manager.credentials.path.read_bytes())
+    original = module.write_json
+    def fail(path, value):
+        if path == manager.path:
+            raise OSError('проверка сбоя записи')
+        return original(path, value)
+    monkeypatch.setattr(module, 'write_json', fail)
+    answers = iter(['https://changed.test/v1', 'bearer'])
+    with pytest.raises(OSError):
+        manager.configure('local', read=lambda _: next(answers), password=lambda _: 'new-token')
+    assert before == (manager.path.read_bytes(), manager.credentials.path.read_bytes())
+    assert manager.connection().token == 'original-token'

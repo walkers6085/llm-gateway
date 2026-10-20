@@ -91,7 +91,10 @@ async def test_bridge_connect_dialog_cancellation_does_not_hang(gw,tmp_path):
         send(proc,type='submit',text='/connect')
         event,_=await receive(proc,'input_request')
         assert event['prompt']
-        assert [choice['value'] for choice in event.get('choices',[])]==['bearer','basic','none']
+        assert 'URL API' in event['prompt']
+        send(proc,type='answer',id=event['id'],value='')
+        event,_=await receive(proc,'input_request')
+        assert [choice['value'] for choice in event.get('choices',[])]==['bearer','mtls','basic','none']
         send(proc,type='cancel')
         await receive(proc,'idle')
         send(proc,type='submit',text='/tools')
@@ -155,7 +158,9 @@ async def test_bridge_connect_stores_secret_without_echo(gw,tmp_path):
         await receive(proc,'ready')
         send(proc,type='submit',text='/connect')
         event,_=await receive(proc,'input_request')
-        assert not event['secret']
+        assert not event['secret'] and 'URL API' in event['prompt']
+        send(proc,type='answer',id=event['id'],value='')
+        event,_=await receive(proc,'input_request')
         send(proc,type='answer',id=event['id'],value='bearer')
         event,_=await receive(proc,'input_request')
         assert event['secret']
@@ -195,7 +200,7 @@ async def test_offline_start_commands_and_provider_setup_then_chat(gw,tmp_path):
         assert any(e['type']=='table' for e in events)
         # Новый провайдер настраивается внутри того же UI, даже без модели/ключа шлюза.
         send(proc,type='submit',text='/connect local')
-        for value in (url,'','bearer',secret):
+        for value in (url,'bearer',secret):
             request,_=await receive(proc,'input_request')
             assert request['secret']==(value==secret)
             send(proc,type='answer',id=request['id'],value=value)
@@ -589,5 +594,53 @@ async def test_pending_steering_survives_cancel_and_process_restart(gw, tmp_path
         _, events = await receive(proc, 'idle')
         snapshot = next(e for e in events if e['type'] == 'snapshot')
         assert snapshot['pending_inputs'][0]['text'] == 'Не теряй это уточнение'
+    finally:
+        await stop(proc)
+
+
+async def test_provider_wizard_edit_manage_and_cancel_are_interactive(gw, tmp_path):
+    proc = await launch(gw, tmp_path)
+    try:
+        await receive(proc, 'ready')
+        send(proc, type='submit', text='/provider')
+        table, _ = await receive(proc, 'table')
+        assert any(c.get('command') == '/provider add' for c in table['selection']['choices'])
+        await receive(proc, 'idle')
+        send(proc, type='submit', text='/provider add')
+        for value in ('local', 'https://example.test/v1', 'none'):
+            request, _ = await receive(proc, 'input_request')
+            send(proc, type='answer', id=request['id'], value=value)
+        _, events = await receive(proc, 'idle')
+        assert not any(e['type'] == 'error' for e in events), events
+        assert next(e['provider'] for e in events if e['type'] == 'snapshot') == 'local'
+        send(proc, type='submit', text='/provider edit local')
+        for value in ('https://changed.test/v1', 'bearer', 'wizard-hidden-key'):
+            request, _ = await receive(proc, 'input_request')
+            assert request['secret'] == (value == 'wizard-hidden-key')
+            send(proc, type='answer', id=request['id'], value=value)
+        _, events = await receive(proc, 'idle')
+        assert not any(e['type'] == 'error' for e in events), events
+        assert 'wizard-hidden-key' not in json.dumps(events)
+        for action in ('disable', 'enable'):
+            send(proc, type='submit', text=f'/provider {action} glm')
+            _, events = await receive(proc, 'idle')
+            assert not any(e['type'] == 'error' for e in events), events
+        send(proc, type='submit', text='/provider remove glm')
+        request, _ = await receive(proc, 'input_request')
+        assert 'подключение glm' in request['prompt']
+        send(proc, type='answer', id=request['id'], value='y')
+        await receive(proc, 'idle')
+        registry = tmp_path / 'home/.config/gwagent/providers.json'
+        assert 'glm' not in json.loads(registry.read_text())['providers']
+        send(proc, type='submit', text='/provider add temporary')
+        request, _ = await receive(proc, 'input_request')
+        send(proc, type='answer', id=request['id'], value='https://example.test/v1')
+        await receive(proc, 'input_request')
+        send(proc, type='cancel')
+        await receive(proc, 'idle')
+        assert 'temporary' not in json.loads(registry.read_text())['providers']
+        send(proc, type='submit', text='/provider disable local')
+        _, events = await receive(proc, 'idle')
+        assert any(e['type'] == 'error' and 'Сначала выберите' in e['message'] for e in events)
     finally:
         await stop(proc)

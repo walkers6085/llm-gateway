@@ -278,11 +278,12 @@ async def test_plan_mode_and_model_question_in_plain_cli(gw):
 
 async def test_connect_shell_command_and_eof(tmp_path):
     path = tmp_path / 'providers.json'
-    out, err, read = run_cli(['gw-cli-test-token'])
+    out, err, read = run_cli(['', 'none'])
     code = await amain(['connect', 'gateway', '--providers-file', str(path), '--cwd', str(tmp_path)], read=read, out=out, err=err)
     assert code == 0, err.getvalue()
     from agent.providers import ProviderManager
-    assert ProviderManager(path).connection().token == 'gw-cli-test-token'
+    assert ProviderManager(path).connection().token == ''
+    assert ProviderManager(path).get('gateway')['auth'] == 'stored'
     out, err, read = run_cli([])
     code = await amain(['connect', '--providers-file', str(path), '--cwd', str(tmp_path)], read=read, out=out, err=err)
     assert code == 2

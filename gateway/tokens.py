@@ -7,9 +7,12 @@
 import hashlib
 import secrets
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+from agent.storage import private_database, synchronized
 
 TOKEN_PREFIX = "gw-"
 
@@ -78,16 +81,24 @@ def _row_to_token(row: sqlite3.Row) -> Token:
     )
 
 
+@synchronized
 class TokenStore:
     def __init__(self, db_path: str):
-        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        private_database(db_path)
         self.db = sqlite3.connect(db_path, check_same_thread=False, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
-        columns = {r["name"] for r in self.db.execute("PRAGMA table_info(tokens)")}
-        if "agent_profile" not in columns:  # база создана до появления агента
-            self.db.execute("ALTER TABLE tokens ADD COLUMN agent_profile TEXT NOT NULL DEFAULT ''")
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            columns = {r['name'] for r in self.db.execute('PRAGMA table_info(tokens)')}
+            if 'agent_profile' not in columns:
+                self.db.execute("ALTER TABLE tokens ADD COLUMN agent_profile TEXT NOT NULL DEFAULT ''")
+            self.db.execute('COMMIT')
+        except Exception:
+            self.db.execute('ROLLBACK')
+            raise
 
     def create(self, name: str, days: float | None = None, models: list[str] | None = None,
                rpm: int = 0, agent_profile: str = "") -> tuple[str, Token]:
@@ -145,3 +156,6 @@ class TokenStore:
             args.append(token_id)
         sql += " GROUP BY t.name, u.model ORDER BY t.name, requests DESC"
         return self.db.execute(sql, args).fetchall()
+
+    def close(self):
+        self.db.close()

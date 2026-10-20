@@ -23,6 +23,7 @@ def test_defaults_are_valid_and_complete():
 def test_layers_override_in_order(tmp_path):
     user = write(tmp_path / "user.json", {"max_steps": 5, "shell": {"timeout": 10}})
     write(tmp_path / "proj" / ".gwagent" / "settings.json", {"shell": {"timeout": 20}, "model": "alpha"})
+    st.TrustStore().set(tmp_path / "proj")
     extra = write(tmp_path / "extra.json", {"model": "beta"})
     s = st.load(tmp_path / "proj", extra=extra, overrides={"max_steps": 7}, user_file=user)
     assert s["shell"]["timeout"] == 20          # проект главнее пользователя

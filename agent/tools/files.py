@@ -5,11 +5,20 @@
 """
 
 import os
+import asyncio
+import difflib
+import stat
+import multiprocessing
+import tempfile
+import hashlib
+from itertools import islice
 import re
 from fnmatch import fnmatch
 from pathlib import Path
 
 from .base import Tool, ToolContext, ToolError, normalize_rel
+from ..credentials import protected, _PROTECTED, protect
+from ..storage import atomic_write, digest, file_lock
 
 SKIP_DIRS = {".git", "node_modules", "venv", ".venv", "__pycache__", ".mypy_cache", ".pytest_cache"}
 MAX_LIST = 500
@@ -21,6 +30,8 @@ def resolve(ctx: ToolContext, path: str) -> Path:
     target = (root / path).resolve() if path else root
     if target != root and root not in target.parents:
         raise ToolError(f"путь {path!r} вне рабочей папки")
+    if protected(target):
+        raise ToolError("доступ к файлу учётных данных/сертификату запрещён")
     return target
 
 
@@ -40,11 +51,43 @@ def read_text(path: Path, limit: int) -> str:
 
 
 class PathTool(Tool):
+    async def run(self, args, ctx):
+        if self.name not in ('grep', 'glob', 'list_dir'):
+            return await asyncio.to_thread(self._run, args, ctx)
+        # Регулярное выражение выполняется в отдельном процессе: его можно остановить.
+        mp = multiprocessing.get_context('spawn')
+        parent, child = mp.Pipe(duplex=False)
+        process = mp.Process(target=_file_worker, args=(child, self.name, args, str(ctx.workspace), ctx.settings['files'], [str(p) for p in _PROTECTED]))
+        process.start()
+        child.close()
+        try:
+            deadline = asyncio.get_running_loop().time() + ctx.settings['files'].get('timeout', 10)
+            while not parent.poll():
+                if not process.is_alive():
+                    raise ToolError('процесс поиска завершился без ответа')
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise ToolError('таймаут поиска; уточните выражение или папку')
+                await asyncio.sleep(.02)
+            ok, result = parent.recv()
+            if not ok:
+                raise ToolError(result)
+            return result
+        finally:
+            if process.is_alive():
+                process.terminate()
+            await asyncio.to_thread(process.join, 1)
+            if process.is_alive():
+                process.kill()
+                await asyncio.to_thread(process.join, 1)
+            parent.close()
+            process.close()
+
     def subject(self, args: dict) -> str | None:
         return normalize_rel(args.get("path", ""))
 
 
 class ReadFile(PathTool):
+    plan_safe = True
     name = "read_file"
     default_permission = "allow"
     description = ("Прочитать текстовый файл. Возвращает строки с номерами (`номер<TAB>текст`). "
@@ -55,9 +98,13 @@ class ReadFile(PathTool):
         "limit": {"type": "integer", "minimum": 1, "description": "сколько строк (по умолчанию 2000)"},
     }, "required": ["path"], "additionalProperties": False}
 
-    async def run(self, args, ctx):
+    def _run(self, args, ctx):
         path = resolve(ctx, args["path"])
+        before = digest(path) if path.is_file() else None
         lines = read_text(path, ctx.settings["files"]["max_read_bytes"]).splitlines()
+        if digest(path) != before:
+            raise ToolError('файл изменился во время чтения')
+        ctx.extra.setdefault('read_hashes', {})[str(path)] = before
         start = args.get("offset", 1)
         chunk = lines[start - 1:start - 1 + args.get("limit", 2000)]
         if not chunk:
@@ -75,15 +122,19 @@ class WriteFile(PathTool):
     parameters = {"type": "object", "properties": {
         "path": {"type": "string"},
         "content": {"type": "string"},
+        "expected_sha256": {"type": "string"}, "preview": {"type": "boolean"},
     }, "required": ["path", "content"], "additionalProperties": False}
 
-    async def run(self, args, ctx):
+    def _run(self, args, ctx):
         path = resolve(ctx, args["path"])
         if path.is_dir():
             raise ToolError(f"{args['path']}: это папка")
         path.parent.mkdir(parents=True, exist_ok=True)
         existed = path.exists()
-        path.write_text(args["content"], encoding="utf-8")
+        before = path.read_text(encoding='utf-8') if existed else ''
+        if args.get('preview'):
+            return diff(before, args['content'], args['path'])
+        safe_write(path, args['content'], args, ctx)
         return f"{'Перезаписан' if existed else 'Создан'} {rel(ctx, path)} ({len(args['content'].encode())} байт)"
 
 
@@ -96,10 +147,12 @@ class EditFile(PathTool):
         "old_string": {"type": "string", "minLength": 1},
         "new_string": {"type": "string"},
         "replace_all": {"type": "boolean"},
+        "expected_sha256": {"type": "string"}, "preview": {"type": "boolean"},
     }, "required": ["path", "old_string", "new_string"], "additionalProperties": False}
 
-    async def run(self, args, ctx):
+    def _run(self, args, ctx):
         path = resolve(ctx, args["path"])
+        original_hash = digest(path)
         text = read_text(path, ctx.settings["files"]["max_read_bytes"])
         count = text.count(args["old_string"])
         if count == 0:
@@ -107,11 +160,14 @@ class EditFile(PathTool):
         if count > 1 and not args.get("replace_all"):
             raise ToolError(f"old_string встречается {count} раз — уточни фрагмент или укажи replace_all")
         new = text.replace(args["old_string"], args["new_string"], -1 if args.get("replace_all") else 1)
-        path.write_text(new, encoding="utf-8")
+        if args.get('preview'):
+            return diff(text, new, args['path'])
+        safe_write(path, new, {'expected_sha256': original_hash, **args}, ctx)
         return f"Изменён {rel(ctx, path)}: замен — {count if args.get('replace_all') else 1}"
 
 
 class ListDir(PathTool):
+    plan_safe = True
     name = "list_dir"
     default_permission = "allow"
     description = "Список файлов и папок (папки — с `/` на конце, у файлов — размер)."
@@ -119,18 +175,19 @@ class ListDir(PathTool):
         "path": {"type": "string", "description": "по умолчанию — рабочая папка"},
     }, "additionalProperties": False}
 
-    async def run(self, args, ctx):
+    def _run(self, args, ctx):
         path = resolve(ctx, args.get("path", ""))
         if not path.is_dir():
             raise ToolError(f"{args.get('path')}: не папка")
-        entries = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name))
+        entries = sorted(islice(path.iterdir(), MAX_LIST+1), key=lambda p: (not p.is_dir(), p.name))
         lines = [f"{p.name}/" if p.is_dir() else f"{p.name}\t{p.stat().st_size}" for p in entries[:MAX_LIST]]
         if len(entries) > MAX_LIST:
-            lines.append(f"…и ещё {len(entries) - MAX_LIST}")
+            lines.append(f"…больше {MAX_LIST} записей, уточните папку")
         return "\n".join(lines) or "(пусто)"
 
 
 class Glob(PathTool):
+    plan_safe = True
     name = "glob"
     default_permission = "allow"
     description = "Найти файлы по шаблону (`**/*.py`, `src/*.md`). Пропускает .git, node_modules, venv."
@@ -139,7 +196,7 @@ class Glob(PathTool):
         "path": {"type": "string", "description": "откуда искать, по умолчанию — рабочая папка"},
     }, "required": ["pattern"], "additionalProperties": False}
 
-    async def run(self, args, ctx):
+    def _run(self, args, ctx):
         base = resolve(ctx, args.get("path", ""))
         root = ctx.workspace.resolve()
         found = []
@@ -157,6 +214,7 @@ class Glob(PathTool):
 
 
 class Grep(PathTool):
+    plan_safe = True
     name = "grep"
     default_permission = "allow"
     description = ("Поиск по содержимому файлов регулярным выражением (Python re). "
@@ -168,7 +226,7 @@ class Grep(PathTool):
         "ignore_case": {"type": "boolean"},
     }, "required": ["pattern"], "additionalProperties": False}
 
-    async def run(self, args, ctx):
+    def _run(self, args, ctx):
         try:
             rx = re.compile(args["pattern"], re.IGNORECASE if args.get("ignore_case") else 0)
         except re.error as exc:
@@ -177,7 +235,12 @@ class Grep(PathTool):
         limit = ctx.settings["files"]["max_read_bytes"]
         files = [base] if base.is_file() else self._walk(base)
         out = []
-        for f in files:
+        for index, f in enumerate(files):
+            if index >= ctx.settings['files'].get('max_scan_files', 1000):
+                out.append('…достигнут files.max_scan_files; уточните папку')
+                break
+            if protected(f):
+                continue
             if args.get("include") and not fnmatch(f.name, args["include"]):
                 continue
             try:
@@ -206,3 +269,38 @@ class Grep(PathTool):
 
 
 TOOLS = [ReadFile, WriteFile, EditFile, ListDir, Glob, Grep]
+
+
+def diff(before, after, name):
+    return ''.join(difflib.unified_diff(before.splitlines(True), after.splitlines(True), fromfile=name, tofile=name)) or '(нет изменений)'
+
+
+def safe_write(path, content, args, ctx):
+    if len(content.encode()) > ctx.settings['files']['max_read_bytes']:
+        raise ToolError('слишком большой результат записи')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    locks = Path(tempfile.gettempdir()) / f'gwagent-locks-{os.getuid()}'
+    locks.mkdir(mode=0o700, exist_ok=True)
+    if locks.is_symlink() or locks.stat().st_uid != os.getuid() or locks.stat().st_mode & 0o077:
+        raise ToolError('небезопасный каталог блокировок')
+    lock_path = locks / hashlib.sha256(str(path).encode()).hexdigest()
+    with file_lock(lock_path):
+        expected = args.get('expected_sha256', ctx.extra.get('read_hashes', {}).get(str(path)))
+        if expected is not None and digest(path) != expected:
+            raise ToolError('файл изменён после чтения; прочитайте его заново')
+        mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
+        atomic_write(path, content.encode(), mode)
+        ctx.extra.setdefault('read_hashes', {})[str(path)] = digest(path)
+
+
+def _file_worker(pipe, name, args, workspace, files, protected_paths):
+    try:
+        for p in protected_paths:
+            protect(p)
+        result = {'grep': Grep, 'glob': Glob, 'list_dir': ListDir}[name]()._run(args, ToolContext(Path(workspace), {'files': files}))
+        # Не допускаем огромного IPC-сообщения, блокирующего отмену в родителе.
+        pipe.send((True, result[:100000]))
+    except Exception as exc:
+        pipe.send((False, str(exc)))
+    finally:
+        pipe.close()

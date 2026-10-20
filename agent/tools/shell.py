@@ -47,9 +47,12 @@ class Shell(Tool):
             return ToolResult(f"Таймаут {timeout} с, процесс остановлен.\n{text}".rstrip(), is_error=True)
         except asyncio.CancelledError:
             _killpg(proc)
+            await proc.wait()
             reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
             raise
         await _finish(reader)
+        _killpg(proc)
         text = truncate(buf.decode("utf-8", "replace"), limit)
         code = proc.returncode
         return ToolResult(f"exit code: {code}\n{text}".rstrip(), is_error=code != 0)

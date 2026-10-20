@@ -12,7 +12,7 @@ OpenAI-совместимый прокси (FastAPI + httpx) к своему и�
 
 ## Команды
 ```bash
-venv/bin/pytest -q                                   # все тесты (~20 с, офлайн; поднимают настоящий mTLS-апстрим)
+venv/bin/pytest -q                                   # все тесты (офлайн; поднимают настоящий mTLS-апстрим)
 venv/bin/pytest -q tests/test_loop.py::test_cancel_keeps_history_valid   # один тест
 venv/bin/uvicorn --factory gateway.app:create_app --host 0.0.0.0 --port 7700   # ручной запуск шлюза
 ./gwtoken create|list|revoke|usage|agent             # токены; `agent <имя> <профиль>|--off` — доступ к /agent/*
@@ -48,3 +48,18 @@ GW_TOKEN=gw-… ./gwagent [-p "задача"]                # CLI-агент; �
 - Общие подделки — `tests/fakes.py`: PKI, mTLS-апстрим (`upstream`) со сценарием `SCRIPT` (ответы ассистента с `tool_calls`, отдаются SSE-потоком кусками), `SEEN`, `ServerThread`, `scripted_transport` (MockTransport для цикла без сети). Фикстуры — `tests/conftest.py` (`make(**поля Settings)` → `(TestClient, TokenStore)`, чистит `SEEN`/`SCRIPT`).
 - `async def test_*` запускает хук в `conftest.py` (pytest-asyncio не нужен).
 - Всё офлайн: сайты, поисковик, MCP-серверы — локальные (`tests/fixtures/`). Без моков TLS.
+
+
+## После аудита
+
+- Linux/Python 3.12+, установка CLI через pyproject.toml: gwagent/gwproviders/gwbench.
+- Проектный .gwagent/settings.json требует gwagent trust до применения. В тестах пользовательские
+  конфиги/реестр доверия изолируются autouse-фикстурой, не пишите в реальные ~/.config.
+- Секреты: agent/credentials.py и отдельный auth.json; providers собирает общий mTLS/auth-клиент.
+- SQLite schema v2: журнал ходов, checkpoint контекста, ID/отпечаток подключения. Все операции
+  соединения защищены RLock; хранилища закрываются в lifecycle.
+- Потоки: общий agent/streaming.py; отмена закрывает вложенные генераторы и подпроцессы.
+- Файловый поиск: spawn-процесс, таймаут, предел числа файлов; запись атомарная с конфликтами.
+- Проверки: pip install -r requirements-dev.txt -c requirements.lock; pytest -q;
+  node --test tests/test_chat.mjs; pip wheel --no-deps . для упаковки. Runtime не включает pytest.
+- Карта выполненного аудита и оставшихся ограничений: docs/wiki/technical-debt.md.

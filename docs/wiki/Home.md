@@ -21,6 +21,8 @@ shell, сеть, MCP), права и хуки решают, что можно, �
 
 ## Инструменты
 - [tools/files.md](tools/files.md) — `read_file`, `write_file`, `edit_file`, `list_dir`, `glob`, `grep`
+- [tools/question.md](tools/question.md) — `question`, уточняющие вопросы пользователя
+- [tools/planning.md](tools/planning.md) — `goal`, `todo`, цель и задачи сессии
 - [tools/shell.md](tools/shell.md) — `shell`
 - [tools/web.md](tools/web.md) — `web_fetch`, `http_request`, `web_search`, защита от SSRF
 
@@ -30,6 +32,7 @@ shell, сеть, MCP), права и хуки решают, что можно, �
 - [web-chat.md](web-chat.md) — веб-чат: режимы «Чат» и «Агент»
 
 ## Эксплуатация
+- [technical-debt.md](technical-debt.md) — результат аудита, выполненные задачи и ограничения
 - [bench/README.md](bench/README.md) — бенчмарки качества, скорости и контекстного окна
 - [security.md](security.md) — модель угроз и рекомендации
 - [testing.md](testing.md) — как устроены тесты, как добавлять новые
@@ -39,3 +42,7 @@ shell, сеть, MCP), права и хуки решают, что можно, �
 Правка модуля = правка его страницы в том же коммите + строка в [changelog.md](changelog.md).
 [`tests/test_wiki.py`](../../tests/test_wiki.py) падает, если инструмент, ключ настроек, событие хука или цикла,
 эндпоинт `/agent/*` или страница вики не описаны, а также при битых относительных ссылках.
+
+- [CLI на OpenTUI: таблицы и важные замечания](tui.md)
+
+- [Сабагент](tools/subagent.md) — изолированные дочерние задачи.

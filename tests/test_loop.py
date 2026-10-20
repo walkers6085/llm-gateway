@@ -75,7 +75,7 @@ async def test_plain_answer(tmp_path):
     seen = []
     agent, store, usage = make_agent(tmp_path, [{"content": "готово"}], seen)
     evs = await run(agent, "привет\nвторая строка")
-    assert types(evs) == ["text", "usage", "assistant", "done"]
+    assert types(evs) == ["context", "text", "usage", "assistant", "done"]
     assert evs[-1]["reason"] == "stop"
     assert [m["role"] for m in store.messages(agent.session.id)] == ["user", "assistant"]
     assert store.get(agent.session.id).title == "привет"
@@ -121,7 +121,8 @@ async def test_max_steps(tmp_path):
     script = [{"tool_calls": [tool_call(f"c{i}", "echo", text="x")]} for i in range(5)]
     agent, _, _ = make_agent(tmp_path, script, max_steps=2)
     evs = await run(agent)
-    assert evs[-1] == {"type": "done", "reason": "max_steps"}
+    assert evs[-1]["type"] == "done" and evs[-1]["reason"] == "max_steps"
+    assert evs[-1]["request_id"] and evs[-1]["span_id"]
     assert "лимит шагов" in evs[-2]["message"]
 
 

@@ -67,7 +67,8 @@ class Hooks:
     async def _run_one(self, hook: dict, data: dict, result: HookResult) -> None:
         command = hook["command"]
         env = {**self.env, "GWAGENT_EVENT": data["event"], "GWAGENT_SESSION": self.session_id,
-               "GWAGENT_CWD": self.cwd}
+               "GWAGENT_CWD": self.cwd, "GWAGENT_REQUEST_ID": data.get("request_id", ""),
+               "GWAGENT_SPAN_ID": data.get("span_id", "")}
         try:
             proc = await asyncio.create_subprocess_exec(
                 "/bin/sh", "-c", command, cwd=self.cwd, env=env, start_new_session=True,
@@ -75,14 +76,38 @@ class Hooks:
         except OSError as exc:
             result.warnings.append(f"хук {command!r} не запустился: {exc}")
             return
+        async def collect(stream):
+            buf = bytearray()
+            while chunk := await stream.read(65536):
+                if len(buf) < 65536:
+                    buf.extend(chunk[:65536-len(buf)])
+            return bytes(buf)
+        readers = [asyncio.create_task(collect(proc.stdout)), asyncio.create_task(collect(proc.stderr))]
+        async def communicate():
+            try:
+                proc.stdin.write(json.dumps(data, ensure_ascii=False).encode())
+                await proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # Хук вправе завершиться, не читая stdin.
+            finally:
+                proc.stdin.close()
+            await proc.wait()
+            return await asyncio.gather(*readers)
         try:
-            out, err = await asyncio.wait_for(
-                proc.communicate(json.dumps(data, ensure_ascii=False).encode()), hook.get("timeout", 30))
-        except asyncio.TimeoutError:
+            out, err = await asyncio.wait_for(communicate(), hook.get("timeout", 30))
+        except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
             _kill(proc)
             await proc.wait()
+            if isinstance(exc, asyncio.CancelledError):
+                raise
             result.warnings.append(f"хук {command!r}: таймаут {hook.get('timeout', 30)} с")
             return
+        finally:
+            # Дети могут держать stdout открытым даже после выхода родителя.
+            _kill(proc)
+            for reader in readers:
+                reader.cancel()
+            await asyncio.gather(*readers, return_exceptions=True)
         stdout, stderr = out.decode("utf-8", "replace").strip(), err.decode("utf-8", "replace").strip()
         if proc.returncode == 2:
             result.decision, result.reason = "deny", stderr or f"заблокировано хуком {command!r}"

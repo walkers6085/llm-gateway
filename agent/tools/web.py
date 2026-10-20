@@ -82,7 +82,11 @@ async def request(ctx: ToolContext, method: str, url: str, *, headers: dict | No
                 raise ToolError(f"ошибка соединения с {url}: {type(exc).__name__}: {exc}") from None
             try:
                 if resp.is_redirect and "location" in resp.headers:
-                    url = urljoin(str(resp.url), resp.headers["location"])
+                    destination = urljoin(str(resp.url), resp.headers["location"])
+                    origin = lambda u: (httpx.URL(u).scheme, httpx.URL(u).host, httpx.URL(u).port)
+                    if origin(destination) != origin(url):
+                        raise ToolError(f"редирект на другой origin {httpx.URL(destination).host} требует отдельного подтверждённого запроса")
+                    url = destination
                     if resp.status_code in (301, 302, 303) and method not in ("GET", "HEAD"):
                         method, content, data = "GET", None, None
                     continue
@@ -207,6 +211,7 @@ class UrlTool(Tool):
 
 
 class WebFetch(UrlTool):
+    plan_safe = True
     name = "web_fetch"
     description = ("Скачать страницу по URL (GET) и вернуть её текст: HTML превращается в текст с "
                    "заголовками, списками и ссылками [текст](url). Длинные страницы — частями через offset.")
@@ -315,6 +320,7 @@ def parse_duckduckgo(html: str) -> list[dict]:
 
 
 class WebSearch(Tool):
+    plan_safe = True
     name = "web_search"
     default_permission = "allow"
     description = ("Поиск в интернете. Возвращает список: заголовок, URL, фрагмент. "

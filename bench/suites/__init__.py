@@ -6,7 +6,7 @@ import uuid
 
 from bench.runner import Bench, median, pct
 from bench.textgen import filler, haystack, insert
-from .agent_tasks import Chain, Structured, Tools
+from .agent_tasks import Chain, Structured, Tools, Recovery, ToolChoice
 
 
 def integer(minimum=1):
@@ -26,12 +26,14 @@ class Speed(Bench):
             r = await ctx.client.complete(ctx.model, [{"role": "user", "content":
                 "Перечисляй целые числа начиная с 1, через пробел, пока не закончится лимит ответа."}],
                 max_tokens=cfg["max_tokens"])
-            rows.append(vars(r) | {"decode_tps": r.decode_tps})
+            rows.append(vars(r) | {"decode_tps": r.decode_tps, "chunks_per_second": (r.chunks / r.total if r.total else None)})
         good = [r for r in rows if r["status"] == 200 and not r["error"]]
         return self.result(metrics={"successful": len(good), "requests": len(rows),
             "ttft_p50": median([r["ttft"] for r in good]),
             "ttft_p95": pct([r["ttft"] for r in good], .95),
-            "decode_tps_p50": median([r["decode_tps"] for r in good])}, details=rows,
+            "decode_tps_p50": median([r["decode_tps"] for r in good]),
+            "chunks_per_second_p50": median([r["chunks_per_second"] for r in good if not r['usage_reported']])}, details=rows,
+            infrastructure_errors=len(rows)-len(good),
             error="Все запросы завершились ошибкой" if not good else "",
             notes=["TTFT включает сеть и очередь. Без usage скорость оценивается в чанках/с; чанк может содержать несколько токенов."])
 
@@ -97,10 +99,10 @@ class Needle(Bench):
                         text + "\nКакой секретный код проекта Альтаир? Ответь только кодом."}], max_tokens=96)
                     rows.append({"length": length, "depth": depth, "expected": code,
                                  "answer": r.text, "passed": r.ok and r.text.strip() == code,
-                                 "error": r.error})
+                                 "error": r.error, "infrastructure_error": not r.ok})
         accuracy = sum(r["passed"] for r in rows) / len(rows) if rows else 0
         return self.result(score=accuracy * 100, metrics={"accuracy": accuracy, "cases": len(rows)},
-                           details=rows, error="Нет случаев" if not rows else "")
+                           details=rows, infrastructure_errors=sum(r['infrastructure_error'] for r in rows), error="Нет случаев" if not rows else "")
 
 
 class Reasoning(Bench):
@@ -117,10 +119,12 @@ class Reasoning(Bench):
             r = await ctx.client.complete(ctx.model, [{"role": "user", "content":
                 f"Вычисли ({a} + {b}) * {c}. Ответь только целым числом без пояснений."}], max_tokens=64)
             rows.append({"expected": expected, "answer": r.text,
-                         "passed": r.ok and r.text.strip() == expected, "error": r.error})
+                         "passed": r.ok and r.text.strip() == expected, "error": r.error, "infrastructure_error": not r.ok})
         accuracy = sum(r["passed"] for r in rows) / len(rows)
-        return self.result(score=accuracy * 100, metrics={"accuracy": accuracy}, details=rows,
+        return self.result(score=accuracy * 100, metrics={"accuracy": accuracy}, details=rows, infrastructure_errors=sum(r['infrastructure_error'] for r in rows),
                            notes=["Синтетическая арифметика; оценка не характеризует все виды рассуждений."])
 
 
-BENCHES = {b.name: b for b in (Speed(), ContextWindow(), Needle(), Reasoning(), Tools(), Structured(), Chain())}
+from .retrieval import Retrieval
+
+BENCHES = {b.name: b for b in (Speed(), ContextWindow(), Needle(), Reasoning(), Tools(), Structured(), Chain(), ToolChoice(), Recovery(), Retrieval())}

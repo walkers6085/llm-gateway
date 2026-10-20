@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools==84.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-gateway-agent"
+version = "0.2.0"
+description = "Локальный агент, OpenAI-совместимый шлюз и бенчмарки моделей"
+readme = "README.md"
+requires-python = ">=3.12"
+dynamic = ["dependencies"]
+
+[project.scripts]
+gwagent = "agent.cli:main"
+gwbench = "bench.__main__:main"
+gwproviders = "agent.providers:main"
+
+[tool.setuptools.packages.find]
+include = ["agent*", "bench*", "gateway*"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[tool.setuptools.data-files]
+"share/llm-gateway/chat" = ["chat/index.html"]
+"share/llm-gateway/tui" = ["tui/package.json", "tui/bun.lock", "tui/tsconfig.json"]
+"share/llm-gateway/tui/src" = ["tui/src/main.ts", "tui/src/view.ts", "tui/src/format.ts", "tui/src/theme.ts", "tui/src/choice.ts", "tui/src/menus.ts", "tui/src/terminal-input.ts", "tui/src/approval.ts", "tui/src/sidebar.ts"]

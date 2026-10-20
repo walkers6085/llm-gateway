@@ -124,3 +124,22 @@ def test_missing_cert_files_give_503_not_crash(make):
         r = client.post("/v1/chat/completions", json=CHAT, headers=auth(raw))
     assert r.status_code == 503
     assert r.json()["error"]["code"] == "gateway_not_configured"
+
+
+def test_proxy_request_ids_and_structured_usage(make, caplog):
+    import logging
+    caplog.set_level(logging.INFO, logger='gateway')
+    client, store = make()
+    raw, _ = store.create('trace')
+    with client:
+        response = client.post('/v1/chat/completions', json=CHAT,
+                               headers={**auth(raw),'x-request-id':'root-123','x-span-id':'model-456','x-parent-span-id':'turn-789'})
+        assert response.headers['x-request-id']=='root-123'
+        assert response.headers['x-span-id']=='model-456'
+        assert SEEN[-1]['trace']=={'x-request-id':'root-123','x-span-id':'model-456','x-parent-span-id':'turn-789'}
+        invalid = client.post('/v1/chat/completions', json={**CHAT,'stream':True},
+                              headers={**auth(raw),'x-request-id':'invalid/id'})
+        assert len(invalid.headers['x-request-id'])==32
+    entry = next(json.loads(r.message) for r in caplog.records if r.message.startswith('{') and 'root-123' in r.message)
+    assert entry['parent_span_id']=='turn-789' and entry['prompt_tokens']==7
+    assert entry['status']==200 and entry['model']=='alpha'

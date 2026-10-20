@@ -37,6 +37,7 @@ class Tool:
     description: str = ""
     parameters: dict = {"type": "object", "properties": {}}
     default_permission: str = "ask"
+    plan_safe: bool = False
 
     def subject(self, args: dict) -> str | None:
         """Строка, с которой сравнивается шаблон правила `tool(шаблон)`; None — шаблоны не применимы."""

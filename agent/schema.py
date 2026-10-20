@@ -6,6 +6,8 @@ properties, required, additionalProperties (bool или схема), items, enum
 minimum/maximum, minLength. Остальные ключи схемы (description, default, …) игнорируются.
 """
 
+import math
+
 TYPES = {
     "string": lambda v: isinstance(v, str),
     "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
@@ -41,6 +43,8 @@ def validate(value, schema: dict, path: str = "") -> None:
     if "enum" in schema and value not in schema["enum"]:
         raise SchemaError(path, f"допустимые значения: {', '.join(map(repr, schema['enum']))}")
     if TYPES["number"](value):
+        if not math.isfinite(value):
+            raise SchemaError(path, "число должно быть конечным")
         if "minimum" in schema and value < schema["minimum"]:
             raise SchemaError(path, f"не меньше {schema['minimum']}")
         if "maximum" in schema and value > schema["maximum"]:

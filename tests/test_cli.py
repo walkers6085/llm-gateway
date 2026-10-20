@@ -81,7 +81,8 @@ async def test_prompt_mode_denies_without_tty_and_json_output(gw):
     events = [json.loads(line) for line in out.getvalue().splitlines()]
     result = next(e for e in events if e["type"] == "tool_result")
     assert result["decision"] == "ask:deny" and not (ws / "x").exists()
-    assert events[-1] == {"type": "done", "reason": "stop"}
+    assert events[-1]["type"] == "done" and events[-1]["reason"] == "stop"
+    assert events[-1]["request_id"] and events[-1]["span_id"]
     assert SEEN[-1]["body"]["model"] == "beta"
 
 
@@ -155,15 +156,16 @@ async def test_provider_switch_resume_and_missing_key(gw, monkeypatch):
     providers_file = ws / "providers.json"
     manager = ProviderManager(providers_file)
     url = json.loads(cfg.read_text())["gateway"]["url"]
-    manager.add("first", url, "GW_TOKEN", "alpha")
+    manager.add("first", url, "GW_TOKEN", "alpha", tags={"agent-free": ["free"]})
     manager.add("second", url, "GW_TOKEN", "beta")
     manager.add("broken", url, "MISSING_TEST_PROVIDER_KEY", "alpha")
     manager.use("first")
     monkeypatch.delenv("MISSING_TEST_PROVIDER_KEY", raising=False)
     SCRIPT.extend([{"content": "один"}, {"content": "два"}])
-    out, err, read = run_cli(["/models", "первый", "/provider broken", "/provider second", "второй", "/exit"])
+    out, err, read = run_cli(["/models", "первый", "/provider broken", "без ключа", "/provider second", "второй", "/exit"])
     args = ["--cwd", str(ws), "--settings", str(cfg), "--providers-file", str(providers_file)]
     assert await amain(args, read=read, out=out, err=err) == 0
+    assert "first / agent-free · free" in out.getvalue()
     assert [r["body"]["model"] for r in SEEN if r["path"] == "chat"] == ["alpha", "beta"]
     assert "MISSING_TEST_PROVIDER_KEY" in err.getvalue()
     sessions = SessionStore(db).list("local")
@@ -180,7 +182,7 @@ async def test_provider_switch_resume_and_missing_key(gw, monkeypatch):
     assert "другому провайдеру" in err.getvalue()
 
 
-async def test_failed_provider_switch_keeps_current_connection(gw, monkeypatch):
+async def test_provider_without_models_can_be_selected_and_model_set_later(gw, monkeypatch):
     from agent.llm import LLMClient
     from agent.providers import ProviderManager
     cfg, ws, db = gw
@@ -193,10 +195,82 @@ async def test_failed_provider_switch_keeps_current_connection(gw, monkeypatch):
         return []
     monkeypatch.setattr(LLMClient, "models", empty_models)
     SCRIPT.append({"content": "после ошибки"})
-    out, err, read = run_cli(["/provider empty", "проверка", "/exit"])
+    out, err, read = run_cli(["/provider empty", "проверка", "/model alpha", "после настройки", "/exit"])
     assert await amain(["--cwd", str(ws), "--settings", str(cfg), "--provider", "first",
                         "--providers-file", str(providers_file)], read=read, out=out, err=err) == 0
     assert "ни одной модели" in err.getvalue()
     assert "после ошибки" in out.getvalue()
-    [session] = SessionStore(db).list("local")
-    assert session.profile == "provider:first" and session.model == "alpha"
+    sessions = SessionStore(db).list("local")
+    assert any(s.profile == "provider:empty" and s.model == "alpha" for s in sessions)
+    assert SEEN[-1]["body"]["model"] == "alpha"
+
+
+async def test_plain_offline_commands_provider_add_set_resume_and_recovery(gw,monkeypatch):
+    cfg,ws,db=gw
+    monkeypatch.delenv('GW_TOKEN')
+    out,err,read=run_cli(['/help','/tools','/models','/provider add local http://127.0.0.1:1/v1',
+        '/provider local','/provider set local http://127.0.0.1:2/v1 custom','/model later','/new','/sessions','/exit'])
+    assert await amain(['--cwd',str(ws),'--settings',str(cfg)],read=read,out=out,err=err)==0
+    assert 'нет токена' in err.getvalue()
+    assert 'Инструмент' not in err.getvalue()
+    assert 'Подключение local сохранено' in out.getvalue()
+    assert not SEEN
+    store=SessionStore(db)
+    session=next(s for s in store.list('local') if s.profile=='provider:local' and s.model=='later')
+    store.close()
+    out,err,read=run_cli(['/help','/exit'])
+    assert await amain(['--cwd',str(ws),'--settings',str(cfg),'--resume',session.id],read=read,out=out,err=err)==0
+    assert not SEEN
+
+
+async def test_tool_help_works_offline_without_running_tool(gw,monkeypatch):
+    cfg,ws,_=gw
+    monkeypatch.delenv('GW_TOKEN')
+    out,err,read=run_cli(['/tools write_file','/tools unknown','/exit'])
+    assert await amain(['--cwd',str(ws),'--settings',str(cfg)],read=read,out=out,err=err)==0
+    assert 'write_file' in out.getvalue() and '"required"' in out.getvalue()
+    assert 'Неизвестный инструмент' in err.getvalue()
+    assert not SEEN and not list(ws.iterdir())
+
+
+async def test_direct_subagent_command_and_logs(gw):
+    cfg, ws, db = gw
+    SCRIPT.append({'content':'Результат дочерней задачи'})
+    out, err, read = run_cli(['/agent Изучи задачу','/logs','/exit'])
+    code = await amain(['--plain','--cwd',str(ws),'--settings',str(cfg),'--allow-all'],read=read,out=out,err=err)
+    assert code==0, err.getvalue()
+    assert 'Результат дочерней задачи' in out.getvalue()
+    assert 'model.end' in out.getvalue() and 'request_id' in out.getvalue()
+    store=SessionStore(db)
+    assert len(store.list('local'))==2
+    store.close()
+
+
+async def test_compact_command_after_single_turn(gw):
+    cfg, ws, db = gw
+    SCRIPT.extend([{'content': 'Подробный старый ответ ' * 500}, {'content': 'Продолжаю'}])
+    out, err, read = run_cli(['Исходная задача', '/compact', 'Следующий запрос', '/exit'])
+    code = await amain(['--cwd', str(ws), '--settings', str(cfg)], read=read, out=out, err=err)
+    assert code == 0
+    assert 'Контекст сокращён' in out.getvalue()
+    store = SessionStore(db)
+    [session] = store.list('local')
+    assert session.context_seq > 0
+    assert len(store.messages(session.id)) == 4
+    assert any(m.get('content') == 'Следующий запрос' for m in SEEN[-1]['body']['messages'])
+    store.close()
+
+
+async def test_plan_mode_and_model_question_in_plain_cli(gw):
+    cfg, ws, db = gw
+    SCRIPT.extend([{'tool_calls': [tool_call('q', 'question', question='Формат экспорта?', options=['JSON', 'CSV'])]},
+                   {'content': 'Использую CSV'}])
+    out, err, read = run_cli(['/mode plan', 'Составь план экспорта', '2', '/mode build', '/exit'])
+    code = await amain(['--cwd', str(ws), '--settings', str(cfg)], read=read, out=out, err=err)
+    assert code == 0
+    assert 'Вопрос агента: Формат экспорта?' in out.getvalue()
+    assert 'Активный агент: plan' in out.getvalue() and 'Активный агент: build' in out.getvalue()
+    calls = [row['body'] for row in SEEN if 'body' in row]
+    assert 'Активный агент: plan' in calls[0]['messages'][0]['content']
+    assert json.loads(next(m['content'] for m in SEEN[-1]['body']['messages'] if m['role'] == 'tool')) == {'answer': 'CSV'}
+    store = SessionStore(db); assert store.list('local')[0].agent_mode == 'build'; store.close()

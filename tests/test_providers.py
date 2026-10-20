@@ -63,3 +63,55 @@ async def test_models_request(tmp_path):
     assert await manager.models("local", transport=httpx.MockTransport(handler)) == ["vendor/model"]
     with pytest.raises(ValueError, match="HTTP 401"):
         await manager.models("local", transport=httpx.MockTransport(lambda req: httpx.Response(401, text="secret")))
+
+
+def test_builtin_glm_and_mistral_presets_are_independent_and_require_own_keys(tmp_path,monkeypatch):
+    first=ProviderManager(tmp_path/'first/providers.json')
+    second=ProviderManager(tmp_path/'second/providers.json')
+    for name,env,model in [('glm','ZAI_API_KEY','glm-5.1'),('mistral','MISTRAL_API_KEY','mistral-small-latest')]:
+        monkeypatch.delenv(env,raising=False)
+        assert first.get(name)['model']==model
+        with pytest.raises(ValueError,match=env):
+            first.connection(name)
+        monkeypatch.setenv(env,'test-'+name+'-preset-secret')
+        connection=first.connection(name)
+        assert connection.model==model and connection.token=='test-'+name+'-preset-secret'
+        assert 'preset-secret' not in repr(connection)
+    first.config['providers']['glm']['models'].append('local-only')
+    assert second.get('glm')['models']==['glm-5.1','glm-4.5-flash','glm-4.7-flash']
+    assert second.get('glm')['tags']=={'glm-4.5-flash':['free'],'glm-4.7-flash':['free']}
+    assert not first.path.exists() and not second.path.exists()
+    assert not first.selected
+
+
+def test_builtin_preset_can_use_stored_auth_without_environment(tmp_path,monkeypatch,capsys):
+    manager=ProviderManager(tmp_path/'providers.json')
+    monkeypatch.delenv('ZAI_API_KEY',raising=False)
+    manager.connect('glm',read=lambda _:'bearer',password=lambda _:'stored-glm-test-secret')
+    manager.use('glm')
+    loaded=ProviderManager(manager.path)
+    assert loaded.connection().token=='stored-glm-test-secret'
+    assert loaded.connection().model=='glm-5.1'
+    assert loaded.selected
+    assert 'stored-glm-test-secret' not in manager.path.read_text()
+    assert main(['--file',str(manager.path),'list'])==0
+    assert 'stored-glm-test-secret' not in capsys.readouterr().out
+
+
+def test_tags_validate_merge_and_display(tmp_path, capsys):
+    path = tmp_path / "providers.json"
+    manager = ProviderManager(path)
+    manager.add("pro", "https://example.org/v1", model="m1", tags={"m1": ["free"]})
+    assert manager.get("pro")["tags"] == {"m1": ["free"]}
+    assert main(["--file", str(path), "list"]) == 0
+    assert "m1(free)" in capsys.readouterr().out
+    assert main(["--file", str(path), "update", "pro", "--tag", "m1=shared", "--tag", "m2=free"]) == 0
+    assert ProviderManager(path).get("pro")["tags"] == {"m1": ["free", "shared"], "m2": ["free"]}
+    path.write_text(json.dumps({"default": "pro", "providers": {"pro": {
+        "url": "https://example.org/v1", "token_env": "", "model": "", "models": [],
+        "tags": {"m1": "not-a-list"}}}}))
+    with pytest.raises(ValueError):
+        ProviderManager(path)
+    with pytest.raises(ValueError):
+        manager.update("pro", tags={"m1": [1]})
+    assert main(["--file", str(path), "update", "pro", "--tag", "m3"]) == 2

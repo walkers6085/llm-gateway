@@ -103,7 +103,8 @@ def _scripted_chunks(reply: dict):
 @upstream.post("/v1/chat/completions")
 async def _chat(request: Request):
     body = await request.json()
-    SEEN.append({"path": "chat", "auth": request.headers.get("authorization"), "body": body})
+    SEEN.append({"path": "chat", "auth": request.headers.get("authorization"), "body": body,
+                 "trace": {name: request.headers.get(name) for name in ("x-request-id", "x-span-id", "x-parent-span-id")}})
     if SCRIPT:
         reply = SCRIPT.pop(0)
         if reply.get("status"):

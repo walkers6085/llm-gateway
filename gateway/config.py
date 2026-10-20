@@ -44,6 +44,7 @@ class Settings:
     upstream_timeout: float = 300.0
     db_path: str = ""
     agent_config: str = ""
+    max_agent_runs: int = 16
     max_request_body_bytes: int = 10 * 1024 * 1024
     model_max_connections: dict[str, int] = field(default_factory=dict)
     model_max_connections_default: int = 0
@@ -63,6 +64,7 @@ class Settings:
             upstream_timeout=float(os.getenv("UPSTREAM_TIMEOUT", "300")),
             db_path=_path("DB_PATH", "data/gateway.db"),
             agent_config=_path("AGENT_CONFIG", "config/agent.json"),
+            max_agent_runs=int(os.getenv("MAX_AGENT_RUNS", "16")),
             max_request_body_bytes=int(os.getenv("MAX_REQUEST_BODY_BYTES", str(10 * 1024 * 1024))),
             model_max_connections=json.loads(os.getenv("MODEL_MAX_CONNECTIONS", "{}") or "{}"),
             model_max_connections_default=int(os.getenv("MODEL_MAX_CONNECTIONS_DEFAULT", "0")),

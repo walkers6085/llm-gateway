@@ -38,7 +38,9 @@ def events(text):
 def send(client, raw, sid, content):
     with client.stream("POST", f"/agent/sessions/{sid}/messages", json={"content": content}, headers=auth(raw)) as r:
         assert r.status_code == 200, r.read()
-        return events("".join(r.iter_text()))
+        rows = events("".join(r.iter_text()))
+        assert all(event.get('request_id') == r.headers['x-request-id'] for event in rows)
+        return rows
 
 
 def test_access_requires_agent_profile(agent_gw):
@@ -143,7 +145,8 @@ def test_cancel(agent_gw):
         t.join(10)
         msgs = client.get(f"/agent/sessions/{sid}", headers=auth(raw)).json()["messages"]
         assert client.post(f"/agent/sessions/{sid}/cancel", headers=auth(raw)).json() == {"cancelled": False}
-    assert collected[-1] == {"type": "done", "reason": "cancelled"}
+    assert collected[-1]["type"] == "done" and collected[-1]["reason"] == "cancelled"
+    assert collected[-1]["request_id"] == collected[0]["request_id"]
     assert msgs[-1] == {"role": "tool", "tool_call_id": "c1", "content": "Отменено пользователем"}
 
 
@@ -174,7 +177,7 @@ def test_read_only_profile(agent_gw):
         sid = client.post("/agent/sessions", json={"model": "alpha"}, headers=auth(raw)).json()["id"]
         evs = send(client, raw, sid, "x")
         names = [t["name"] for t in client.get("/agent/tools", headers=auth(raw)).json()["data"]]
-    assert names == ["read_file"]
+    assert names == ["read_file", "subagent"]
     assert "нет инструмента 'shell'" in next(e for e in evs if e["type"] == "tool_result")["content"]
 
 
@@ -192,3 +195,49 @@ def test_chat_page_has_agent_mode(make):
     with client:
         page = client.get("/chat/").text
     assert '<option value="agent">Агент</option>' in page and "/agent/sessions" in page
+
+
+def test_revocation_cancels_waiting_run(agent_gw):
+    client,store=agent_gw()
+    raw,token=store.create('revocation',agent_profile='default')
+    SCRIPT.append({'tool_calls':[tool_call('c1','shell',command='echo must-not-run')]})
+    collected=[]
+    with client:
+        sid=client.post('/agent/sessions',json={'model':'alpha'},headers=auth(raw)).json()['id']
+        thread=threading.Thread(target=lambda:collected.extend(send(client,raw,sid,'test')))
+        thread.start()
+        for _ in range(100):
+            if client.get(f'/agent/sessions/{sid}',headers=auth(raw)).json()['pending']:break
+            time.sleep(.02)
+        store.set_agent_profile(token.id,'ro')
+        thread.join(3)
+        assert not thread.is_alive()
+        assert collected[-1]['type']=='done' and collected[-1]['reason']=='cancelled'
+        assert not any(e.get('type')=='tool_result' and e.get('ok') for e in collected)
+
+
+@pytest.mark.parametrize('child_first',[True,False])
+def test_subagent_mtls_audit_and_shared_workspace_deletion(agent_gw, child_first):
+    client, store = agent_gw()
+    raw, token = store.create('delegation', agent_profile='auto')
+    SCRIPT.extend([{'tool_calls':[tool_call('delegate','subagent',task='Создай файл')]},
+                   {'tool_calls':[tool_call('child-write','write_file',path='child.txt',content='результат')]},
+                   {'content':'Файл создан'}, {'content':'Итог'}])
+    with client:
+        session = client.post('/agent/sessions',json={'model':'alpha'},headers=auth(raw)).json()
+        rows = send(client,raw,session['id'],'Поручи создание файла')
+        child = next(e['session_id'] for e in rows if e['type']=='subagent_start')
+        rid = rows[0]['request_id']
+        assert all(item['trace']['x-request-id']==rid for item in SEEN)
+        assert len({item['trace']['x-span-id'] for item in SEEN})==4
+        assert store.usage(token.id)[0]['requests']==4
+        workspace=Path(session['workspace'])
+        assert (workspace/'child.txt').read_text()=='результат'
+        child_detail=client.get(f'/agent/sessions/{child}',headers=auth(raw)).json()
+        assert child_detail['messages'][0]['content']=='Создай файл'
+        assert child_detail['tool_runs'][0]['request_id']==rid
+        first, last = (child,session['id']) if child_first else (session['id'],child)
+        assert client.delete(f'/agent/sessions/{first}',headers=auth(raw)).status_code==200
+        assert workspace.exists()
+        assert client.delete(f'/agent/sessions/{last}',headers=auth(raw)).status_code==200
+        assert not workspace.exists()

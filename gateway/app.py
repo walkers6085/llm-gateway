@@ -8,8 +8,12 @@
 import asyncio
 import json
 import logging
+import re
+import uuid
 import ssl
 import time
+import sysconfig
+from pathlib import Path
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -84,6 +88,18 @@ def check_cert_expiry(path: str) -> None:
         log.warning("Не удалось прочитать срок сертификата %s: %s", path, exc)
 
 
+class ManagedStreamingResponse(StreamingResponse):
+    def __init__(self, *args, cleanup, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.cleanup = cleanup
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self.cleanup()
+
+
 class RateLimiter:
     """Скользящее окно в 60 с на токен (в памяти процесса)."""
 
@@ -130,6 +146,7 @@ def create_app(settings: Settings | None = None, store: TokenStore | None = None
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO, format="%(levelname)s:     [gateway] %(message)s")
     settings = settings or Settings.from_env()
+    owns_store = store is None
     store = store or TokenStore(settings.db_path)
     rate = RateLimiter()
     models_limit = ModelLimiter(settings.model_max_connections, settings.model_max_connections_default)
@@ -159,9 +176,13 @@ def create_app(settings: Settings | None = None, store: TokenStore | None = None
             proxy=settings.upstream_proxy or None,
             **kwargs,
         )
-        yield
-        await app.state.agent.close()
-        await app.state.client.aclose()
+        try:
+            yield
+        finally:
+            await app.state.agent.close()
+            await app.state.client.aclose()
+            if owns_store:
+                store.close()
 
     app = FastAPI(
         title="LLM Gateway",
@@ -174,7 +195,22 @@ def create_app(settings: Settings | None = None, store: TokenStore | None = None
     if settings.cors_origins:
         app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origins,
                            allow_methods=["GET", "POST", "OPTIONS"],
-                           allow_headers=["authorization", "content-type", "x-api-key"])
+                           allow_headers=["authorization", "content-type", "x-api-key", "x-request-id", "x-span-id", "x-parent-span-id"],
+                           expose_headers=["x-request-id", "x-span-id"])
+
+    @app.middleware('http')
+    async def limit_request_body(request, call_next):
+        if request.method in ('POST', 'PUT', 'PATCH'):
+            declared = request.headers.get('content-length', '')
+            if declared.isdigit() and int(declared) > settings.max_request_body_bytes:
+                return JSONResponse(error_body('Слишком большой запрос', 'invalid_request_error', 'request_too_large'), status_code=413)
+            raw = bytearray()
+            async for chunk in request.stream():
+                if len(raw) + len(chunk) > settings.max_request_body_bytes:
+                    return JSONResponse(error_body('Слишком большой запрос', 'invalid_request_error', 'request_too_large'), status_code=413)
+                raw.extend(chunk)
+            request._body = bytes(raw)
+        return await call_next(request)
 
     @app.exception_handler(GatewayError)
     async def _gateway_error(_: Request, exc: GatewayError):
@@ -235,12 +271,16 @@ def create_app(settings: Settings | None = None, store: TokenStore | None = None
             raise GatewayError(400, "Тело запроса должно быть JSON-объектом")
         return body
 
-    app.state.agent = AgentService(settings, store, lambda: app.state.client, upstream_headers)
+    app.state.agent = AgentService(settings, store, lambda: app.state.client, upstream_headers, models_limit.get)
     mount_agent(app, app.state.agent, authenticate, upstream, GatewayError)
 
     @app.get("/", include_in_schema=False)
     async def root():
         return RedirectResponse("/chat/")
+
+    @app.get('/live')
+    async def live():
+        return {'status': 'ok'}
 
     @app.get("/health")
     async def health():
@@ -248,7 +288,7 @@ def create_app(settings: Settings | None = None, store: TokenStore | None = None
             return JSONResponse({"status": "degraded", "upstream": "not_configured"}, status_code=503)
         try:
             resp = await app.state.client.get("/models", headers=upstream_headers(), timeout=10)
-            ok = resp.status_code < 500
+            ok = resp.status_code == 200
         except Exception as exc:
             log.warning("health: апстрим недоступен: %s", describe(exc))
             ok = False
@@ -277,87 +317,110 @@ def create_app(settings: Settings | None = None, store: TokenStore | None = None
             raise GatewayError(404, f"Эндпоинт /v1/{path} не поддерживается", code="not_found")
         client = upstream()
         body = await read_body(request)
-        model = body.get("model")
+        model = body.get('model')
+        if not isinstance(model, str) or not model:
+            raise GatewayError(400, 'model должен быть непустой строкой')
         if not token.allows(model):
             raise GatewayError(403, f"Модель {model!r} недоступна для этого токена", "permission_error", "model_not_allowed")
-
-        stream = bool(body.get("stream"))
-        if stream and path == "chat/completions":
-            opts = body.get("stream_options") or {}
-            opts.setdefault("include_usage", True)
-            body["stream_options"] = opts
-
+        stream = body.get('stream', False)
+        if not isinstance(stream, bool):
+            raise GatewayError(400, 'stream должен быть boolean')
+        if stream and path == 'chat/completions':
+            opts = body.get('stream_options') or {}
+            if not isinstance(opts, dict):
+                raise GatewayError(400, 'stream_options должен быть объектом')
+            opts.setdefault('include_usage', True)
+            body['stream_options'] = opts
+        trace_headers = {}
+        for name in ("x-request-id", "x-span-id", "x-parent-span-id"):
+            value = request.headers.get(name, "")
+            if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
+                trace_headers[name] = value
+        trace_headers.setdefault("x-request-id", uuid.uuid4().hex)
+        trace_headers.setdefault("x-span-id", uuid.uuid4().hex)
         sem = models_limit.get(model)
         if sem is not None:
             await sem.acquire()
-        started = time.monotonic()
-        upstream_req = client.build_request("POST", "/" + path, json=body, headers=upstream_headers())
-        try:
-            resp = await client.send(upstream_req, stream=True)
-        except httpx.HTTPError as exc:
+        started, status, usage = time.monotonic(), 502, (0, 0)
+        resp, handed_off, finished = None, False, False
+
+        def finish(code, used):
+            nonlocal finished
+            if finished:
+                return
+            finished = True
             if sem is not None:
                 sem.release()
-            store.record(token.id, path, model, 502, ms=int((time.monotonic() - started) * 1000))
-            raise upstream_failure(exc)
+            elapsed = int((time.monotonic()-started)*1000)
+            log.info("%s", json.dumps({"event": "proxy.model.end", "request_id": trace_headers["x-request-id"],
+                     "span_id": trace_headers["x-span-id"], "parent_span_id": trace_headers.get("x-parent-span-id", ""),
+                     "model": model, "token_id": token.id, "status": code, "ms": elapsed,
+                     "prompt_tokens": used[0], "completion_tokens": used[1]}))
+            store.record(token.id, path, model, code, used[0], used[1], elapsed)
 
-        def finish(status: int, usage: tuple[int, int]) -> None:
-            if sem is not None:
-                sem.release()
-            store.record(token.id, path, model, status, usage[0], usage[1],
-                         int((time.monotonic() - started) * 1000))
-
-        is_sse = resp.headers.get("content-type", "").startswith("text/event-stream")
-        if not (stream and is_sse and resp.status_code == 200):
+        async def close(code, used):
+            if finished:
+                return
             try:
-                content = await resp.aread()
-            except httpx.HTTPError as exc:
-                finish(502, (0, 0))
-                raise upstream_failure(exc)
+                if resp is not None:
+                    await resp.aclose()
             finally:
-                await resp.aclose()
-            usage = (0, 0)
-            if resp.status_code == 200:
-                try:
-                    usage = extract_usage(json.loads(content))
-                except (ValueError, AttributeError):
-                    pass
-            finish(resp.status_code, usage)
-            return Response(content, status_code=resp.status_code, headers=passthrough_headers(resp))
+                finish(code, used)
 
         async def relay():
-            usage = (0, 0)
-            status = resp.status_code
-            tail = b""
+            code, used, tail = 200, (0, 0), b''
             try:
                 async for chunk in resp.aiter_raw():
                     yield chunk
-                    # Ищем usage в последних событиях, не меняя поток.
                     tail += chunk
-                    *lines, tail = tail.split(b"\n")
+                    *lines, tail = tail.split(b'\n')
+                    if len(tail) > 1048576:
+                        raise httpx.ReadError('слишком длинное SSE-событие')
                     for line in lines:
-                        if line.startswith(b"data:") and b'"usage"' in line:
+                        if line.startswith(b'data:') and b'"usage"' in line:
                             try:
-                                found = extract_usage(json.loads(line[5:].strip()))
-                                if any(found):
-                                    usage = found
-                            except (ValueError, AttributeError):
+                                used = extract_usage(json.loads(line[5:].strip()))
+                            except (ValueError, TypeError, AttributeError):
                                 pass
-            except httpx.HTTPError as exc:
-                status = 502
-                log.error("Обрыв стрима от апстрима: %r", exc)
+            except httpx.HTTPError:
+                code = 502
+                log.warning('обрыв стрима апстрима')
             except asyncio.CancelledError:
-                status = 499  # клиент закрыл соединение
+                code = 499
                 raise
             finally:
-                await resp.aclose()
-                finish(status, usage)
+                await close(code, used)
 
-        headers = passthrough_headers(resp)
-        headers["cache-control"] = "no-cache"
-        headers["x-accel-buffering"] = "no"
-        return StreamingResponse(relay(), status_code=200, headers=headers, media_type="text/event-stream")
+        try:
+            req = client.build_request('POST', '/' + path, json=body, headers={**upstream_headers(), **trace_headers})
+            resp = await client.send(req, stream=True)
+            status = resp.status_code
+            if stream and status == 200 and resp.headers.get('content-type', '').startswith('text/event-stream'):
+                headers = passthrough_headers(resp)
+                headers.update({'cache-control': 'no-cache', 'x-accel-buffering': 'no', **trace_headers})
+                response = ManagedStreamingResponse(relay(), status_code=200, headers=headers, media_type='text/event-stream', cleanup=lambda: close(499, (0, 0)))
+                handed_off = True
+                return response
+            content = await resp.aread()
+            if status == 200:
+                try:
+                    usage = extract_usage(json.loads(content))
+                except (ValueError, TypeError, AttributeError):
+                    pass
+            return Response(content, status_code=status, headers={**passthrough_headers(resp), **trace_headers})
+        except asyncio.CancelledError:
+            status = 499
+            raise
+        except httpx.HTTPError as exc:
+            status = 504 if isinstance(exc, httpx.TimeoutException) else 502
+            raise upstream_failure(exc)
+        finally:
+            if not handed_off:
+                await close(status, usage)
 
     chat_dir = ROOT / "chat"
+    if not chat_dir.is_dir():
+        chat_dir = Path(sysconfig.get_path("data")) / "share/llm-gateway/chat"
     if chat_dir.is_dir():
         app.mount("/chat", StaticFiles(directory=chat_dir, html=True), name="chat")
     return app

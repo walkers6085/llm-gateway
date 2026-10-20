@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 
 import httpx
 
+from agent.streaming import data_events
 from agent.llm import ToolCallBuilder, _error_message
 
 
@@ -36,6 +37,8 @@ class Completion:
         """Скорость генерации: токены после первого / время после первого токена."""
         if self.ttft is None or self.completion_tokens < 2 or self.total <= self.ttft:
             return None
+        if not self.usage_reported:
+            return None
         return (self.completion_tokens - 1) / (self.total - self.ttft)
 
     @property
@@ -49,12 +52,15 @@ class Completion:
 class BenchClient:
     def __init__(self, base_url: str, *, token: str = "", headers: dict | None = None,
                  timeout: float = 300, transport: httpx.AsyncBaseTransport | None = None,
-                 max_connections: int = 64):
+                 max_connections: int = 64, connection=None):
         h = dict(headers or {})
         if token:
             h["authorization"] = f"Bearer {token}"
+        self.options = connection.options if connection else {}
+        kwargs = connection.http_kwargs() if connection else {}
+        kwargs['headers'] = {**h, **kwargs.get('headers', {})}
         self.http = httpx.AsyncClient(
-            base_url=base_url.rstrip("/"), headers=h, trust_env=False, transport=transport,
+            base_url=base_url.rstrip("/"), trust_env=False, transport=transport, **kwargs,
             timeout=httpx.Timeout(timeout, connect=15),
             limits=httpx.Limits(max_connections=max_connections, max_keepalive_connections=max_connections))
 
@@ -78,6 +84,15 @@ class BenchClient:
             body["temperature"] = temperature
         if tools:
             body["tools"] = tools
+        if not self.options.get('stream', True):
+            body['stream'] = False
+            body.pop('stream_options', None)
+        if not self.options.get('usage', True): body.pop('stream_options', None)
+        if not self.options.get('temperature', True): body.pop('temperature', None)
+        if self.options.get('max_tokens_field') == 'max_completion_tokens' and 'max_tokens' in body:
+            body['max_completion_tokens'] = body.pop('max_tokens')
+        if tools and not self.options.get('tools', True):
+            return Completion(error='модель не поддерживает инструменты')
         body.update(extra or {})
         out = Completion()
         started = time.perf_counter()
@@ -97,19 +112,22 @@ class BenchClient:
                 out.ttft = time.perf_counter() - started
                 msg = ((data.get("choices") or [{}])[0]).get("message") or {}
                 out.text, out.tool_calls = msg.get("content") or "", msg.get("tool_calls") or []
-                self._usage(out, data)
+                out.finish_reason = data['choices'][0].get('finish_reason')
+                if data.get('usage'):
+                    self._usage(out, data)
                 return out
             calls, parts = ToolCallBuilder(), []
-            async for line in resp.aiter_lines():
-                if not line.startswith("data:"):
-                    continue
-                payload = line[5:].strip()
+            done = False
+            async for payload in data_events(resp):
+                payload = payload.strip()
                 if payload == "[DONE]":
+                    done = True
                     break
                 try:
                     chunk = json.loads(payload)
                 except ValueError:
-                    continue
+                    out.error = 'некорректный JSON в SSE'
+                    break
                 if chunk.get("error"):
                     out.error = _error_message(payload.encode())
                     break
@@ -127,10 +145,14 @@ class BenchClient:
                     if delta.get("tool_calls"):
                         calls.add(delta["tool_calls"])
                     out.finish_reason = choice.get("finish_reason") or out.finish_reason
+            if not done and out.finish_reason is None and not out.error:
+                out.error = 'незавершённый SSE'
+            if out.finish_reason == 'content_filter':
+                out.error = 'ответ заблокирован моделью'
             out.text, out.tool_calls = "".join(parts), calls.result()
         except httpx.HTTPError as exc:
             out.error = f"обрыв: {type(exc).__name__}: {exc}"
-        except ValueError as exc:
+        except (ValueError, TypeError, AttributeError, KeyError, IndexError) as exc:
             out.error = f"неверный ответ: {exc}"
         finally:
             await resp.aclose()
@@ -144,4 +166,4 @@ class BenchClient:
         u = data.get("usage") or {}
         out.prompt_tokens = int(u.get("prompt_tokens") or 0)
         out.completion_tokens = int(u.get("completion_tokens") or 0)
-        out.usage_reported = True
+        out.usage_reported = bool(u)

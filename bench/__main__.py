@@ -22,9 +22,10 @@ async def execute(args):
     if any(n not in BENCHES for n in names):
         raise ValueError("Неизвестный набор: " + args.suites)
     provider = None
+    connection = None
     token = os.environ.get("GW_TOKEN", "")
     manager = ProviderManager(args.providers_file) if args.provider or args.providers_file or not args.url else None
-    if args.provider or args.providers_file or (manager is not None and manager.path.exists() and not args.url):
+    if args.provider or args.providers_file or (manager is not None and manager.selected and not args.url):
         if args.url:
             raise ValueError("--url и --provider/--providers-file нельзя использовать вместе")
         connection = manager.connection(args.provider, args.model)
@@ -32,7 +33,7 @@ async def execute(args):
     args.url = args.url or "http://127.0.0.1:7700/v1"
     if not args.model:
         raise ValueError("нужен --model или модель по умолчанию у провайдера")
-    client = BenchClient(args.url, token=token, timeout=config["timeout"])
+    client = BenchClient(args.url, token=token, timeout=config["timeout"], **({"connection": connection} if connection else {}))
     try:
         ctx = Context(client, args.model, config, lambda s: print(s, file=sys.stderr))
         results = await run_all(ctx, [BENCHES[n] for n in names])
@@ -41,7 +42,7 @@ async def execute(args):
             report["provider"] = provider
         for path in save_report(report, BENCHES, Path(args.output)):
             print(path)
-        return 1 if any(r.error for r in results) else 0
+        return 1 if any(r.error or r.infrastructure_errors for r in results) else 0
     finally:
         await client.close()
 

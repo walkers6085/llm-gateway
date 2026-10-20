@@ -12,7 +12,7 @@ OpenAI-совместимый шлюз к инференсу, который д�
 ## Установка
 ```bash
 python3 -m venv venv
-venv/bin/pip install -r requirements.txt        # Windows: venv\Scripts\pip install -r requirements.txt
+venv/bin/pip install -r requirements.txt -c requirements.lock        # Windows: venv\Scripts\pip install -r requirements.txt
 cp .env.example .env
 venv/bin/uvicorn --factory gateway.app:create_app --host 0.0.0.0 --port 7700
 ```
@@ -86,3 +86,41 @@ venv/bin/python -m bench --provider local --suites tools,structured,chain --quic
 
 [Менеджер провайдеров](docs/wiki/providers.md) общий для CLI агента и бенчмарков:
 именованные URL, модели и ключи из окружения, список моделей и сохранённый выбор подключения.
+
+
+## Установка CLI и настройка подключения
+
+Linux, Python 3.12+. Установка пакета: `python -m pip install . -c requirements.lock`.
+Доступны gwagent, gwproviders, gwbench; из checkout сохраняются ./gwagent и python -m bench.
+
+```bash
+gwproviders add corp --url https://llm.example.org/v1 --model MODEL \
+  --cert /path/client.crt --key /path/client.key --ca /path/ca.pem
+gwproviders connect corp               # скрытый ввод ключа/пароля
+gwproviders use corp
+gwagent doctor
+gwagent trust                          # если в проекте есть .gwagent/settings.json
+gwagent
+```
+
+Подключения — ~/.config/gwagent/providers.json, секреты — отдельный auth.json (0600),
+сертификаты остаются файлами. Добавление записи не меняет активный провайдер; нужен use.
+В агенте доступны /connect, /compact, /export и /delete. Подробнее:
+[провайдеры](docs/wiki/providers.md), [CLI](docs/wiki/cli.md), [результат аудита](docs/wiki/technical-debt.md).
+
+Проверки разработчика: `pip install -r requirements-dev.txt -c requirements.lock`,
+`python -m pytest -q`, `node --test tests/test_chat.mjs`.
+
+## Терминальный интерфейс OpenTUI
+
+При установленном [Bun](https://bun.sh) >= 1.3.14:
+
+```bash
+./gwagent tui install
+./gwagent --tui
+```
+
+Потоковые ответы с Markdown, таблицами из JSON, выделением важных замечаний,
+карточками инструментов и скрытым вводом ключей. После установки `gwagent` выбирает
+TUI в интерактивном терминале; `--plain` сохраняет обычный CLI, `-p ... --json` — скриптовый режим.
+[Управление и ограничения](docs/wiki/tui.md).

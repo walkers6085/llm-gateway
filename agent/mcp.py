@@ -15,6 +15,7 @@ from collections import deque
 
 import httpx
 
+from .streaming import data_events
 from .tools.base import Tool, ToolContext, ToolError, ToolResult
 
 log = logging.getLogger("gwagent.mcp")
@@ -50,11 +51,12 @@ class StdioTransport:
         self.pending: dict[int, asyncio.Future] = {}
         self.stderr: deque[str] = deque(maxlen=20)
         self.next_id = 0
+        self.read_failed = False
         self.tasks: list[asyncio.Task] = []
 
     @property
     def alive(self) -> bool:
-        return self.proc is not None and self.proc.returncode is None
+        return self.proc is not None and self.proc.returncode is None and not self.read_failed
 
     async def start(self) -> None:
         env = {**os.environ, **subst(self.cfg.get("env", {}))}
@@ -88,10 +90,14 @@ class StdioTransport:
                     continue
                 fut = self.pending.pop(msg.get("id"), None)
                 if fut and not fut.done():
-                    fut.set_result(msg)
+                    if msg.get('jsonrpc') != '2.0':
+                        fut.set_exception(MCPError('неверная версия JSON-RPC'))
+                    else:
+                        fut.set_result(msg)
         except (ValueError, ConnectionError) as exc:  # слишком длинная строка и т. п.
             log.warning("mcp %s: чтение прервано: %s", self.name, exc)
         finally:
+            self.read_failed = True
             tail = " | ".join(self.stderr)
             for fut in self.pending.values():
                 if not fut.done():
@@ -117,15 +123,18 @@ class StdioTransport:
         rid = self.next_id
         fut = asyncio.get_running_loop().create_future()
         self.pending[rid] = fut
-        await self._write({"jsonrpc": "2.0", "id": rid, "method": method, "params": params or {}})
         try:
+            await self._write({"jsonrpc": "2.0", "id": rid, "method": method, "params": params or {}})
             msg = await asyncio.wait_for(fut, timeout)
+            if "error" in msg:
+                raise _rpc_error(msg["error"])
+            return msg.get("result") or {}
         except asyncio.TimeoutError:
-            self.pending.pop(rid, None)
             raise MCPError(f"{self.name}: {method} не ответил за {timeout} с") from None
-        if "error" in msg:
-            raise _rpc_error(msg["error"])
-        return msg.get("result") or {}
+        finally:
+            self.pending.pop(rid, None)
+            if not fut.done():
+                fut.cancel()
 
     async def notify(self, method: str, params: dict | None = None) -> None:
         await self._write({"jsonrpc": "2.0", "method": method, **({"params": params} if params else {})})
@@ -178,16 +187,25 @@ class HttpTransport:
         try:
             if resp.headers.get("mcp-session-id"):
                 self.session_id = resp.headers["mcp-session-id"]
-            if resp.status_code == 202 or "id" not in msg:
+            if resp.status_code == 202:
                 return None
             if resp.status_code == 404 and self.session_id:
                 raise MCPError(f"{self.name}: сессия MCP истекла (404)")
             if resp.status_code >= 400:
-                body = (await resp.aread()).decode("utf-8", "replace")[:300]
-                raise MCPError(f"{self.name}: HTTP {resp.status_code}: {body}")
+                raise MCPError(f"{self.name}: HTTP {resp.status_code}")
             if resp.headers.get("content-type", "").startswith("text/event-stream"):
                 return await asyncio.wait_for(self._from_sse(resp, msg["id"]), timeout)
-            return json.loads(await resp.aread())
+            body = bytearray()
+            async for chunk in resp.aiter_bytes():
+                if len(body) + len(chunk) > LINE_LIMIT:
+                    raise MCPError('слишком большой ответ MCP')
+                body.extend(chunk)
+            if 'id' not in msg:
+                return None
+            result = json.loads(body)
+            if not isinstance(result, dict) or result.get('id') != msg['id'] or result.get('jsonrpc') != '2.0':
+                raise MCPError('неверный JSON-RPC id/version')
+            return result
         except asyncio.TimeoutError:
             raise MCPError(f"{self.name}: {msg.get('method')} не ответил за {timeout} с") from None
         except (ValueError, httpx.HTTPError) as exc:
@@ -197,21 +215,21 @@ class HttpTransport:
 
     @staticmethod
     async def _from_sse(resp: httpx.Response, rid: int) -> dict:
-        data: list[str] = []
-        async for line in resp.aiter_lines():
-            if line.startswith("data:"):
-                data.append(line[5:].strip())
-            elif line == "" and data:
-                msg = json.loads("\n".join(data))
-                data = []
-                if isinstance(msg, dict) and msg.get("id") == rid and "method" not in msg:
-                    return msg
+        async for payload in data_events(resp, LINE_LIMIT):
+            msg = json.loads(payload)
+            if isinstance(msg, dict) and msg.get('id') == rid and 'method' not in msg:
+                if msg.get('jsonrpc') != '2.0':
+                    raise MCPError('неверная версия JSON-RPC')
+                return msg
         raise MCPError("поток закрыт без ответа")
 
     async def request(self, method: str, params: dict | None, timeout: float) -> dict:
         self.next_id += 1
-        msg = await self._post({"jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params or {}},
-                               timeout)
+        try:
+            async with asyncio.timeout(timeout):
+                msg = await self._post({"jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params or {}}, timeout)
+        except TimeoutError:
+            raise MCPError(f'{self.name}: общий таймаут {method}') from None
         if msg is None:
             raise MCPError(f"{self.name}: пустой ответ на {method}")
         if "error" in msg:
@@ -237,6 +255,8 @@ class MCPClient:
         self.proxy = proxy
         self.transport = self._make()
         self.server_info: dict = {}
+        self.last_error = ""
+        self.reconnect_lock = asyncio.Lock()
 
     def _make(self):
         if self.cfg["type"] == "stdio":
@@ -251,6 +271,8 @@ class MCPClient:
         await self.transport.start()
         result = await self.transport.request("initialize", {
             "protocolVersion": PROTOCOL_VERSION, "capabilities": {}, "clientInfo": CLIENT_INFO}, self.timeout)
+        if result.get('protocolVersion') not in (PROTOCOL_VERSION, '2025-03-26', '2024-11-05'):
+            raise MCPError('неподдерживаемая версия MCP')
         self.server_info = result.get("serverInfo") or {}
         if isinstance(self.transport, HttpTransport):
             self.transport.protocol = result.get("protocolVersion") or PROTOCOL_VERSION
@@ -272,10 +294,18 @@ class MCPClient:
         return tools
 
     async def call_tool(self, name: str, arguments: dict) -> dict:
-        if not self.transport.alive:  # stdio-сервер упал — один перезапуск
-            log.warning("mcp %s: сервер не работает, перезапуск", self.name)
-            await self.reconnect()
-        return await self.transport.request("tools/call", {"name": name, "arguments": arguments}, self.timeout)
+        try:
+            if not self.transport.alive:
+                log.warning("mcp %s: сервер не работает, перезапуск", self.name)
+                async with self.reconnect_lock:
+                    if not self.transport.alive:
+                        await self.reconnect()
+            result = await self.transport.request("tools/call", {"name": name, "arguments": arguments}, self.timeout)
+            self.last_error = ''
+            return result
+        except MCPError as exc:
+            self.last_error = str(exc)
+            raise
 
     async def close(self) -> None:
         await self.transport.close()
@@ -336,6 +366,7 @@ class MCPManager:
         self.clients: dict[str, MCPClient] = {}
         self.tools: list[MCPTool] = []
         self.errors: dict[str, str] = {}
+        self.reconnect_lock = asyncio.Lock()
 
     async def start(self) -> "MCPManager":
         servers = {n: c for n, c in (self.config.get("servers") or {}).items() if c.get("enabled", True)}
@@ -344,6 +375,10 @@ class MCPManager:
             self.tools.extend(tools)
             if name not in self.errors:
                 log.info("mcp %s: инструментов %d", name, len(tools))
+        names = [tool.name for tool in self.tools]
+        if len(names) != len(set(names)):
+            await self.close()
+            raise MCPError('коллизия имён MCP после нормализации; переименуйте сервер/инструмент')
         return self
 
     async def _start_one(self, name: str, cfg: dict) -> list[MCPTool]:
@@ -352,7 +387,7 @@ class MCPManager:
             client = MCPClient(name, cfg, self.config.get("timeout", 60), self.proxy)
             await client.connect()
             specs = await client.list_tools()
-        except MCPError as exc:
+        except (MCPError, ValueError, TypeError, AttributeError, KeyError) as exc:
             self.errors[name] = str(exc)
             log.warning("mcp %s: %s", name, exc)
             if client is not None:
@@ -361,10 +396,19 @@ class MCPManager:
         self.clients[name] = client
         return [MCPTool(client, s) for s in specs if s.get("name")]
 
-    def status(self) -> list[dict]:
-        out = [{"name": n, "ok": True, "tools": [t.name for t in self.tools if t.client is c],
-                "server": c.server_info} for n, c in self.clients.items()]
-        out += [{"name": n, "ok": False, "error": e} for n, e in self.errors.items()]
+    def status(self, *, include_disabled=False) -> list[dict]:
+        out = []
+        for name, client in self.clients.items():
+            alive = client.transport.alive
+            error = client.last_error or ('' if alive else 'Соединение закрыто')
+            state = 'error' if error else 'connected'
+            out.append({'name': name, 'ok': not bool(error), 'state': state,
+                        'tools': [t.name for t in self.tools if t.client is client],
+                        'server': client.server_info, **({'error': error} if error else {})})
+        out += [{'name': name, 'ok': False, 'state': 'error', 'error': error} for name, error in self.errors.items()]
+        if include_disabled:
+            out += [{'name': name, 'ok': False, 'state': 'disabled', 'tools': []}
+                    for name, config in self.config.get('servers', {}).items() if not config.get('enabled', True)]
         return out
 
     async def close(self) -> None:

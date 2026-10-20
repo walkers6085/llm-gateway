@@ -7,11 +7,15 @@
 import json
 import statistics
 import time
+import hashlib
+import platform
+import subprocess
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from agent.credentials import sanitize
 from agent.schema import SchemaError, validate
 from agent.settings import merge
 
@@ -32,6 +36,7 @@ class Result:
     notes: list = field(default_factory=list)
     error: str = ""
     seconds: float = 0.0
+    infrastructure_errors: int = 0
 
 
 class Bench:
@@ -187,10 +192,18 @@ def overall(results: list[Result]) -> float | None:
 
 
 def make_report(model: str, url: str, config: dict, results: list[Result], shared: dict) -> dict:
+    try:
+        revision = subprocess.run(['git', 'rev-parse', 'HEAD'], capture_output=True, text=True, timeout=2).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        revision = ''
+    fingerprint = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
+    complete = all(not r.error and not r.infrastructure_errors for r in results)
     return {
+        "schema_version": 2, "method_version": "2", "revision": revision,
+        "python": platform.python_version(), "config_hash": fingerprint, "complete": complete,
         "model": model, "url": url,
         "finished": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "overall": overall(results),
+        "overall": overall(results) if complete else None,
         "shared": shared,
         "config": config,
         "results": [asdict(r) for r in results],
@@ -200,6 +213,7 @@ def make_report(model: str, url: str, config: dict, results: list[Result], share
 def render_report(report: dict, benches: dict[str, Bench]) -> str:
     lines = [f"# Бенчмарк модели `{report['model']}`", "",
              f"{report['finished']} · {report['url']}", ""]
+    lines += ["Полнота: " + ("полный" if report.get('complete', True) else "НЕПОЛНЫЙ: есть ошибки инфраструктуры"), ""]
     if report["overall"] is not None:
         lines += [f"**Итоговая оценка качества: {report['overall']:.1f}/100** "
                   "(среднее по бенчмаркам качества)", ""]
@@ -226,6 +240,7 @@ def save_report(report: dict, benches: dict[str, Bench], out_dir: Path) -> tuple
     safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in report["model"])
     base = out_dir / f"{stamp}_{safe}"
     json_path, md_path = Path(str(base) + ".json"), Path(str(base) + ".md")
+    report = sanitize(report)
     json_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     md_path.write_text(render_report(report, benches), encoding="utf-8")
     return json_path, md_path
@@ -239,6 +254,8 @@ KEY_METRICS = {
     "tools": ["passed"],
     "structured": ["passed", "schema_valid"],
     "chain": ["passed"],
+    "recovery": ["passed"], "tool_choice": ["passed"],
+    "retrieval": ["accuracy", "useful_context_tokens"],
     "reasoning": ["accuracy"],
     "stability": ["identical"],
 }
@@ -260,4 +277,6 @@ def compare(reports: list[dict]) -> str:
             rows.append([f"{title}: оценка"] + [x["score"] if x else None for x in per])
         for key in KEY_METRICS.get(name, []):
             rows.append([f"{title}: {key}"] + [x["metrics"].get(key) if x else None for x in per])
-    return "\n".join(table(head, rows)) + "\n"
+    versions = {(r.get('method_version'), r.get('config_hash'), tuple(x['name'] for x in r['results'])) for r in reports}
+    warning = "Внимание: различаются версии методики, конфигурации или наборы; оценки напрямую несопоставимы.\n\n" if len(versions) > 1 else ''
+    return warning + "\n".join(table(head, rows)) + "\n"

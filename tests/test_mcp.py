@@ -1,6 +1,7 @@
 """MCP-клиент: stdio и Streamable HTTP против игрушечных серверов. См. docs/wiki/mcp.md."""
 
 import json
+import asyncio
 import sys
 from pathlib import Path
 
@@ -152,3 +153,54 @@ def test_helpers(monkeypatch):
                                       {"type": "resource_link", "uri": "file:///b"}]}).content == \
         "txt\n[ссылка на ресурс file:///b]"
     assert render_result({}).content == "(пустой результат)"
+
+
+async def test_stdio_cancel_removes_pending():
+    from agent.mcp import StdioTransport
+    from unittest.mock import AsyncMock
+    transport=StdioTransport('audit',{})
+    transport._write=AsyncMock()
+    task=asyncio.create_task(transport.request('audit',{},60))
+    await asyncio.sleep(0)
+    assert transport.pending
+    task.cancel()
+    await asyncio.gather(task,return_exceptions=True)
+    assert not transport.pending
+
+
+async def test_mcp_collision_is_explicit():
+    from types import SimpleNamespace
+    from agent.mcp import MCPManager, MCPError
+    from unittest.mock import AsyncMock
+    manager=MCPManager({'servers':{'one':{},'two':{}}})
+    manager._start_one=AsyncMock(return_value=[SimpleNamespace(name='same')])
+    with pytest.raises(MCPError,match='коллизия'):
+        await manager.start()
+
+
+async def test_http_response_must_match_rpc_id_and_version():
+    import httpx
+    from agent.mcp import HttpTransport, MCPError
+    transport=HttpTransport('audit',{'url':'http://test/mcp'})
+    await transport.client.aclose()
+    transport.client=httpx.AsyncClient(transport=httpx.MockTransport(lambda request:httpx.Response(200,json={'jsonrpc':'2.0','id':999,'result':{}})))
+    try:
+        with pytest.raises(MCPError,match='id/version'):
+            await transport.request('initialize',{},1)
+    finally:
+        await transport.close()
+
+
+async def test_status_detects_exited_process_and_disabled_server():
+    manager = await started({'servers': {'local': STDIO, 'off': {**STDIO, 'enabled': False}}})
+    try:
+        assert {row['name']: row for row in manager.status(include_disabled=True)}['off']['state'] == 'disabled'
+        client = manager.clients['local']
+        client.transport.proc.kill()
+        await client.transport.proc.wait()
+        state = manager.status()[0]
+        assert not state['ok'] and state['state'] == 'error'
+        await client.call_tool('echo', {'text': 'восстановление'})
+        assert manager.status()[0]['ok']
+    finally:
+        await manager.close()

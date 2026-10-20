@@ -19,6 +19,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from agent.llm import LLMClient
+from agent.tracing import identifier
 from agent.loop import Agent
 from agent.mcp import MCPManager
 from agent.runtime import make_agent, make_registry, start_mcp
@@ -52,15 +53,18 @@ class Run:
     """Идущий запрос к агенту: задача, очередь событий для SSE, ожидающие подтверждения."""
 
     def __init__(self):
-        self.queue: asyncio.Queue = asyncio.Queue()
+        self.queue: asyncio.Queue = asyncio.Queue(maxsize=128)
         self.pending: dict[str, asyncio.Future] = {}
         self.task: asyncio.Task | None = None
+        self.monitor: asyncio.Task | None = None
+        self.guard = lambda: True
 
     async def approver(self, request: dict) -> str:
         fut = asyncio.get_running_loop().create_future()
         self.pending[request["id"]] = fut
         try:
-            return await fut
+            answer = await fut
+            return answer if self.guard() else 'deny'
         finally:
             self.pending.pop(request["id"], None)
 
@@ -71,13 +75,15 @@ def sse(event: dict) -> str:
 
 class AgentService:
     def __init__(self, settings: Settings, tokens: TokenStore,
-                 client: Callable[[], httpx.AsyncClient], upstream_headers: Callable[[], dict]):
+                 client: Callable[[], httpx.AsyncClient], upstream_headers: Callable[[], dict], model_limiter=None):
         self.settings, self.tokens = settings, tokens
+        self.model_limiter = model_limiter
         self.client, self.upstream_headers = client, upstream_headers
         self.sessions = SessionStore(settings.db_path)
         self.profiles: dict[str, dict] | None = None
         self.config_error = ""
         self.mcp: dict[str, MCPManager] = {}
+        self.mcp_configs: dict[str, str] = {}
         self.mcp_lock = asyncio.Lock()
         self.runs: dict[str, Run] = {}
         self.agents: OrderedDict[str, Agent] = OrderedDict()
@@ -104,8 +110,12 @@ class AgentService:
         if not profile["mcp"]["servers"]:
             return None
         async with self.mcp_lock:
+            fingerprint = json.dumps([profile['mcp'], profile['network']['proxy']], sort_keys=True)
+            if name in self.mcp and self.mcp_configs.get(name) != fingerprint:
+                await self.mcp.pop(name).close()
             if name not in self.mcp:
                 self.mcp[name] = await start_mcp(profile)
+                self.mcp_configs[name] = fingerprint
         return self.mcp[name]
 
     def workspace(self, profile: dict, token: Token, session_id: str) -> Path:
@@ -115,14 +125,18 @@ class AgentService:
 
     async def agent_for(self, session: Session, token: Token, profile: dict, run: Run) -> Agent:
         agent = self.agents.get(session.id)
+        if agent is not None and (agent.settings != profile or getattr(agent, 'profile_name', None) != token.agent_profile):
+            self.agents.pop(session.id, None)
+            agent = None
         if agent is None:
-            llm = LLMClient(self.client(), headers=self.upstream_headers())
+            llm = LLMClient(self.client(), headers=self.upstream_headers(), options=profile['model_options'], limiter=self.model_limiter)
             agent = make_agent(
                 llm=llm, settings=profile, store=self.sessions, session=session,
                 mcp=await self.mcp_for(token.agent_profile, profile),
                 hook_env={"GATEWAY_ROOT": str(ROOT)},
                 on_usage=lambda model, status, usage: self.tokens.record(
                     token.id, "agent", model, status, usage[0], usage[1]))
+            agent.profile_name = token.agent_profile
             self.agents[session.id] = agent
             while len(self.agents) > MAX_CACHED_AGENTS:
                 self.agents.popitem(last=False)
@@ -138,6 +152,7 @@ class AgentService:
         await asyncio.gather(*(r.task for r in self.runs.values() if r.task), return_exceptions=True)
         await asyncio.gather(*(m.close() for m in self.mcp.values()), return_exceptions=True)
         self.mcp.clear()
+        self.sessions.close()
 
 
 def mount(app: FastAPI, service: AgentService, authenticate, upstream, error_cls) -> None:
@@ -183,11 +198,13 @@ def mount(app: FastAPI, service: AgentService, authenticate, upstream, error_cls
         run = service.runs.get(session_id)
         if run and run.task:
             run.task.cancel()
+            await asyncio.gather(run.task, return_exceptions=True)
         service.sessions.delete(session_id)
         service.agents.pop(session_id, None)
         root = expand(profile["workspace_root"], ROOT).resolve()
         ws = Path(session.workspace).resolve() if session.workspace else None
-        if ws and root in ws.parents:  # удаляем только папки внутри workspace_root
+        if ws and (root / str(token.id)) in ws.parents and not service.sessions.workspace_in_use(str(ws)):
+            # Дочерние сессии разделяют workspace; удаляем после последней ссылки.
             shutil.rmtree(ws, ignore_errors=True)
         return {"deleted": session_id}
 
@@ -200,11 +217,20 @@ def mount(app: FastAPI, service: AgentService, authenticate, upstream, error_cls
                             "permission_error", "model_not_allowed")
         if not req.content.strip():
             raise error_cls(400, "Пустое сообщение", code="empty_message")
+        if len(service.runs) >= service.settings.max_agent_runs:
+            raise error_cls(429, 'Достигнут лимит активных запусков', code='agent_capacity')
         if session_id in service.runs:
             raise error_cls(409, "Сессия уже выполняет запрос", code="session_busy")
         upstream()  # 503, если шлюз не настроен
         Path(session.workspace).mkdir(parents=True, exist_ok=True)
+        request_id = identifier()
         run = Run()
+        profile_snapshot = json.dumps(profile, sort_keys=True)
+        def authorized():
+            current = service.tokens.get(token.id)
+            return (current.active and current.agent_profile == token.agent_profile and current.allows(session.model)
+                    and json.dumps(service.profiles.get(token.agent_profile), sort_keys=True) == profile_snapshot)
+        run.guard = authorized
         service.runs[session_id] = run
         try:
             agent = await service.agent_for(session, token, profile, run)
@@ -214,26 +240,44 @@ def mount(app: FastAPI, service: AgentService, authenticate, upstream, error_cls
 
         async def produce():
             try:
-                async for event in agent.run(req.content):
-                    await run.queue.put(event)
+                async for event in agent.run(req.content, request_id=request_id):
+                    if not run.guard():
+                        raise asyncio.CancelledError()
+                    await asyncio.wait_for(run.queue.put(event), 30)
             except asyncio.CancelledError:
-                await run.queue.put({"type": "done", "reason": "cancelled"})
+                while run.queue.full():
+                    run.queue.get_nowait()
+                run.queue.put_nowait({"type": "done", "reason": "cancelled", "request_id": request_id})
                 raise
             except Exception as exc:  # ошибка ядра не должна оставлять сессию «занятой»
-                log.exception("агент: сессия %s", session_id)
-                await run.queue.put({"type": "error", "message": f"Внутренняя ошибка агента: {exc}"})
-                await run.queue.put({"type": "done", "reason": "error"})
+                log.exception("агент: сессия %s, запрос %s", session_id, request_id)
+                while run.queue.qsize() > 125:
+                    run.queue.get_nowait()
+                run.queue.put_nowait({"type": "error", "message": "Внутренняя ошибка агента", "request_id": request_id})
+                run.queue.put_nowait({"type": "done", "reason": "error", "request_id": request_id})
             finally:
+                if run.monitor:
+                    run.monitor.cancel()
+                    await asyncio.gather(run.monitor, return_exceptions=True)
                 for fut in run.pending.values():
                     fut.cancel()
                 service.runs.pop(session_id, None)
-                await run.queue.put(None)
+                if run.queue.full():
+                    run.queue.get_nowait()
+                run.queue.put_nowait(None)
 
         run.task = asyncio.create_task(produce())
+        async def monitor():
+            while not run.task.done():
+                await asyncio.sleep(.5)
+                if not run.guard():
+                    run.task.cancel()
+                    break
+        run.monitor = asyncio.create_task(monitor())
 
         async def stream():
             try:
-                yield sse({"type": "session", "id": session_id, "model": session.model})
+                yield sse({"type": "session", "id": session_id, "model": session.model, "request_id": request_id})
                 while True:
                     try:
                         event = await asyncio.wait_for(run.queue.get(), HEARTBEAT)
@@ -249,7 +293,7 @@ def mount(app: FastAPI, service: AgentService, authenticate, upstream, error_cls
                     run.task.cancel()
 
         return StreamingResponse(stream(), media_type="text/event-stream",
-                                 headers={"cache-control": "no-cache", "x-accel-buffering": "no"})
+                                 headers={"cache-control": "no-cache", "x-accel-buffering": "no", "x-request-id": request_id})
 
     @app.post("/agent/sessions/{session_id}/approve")
     async def approve(session_id: str, req: Approval, token: Token = Depends(authenticate)):

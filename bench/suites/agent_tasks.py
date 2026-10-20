@@ -64,13 +64,19 @@ class TaskBench(Bench):
 
     def summarize(self, rows, **metrics):
         passed = sum(row["passed"] for row in rows)
+        n, p = len(rows), passed / len(rows)
+        z = 1.96
+        center = (p + z*z/(2*n))/(1+z*z/n)
+        radius = z*((p*(1-p)/n + z*z/(4*n*n))**.5)/(1+z*z/n)
         return self.result(score=100 * passed / len(rows),
-                           metrics={"passed": passed, "cases": len(rows), **metrics}, details=rows,
+                           metrics={"passed": passed, "cases": len(rows), "accuracy_ci95": [max(0,center-radius), min(1,center+radius)], **metrics}, details=rows,
+                           infrastructure_errors=sum(row.get('infrastructure_error', False) for row in rows),
                            notes=["Ошибки API считаются провалами; детали содержат ответы и причину каждого провала."])
 
 
 class Tools(TaskBench):
     name, title = "tools", "Выбор инструментов и аргументы"
+    hint_names = True
 
     async def run(self, ctx):
         rng, rows = random.Random(ctx.config["seed"]), []
@@ -82,6 +88,8 @@ class Tools(TaskBench):
                      (f"Вычисли {a} * {b} инструментом multiply.", "multiply", {"a": a, "b": b}),
                      ("Ответь только словом ПРИВЕТ. Инструменты не используй.", None, {})]
             for prompt, name, arguments in cases:
+                if not self.hint_names:
+                    prompt = prompt.replace('Используй инструмент weather.', 'Ответ получи через доступный сервис.').replace('инструментом multiply.', 'через доступный сервис.')
                 r = await ctx.client.complete(ctx.model, [{"role": "user", "content": prompt}],
                                               tools=TOOLS, max_tokens=cfg["max_tokens"])
                 error = r.error or (f"HTTP {r.status}" if not r.ok else "")
@@ -94,7 +102,7 @@ class Tools(TaskBench):
                     except (ValueError, TypeError, KeyError, StopIteration) as exc:
                         error = str(exc)
                 rows.append({"prompt": prompt, "expected_tool": name, "expected_arguments": arguments,
-                             "answer": r.text, "tool_calls": r.tool_calls, "passed": not error, "error": error})
+                             "answer": r.text, "tool_calls": r.tool_calls, "passed": not error, "error": error, "infrastructure_error": not r.ok})
         return self.summarize(rows)
 
 
@@ -133,7 +141,7 @@ class Structured(TaskBench):
                     except (ValueError, TypeError) as exc:
                         error = str(exc)
                 rows.append({"expected": expected, "schema": schema, "answer": r.text,
-                             "schema_valid": valid, "passed": not error, "error": error})
+                             "schema_valid": valid, "passed": not error, "error": error, "infrastructure_error": not r.ok})
         return self.summarize(rows, schema_valid=sum(r["schema_valid"] for r in rows))
 
 
@@ -143,6 +151,7 @@ CHAIN_TOOLS = [tool("find_product", "Найти товар по названию
 
 class Chain(TaskBench):
     name, title = "chain", "Цепочка: поиск товара → цена → ответ"
+    simulate_error = False
 
     async def run(self, ctx):
         rng, rows = random.Random(ctx.config["seed"]), []
@@ -155,16 +164,19 @@ class Chain(TaskBench):
                 f"Найди товар «{name}» через find_product, получи его цену через get_price. "
                 "Вызывай инструменты по одному. В конце ответь только целым числом — ценой."}]
             trace, error, used_ids = [], "", set()
-            for step, (expected_name, arguments, output) in enumerate([
-                    ("find_product", {"name": name}, {"product_id": product_id}),
-                    ("get_price", {"product_id": product_id}, {"price": price}),
-                    (None, {}, None)]):
+            sequence = [("find_product", {"name": name}, {"product_id": product_id}),
+                        ("get_price", {"product_id": product_id}, {"price": price}), (None, {}, None)]
+            if self.simulate_error:
+                sequence.insert(1, ('get_price', {'product_id': product_id}, {'error': 'Временная ошибка; повтори get_price с тем же product_id один раз'}))
+            infrastructure_error = False
+            for step, (expected_name, arguments, output) in enumerate(sequence):
                 r = await ctx.client.complete(ctx.model, messages, tools=CHAIN_TOOLS,
                                               max_tokens=cfg["max_tokens"])
                 trace.append({"step": step + 1, "answer": r.text, "tool_calls": r.tool_calls,
                               "status": r.status, "error": r.error})
                 error = r.error or (f"HTTP {r.status}" if not r.ok else "")
                 if error:
+                    infrastructure_error = True
                     break
                 try:
                     if expected_name is None:
@@ -183,5 +195,15 @@ class Chain(TaskBench):
                     error = str(exc)
                     break
             rows.append({"product": name, "expected_price": price, "trace": trace,
-                         "passed": not error, "error": error})
+                         "passed": not error, "error": error, "infrastructure_error": infrastructure_error})
         return self.summarize(rows)
+
+
+class ToolChoice(Tools):
+    name, title = 'tool_choice', 'Выбор инструмента без подсказки имени'
+    hint_names = False
+
+
+class Recovery(Chain):
+    name, title = 'recovery', 'Восстановление после ошибки инструмента'
+    simulate_error = True

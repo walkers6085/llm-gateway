@@ -56,3 +56,14 @@ def make(gateway_settings):
     SCRIPT.clear()
     yield _make
     SCRIPT.clear()
+
+
+@pytest.fixture(autouse=True)
+def isolated_user_config(tmp_path, monkeypatch):
+    from agent import trust, providers, settings, credentials
+    monkeypatch.setattr(trust, 'DEFAULT_FILE', str(tmp_path / 'user/trust.json'))
+    monkeypatch.setattr(providers, 'DEFAULT_FILE', str(tmp_path / 'user/providers.json'))
+    monkeypatch.setattr(settings, 'USER_SETTINGS', tmp_path / 'user/settings.json')
+    monkeypatch.setattr(credentials, 'DEFAULT_FILE', str(tmp_path / 'user/auth.json'))
+    credentials._SECRETS.clear()
+    credentials._PROTECTED.clear()

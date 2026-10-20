@@ -67,6 +67,7 @@ form { max-width: 820px; margin: 0 auto; display: flex; gap: 8px; align-items: f
   <h1>LLM Чат</h1>
   <select id="mode" title="Режим"><option value="chat">Чат</option><option value="agent">Агент</option></select>
   <input id="token" type="password" placeholder="Токен gw-…" autocomplete="off">
+  <label><input id="remember" type="checkbox"> Запомнить токен</label>
   <select id="model"><option value="">— модель —</option></select>
   <select id="session" hidden title="Сессия агента"></select>
   <button id="reload" title="Обновить список моделей">↻</button>
@@ -99,7 +100,9 @@ let mode = store.get("gw_mode") === "agent" ? "agent" : "chat";
 let agentSession = store.get("gw_agent_session") || null;
 let cards = {};
 
-$("token").value = store.get("gw_token");
+$("remember").checked = store.get('gw_remember') === 'yes';
+$("token").value = $("remember").checked ? store.get("gw_token") : '';
+if (!$("remember").checked) { try { localStorage.removeItem('gw_token'); } catch {} }
 $("system").value = store.get("gw_system");
 
 function setStatus(text, err = false) { $("status").textContent = text; $("status").className = err ? "err" : ""; }
@@ -161,7 +164,30 @@ function addMessage(role, text) {
   return el;
 }
 
-function busy(on) { $("send").hidden = on; $("stop").hidden = !on; $("input").disabled = on; }
+function busy(on) {
+  $("send").hidden = on; $("stop").hidden = !on; $("input").disabled = on;
+  for (const id of ['mode','model','session','token','new','reload','remember']) $(id).disabled = on;
+}
+
+async function* readSSE(resp) {
+  const reader = resp.body.getReader(), decoder = new TextDecoder();
+  let buf = '';
+  function data(block) {
+    const value = block.split(/\r?\n/).filter(l => l.startsWith('data:')).map(l => l.slice(5).trimStart()).join('\n');
+    if (!value.trim()) return null;
+    return value.trim() === '[DONE]' ? {stream_done: true} : JSON.parse(value);
+  }
+  try {
+    for (;;) {
+      const {value, done} = await reader.read();
+      buf += done ? decoder.decode() : decoder.decode(value, {stream:true});
+      if (buf.length > 1048576) throw new Error('Слишком большое SSE-событие');
+      const blocks = buf.split(/\r?\n\r?\n/); buf = blocks.pop();
+      for (const block of blocks) { const event = data(block); if (event) yield event; }
+      if (done) { const event = data(buf); if (event) yield event; break; }
+    }
+  } finally { try { await reader.cancel(); } finally { reader.releaseLock(); } }
+}
 
 async function send(text) {
   const model = $("model").value;
@@ -177,7 +203,7 @@ async function send(text) {
 
   controller = new AbortController();
   busy(true); setStatus("генерация…");
-  let answer = "", usage = null;
+  let answer = "", usage = null, completed = false;
   const started = performance.now();
   try {
     const resp = await fetch("/v1/chat/completions", {
@@ -185,26 +211,20 @@ async function send(text) {
       body: JSON.stringify({ model, messages, stream: true, temperature: Number($("temperature").value) }),
     });
     if (!resp.ok) throw new Error(await apiError(resp));
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = "";
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      const lines = buf.split("\n"); buf = lines.pop();
-      for (const line of lines) {
-        if (!line.startsWith("data:")) continue;
-        const data = line.slice(5).trim();
-        if (data === "[DONE]") continue;
-        try {
-          const j = JSON.parse(data);
-          if (j.usage) usage = j.usage;
-          const delta = j.choices?.[0]?.delta?.content;
-          if (delta) { answer += delta; el.innerHTML = renderMarkdown(answer); el.scrollIntoView({ block: "end" }); }
-        } catch {}
+    let finished = false;
+    for await (const j of readSSE(resp)) {
+      if (j.stream_done) { finished = true; break; }
+      if (j.error) throw new Error(j.error.message || 'Ошибка модели');
+      if (j.usage) usage = j.usage;
+      const choice = j.choices?.[0], delta = choice?.delta?.content;
+      if (choice?.finish_reason) {
+        if (choice.finish_reason !== 'stop') throw new Error('Ответ не завершён: ' + choice.finish_reason);
+        finished = true;
       }
+      if (delta) { answer += delta; el.innerHTML = renderMarkdown(answer); el.scrollIntoView({block:'end'}); }
     }
+    if (!finished) throw new Error('Поток оборвался до завершения ответа');
+    completed = true;
     setStatus("");
   } catch (e) {
     if (e.name === "AbortError") setStatus("остановлено");
@@ -213,14 +233,16 @@ async function send(text) {
     controller = null; busy(false); $("input").focus();
   }
   if (answer) {
-    history.push({ role: "assistant", content: answer });
+    if (completed) history.push({ role: "assistant", content: answer });
+    else history.pop();
     const meta = document.createElement("div");
     meta.className = "meta";
     const secs = ((performance.now() - started) / 1000).toFixed(1);
     meta.textContent = `${model} · ${secs} с` + (usage ? ` · токенов: ${usage.prompt_tokens} → ${usage.completion_tokens}` : "");
     el.appendChild(meta);
-  } else if (!el.classList.contains("error")) {
-    el.remove(); history.pop();
+  } else {
+    history.pop();
+    if (!el.classList.contains("error")) el.remove();
   }
 }
 
@@ -268,16 +290,22 @@ function askPermission(ev) {
   box.addEventListener("click", async (e) => {
     const decision = e.target.dataset?.d; if (!decision) return;
     box.querySelectorAll("button").forEach(b => b.disabled = true);
+    try {
     const resp = await fetch(`/agent/sessions/${agentSession}/approve`, {
       method: "POST", headers: headers(), body: JSON.stringify({ id: ev.id, decision }) });
     if (!resp.ok) { setStatus(await apiError(resp), true); box.querySelectorAll("button").forEach(b => b.disabled = false); return; }
     box.remove(); el.querySelector(".st").textContent = "…";
+    } catch (error) {
+      setStatus('Подтверждение не отправлено; повторите', true);
+      box.querySelectorAll('button').forEach(b => b.disabled = false);
+    }
   });
   el.appendChild(box);
   el.scrollIntoView({ block: "end" });
 }
 
 async function loadSessions() {
+  try {
   if (!$("token").value.trim()) return;
   const resp = await fetch("/agent/sessions", { headers: headers() });
   if (!resp.ok) {
@@ -290,9 +318,11 @@ async function loadSessions() {
     data.map(x => `<option value="${escapeHtml(x.id)}">${escapeHtml(x.title || x.id)}</option>`).join("");
   if (!data.some(x => x.id === agentSession)) agentSession = null;
   $("session").value = agentSession || "";
+  } catch (error) { setStatus('Шлюз недоступен; повторите загрузку', true); }
 }
 
 async function openSession(id) {
+  try {
   agentSession = id || null;
   store.set("gw_agent_session", agentSession || "");
   clearLog(id ? "" : "Новая сессия агента: опишите задачу. Инструменты выполняются на сервере.");
@@ -311,16 +341,22 @@ async function openSession(id) {
     }
   }
   if (s.running) setStatus("в сессии идёт запрос (открыт в другой вкладке?)");
+  } catch (error) { setStatus('Шлюз недоступен; повторите загрузку', true); }
 }
 
 async function sendAgent(text) {
   const model = $("model").value;
   if (!agentSession) {
     if (!model) { setStatus("выберите модель", true); return; }
-    const resp = await fetch("/agent/sessions", { method: "POST", headers: headers(), body: JSON.stringify({ model }) });
-    if (!resp.ok) { setStatus(await apiError(resp), true); return; }
-    agentSession = (await resp.json()).id;
-    store.set("gw_agent_session", agentSession);
+    controller = new AbortController(); busy(true);
+    try {
+      const resp = await fetch("/agent/sessions", { method: "POST", headers: headers(), signal: controller.signal, body: JSON.stringify({ model }) });
+      if (!resp.ok) throw new Error(await apiError(resp));
+      agentSession = (await resp.json()).id;
+      store.set("gw_agent_session", agentSession);
+    } catch (error) {
+      controller = null; busy(false); setStatus('Не удалось создать сессию: ' + error.message, true); return;
+    }
   }
   const empty = document.querySelector(".empty"); if (empty) empty.remove();
   addMessage("user", text);
@@ -345,7 +381,7 @@ async function sendAgent(text) {
       case "done": {
         const meta = document.createElement("div"); meta.className = "meta";
         const secs = ((performance.now() - started) / 1000).toFixed(1);
-        const why = { stop: "", max_steps: " · лимит шагов", cancelled: " · отменено", error: " · ошибка", blocked: " · заблокировано" }[ev.reason] ?? "";
+        const why = { stop: "", max_steps: " · лимит шагов", cancelled: " · отменено", error: " · ошибка", blocked: " · заблокировано", budget: " · бюджет контекста" }[ev.reason] ?? "";
         meta.textContent = `${secs} с · токенов: ${prompt} → ${completion}${why}`;
         $("log").appendChild(meta); meta.scrollIntoView({ block: "end" }); break;
       }
@@ -355,19 +391,13 @@ async function sendAgent(text) {
     const resp = await fetch(`/agent/sessions/${agentSession}/messages`, {
       method: "POST", headers: headers(), signal: controller.signal, body: JSON.stringify({ content: text }) });
     if (!resp.ok) throw new Error(await apiError(resp));
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = "";
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      const blocks = buf.split("\n\n"); buf = blocks.pop();
-      for (const block of blocks) {
-        const data = block.split("\n").filter(l => l.startsWith("data:")).map(l => l.slice(5).trim()).join("");
-        if (data) { try { handle(JSON.parse(data)); } catch (e) { console.error(e); } }
-      }
+    let finished = false;
+    for await (const ev of readSSE(resp)) {
+      if (ev.stream_done) continue;
+      handle(ev);
+      if (ev.type === 'done') { finished = true; break; }
     }
+    if (!finished) throw new Error('Поток агента оборвался; история сохранена на сервере');
     setStatus("");
   } catch (e) {
     if (e.name === "AbortError") setStatus("остановлено");
@@ -413,7 +443,13 @@ $("new").addEventListener("click", () => {
 $("mode").addEventListener("change", () => { mode = $("mode").value; store.set("gw_mode", mode); applyMode(); });
 $("session").addEventListener("change", () => { controller?.abort(); openSession($("session").value); });
 $("token").addEventListener("change", () => {
-  store.set("gw_token", $("token").value.trim()); loadModels(); if (mode === "agent") loadSessions();
+  if ($('remember').checked) store.set('gw_token', $('token').value.trim());
+  loadModels(); if (mode === "agent") loadSessions();
+});
+$('remember').addEventListener('change', () => {
+  store.set('gw_remember', $('remember').checked ? 'yes' : 'no');
+  if ($('remember').checked) store.set('gw_token', $('token').value.trim());
+  else { try { localStorage.removeItem('gw_token'); } catch {} }
 });
 $("model").addEventListener("change", () => store.set("gw_model", $("model").value));
 $("system").addEventListener("change", () => store.set("gw_system", $("system").value));

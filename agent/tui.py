@@ -40,7 +40,7 @@ def install():
     source = assets()
     bun = bun_binary()
     if not bun:
-        raise ValueError('установите Bun >= 1.3.14: https://bun.sh; затем gwagent tui install')
+        raise ValueError('установите Bun >= 1.3.8: https://bun.sh; затем gwagent tui install')
     target = cache_path(source)
     target.mkdir(parents=True, exist_ok=True)
     shutil.copytree(source / 'src', target / 'src', dirs_exist_ok=True)
@@ -79,7 +79,7 @@ def dispatch(argv):
         target = installed(source)
         if not bun or not target:
             if args.tui:
-                raise ValueError('для OpenTUI нужны Bun >= 1.3.14 и gwagent tui install; доступен gwagent --plain')
+                raise ValueError('для OpenTUI нужны Bun >= 1.3.8 и gwagent tui install; доступен gwagent --plain')
             return None
         env = dict(os.environ, GWAGENT_PYTHON=sys.executable)
         parent = str(Path(__file__).resolve().parent.parent)

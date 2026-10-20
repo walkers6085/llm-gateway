@@ -115,3 +115,25 @@ def test_tags_validate_merge_and_display(tmp_path, capsys):
     with pytest.raises(ValueError):
         manager.update("pro", tags={"m1": [1]})
     assert main(["--file", str(path), "update", "pro", "--tag", "m3"]) == 2
+
+
+def test_connect_accepts_gateway_token_in_auth_prompt(tmp_path):
+    manager = ProviderManager(tmp_path / 'providers.json')
+    manager.connect('gateway', read=lambda _: 'gw-test-hidden-token',
+                    password=lambda _: pytest.fail('повторный ввод ключа не нужен'))
+    assert manager.connection('gateway').token == 'gw-test-hidden-token'
+    assert 'gw-test-hidden-token' not in manager.path.read_text()
+
+
+@pytest.mark.parametrize('stage', ['kind', 'token'])
+@pytest.mark.parametrize('error', [EOFError, KeyboardInterrupt])
+def test_connect_interrupted_input_preserves_credentials(tmp_path, stage, error):
+    manager = ProviderManager(tmp_path / 'providers.json')
+    manager.connect('gateway', read=lambda _: 'bearer', password=lambda _: 'old-test-token')
+    before = manager.credentials.path.read_bytes()
+    def interrupted(_):
+        raise error
+    with pytest.raises(ValueError, match='отменена'):
+        manager.connect('gateway', read=interrupted if stage == 'kind' else lambda _: 'bearer', password=interrupted)
+    assert manager.credentials.path.read_bytes() == before
+    assert manager.connection('gateway').token == 'old-test-token'

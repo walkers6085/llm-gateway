@@ -153,3 +153,5 @@ chat/completions. CLI: `add ... --tag MODEL=TAG1,TAG2` и `update NAME --tag MOD
 через chat/completions. Метка `free` соответствует их строкам в
 [официальном тарифе Z.AI](https://docs.z.ai/guides/overview/pricing);
 успешный HTTP-ответ сам по себе не доказывает бесплатность других моделей.
+
+Настройка из оболочки: `gwagent connect [имя]` (в том числе `--providers-file`, `--cwd`, `--settings`); внутри чата: `/connect [имя]`. На вопрос типа авторизации нажмите Enter для Bearer, затем введите ключ в скрытом поле. Если токен шлюза `gw-…` вставлен прямо в вопрос типа авторизации, он принимается как Bearer-ключ. EOF или Ctrl+C отменяют ввод без traceback и без замены сохранённых учётных данных.

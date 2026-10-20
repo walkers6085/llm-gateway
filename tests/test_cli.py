@@ -274,3 +274,24 @@ async def test_plan_mode_and_model_question_in_plain_cli(gw):
     assert 'Активный агент: plan' in calls[0]['messages'][0]['content']
     assert json.loads(next(m['content'] for m in SEEN[-1]['body']['messages'] if m['role'] == 'tool')) == {'answer': 'CSV'}
     store = SessionStore(db); assert store.list('local')[0].agent_mode == 'build'; store.close()
+
+
+async def test_connect_shell_command_and_eof(tmp_path):
+    path = tmp_path / 'providers.json'
+    out, err, read = run_cli(['gw-cli-test-token'])
+    code = await amain(['connect', 'gateway', '--providers-file', str(path), '--cwd', str(tmp_path)], read=read, out=out, err=err)
+    assert code == 0, err.getvalue()
+    from agent.providers import ProviderManager
+    assert ProviderManager(path).connection().token == 'gw-cli-test-token'
+    out, err, read = run_cli([])
+    code = await amain(['connect', '--providers-file', str(path), '--cwd', str(tmp_path)], read=read, out=out, err=err)
+    assert code == 2
+    assert 'отменена' in err.getvalue() and 'Traceback' not in err.getvalue()
+
+
+async def test_repl_connect_eof_does_not_crash(gw):
+    cfg, ws, _ = gw
+    out, err, read = run_cli(['/connect'])
+    code = await amain(['--cwd', str(ws), '--settings', str(cfg)], read=read, out=out, err=err)
+    assert code == 0
+    assert 'отменена' in err.getvalue()

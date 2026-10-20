@@ -527,6 +527,8 @@ class App:
                 self.configure_provider(name, read=self.read)
                 await self.switch_provider(name)
                 con.line('Учётные данные сохранены; подключение выбрано')
+            except (EOFError, KeyboardInterrupt):
+                con.line('Настройка подключения отменена', err=True)
             except (ValueError, OSError) as exc:
                 con.line(redact(str(exc)), err=True)
         elif cmd == '/revert':
@@ -715,7 +717,7 @@ def parse_args(argv):
 async def amain(argv=None, read=input, out=None, err=None) -> int:
     if argv is None:
         argv = sys.argv[1:]
-    if argv and argv[0] in ('trust', 'doctor', 'config'):
+    if argv and argv[0] in ('trust', 'doctor', 'config', 'connect'):
         return await utility(argv, read, out, err)
     args = parse_args(argv)
     console = Console(out, err, as_json=args.json)
@@ -772,11 +774,23 @@ async def utility(argv, read=input, out=None, err=None):
     parser.add_argument('--settings')
     parser.add_argument('--providers-file')
     parser.add_argument('--provider')
-    parser.add_argument('action', nargs='?', default='show')
+    parser.add_argument('action', nargs='?', default=None if argv[0] == 'connect' else 'show')
     args = parser.parse_args(argv[1:])
     workspace = Path(args.cwd).expanduser().resolve()
     console = Console(out, err)
     try:
+        if argv[0] == 'connect':
+            settings = load(workspace, extra=args.settings)
+            manager = ProviderManager(args.providers_file)
+            name = args.provider or args.action or manager.config['default']
+            if name not in manager.config['providers']:
+                manager.add(name, read('URL API (с /v1): ').strip(), model=read('Модель (Enter — выбрать позже): ').strip())
+            elif name == 'gateway' and not manager.path.exists():
+                manager.update(name, url=settings['gateway']['url'], model=settings['model'])
+            manager.connect(name, read=read)
+            manager.use(name)
+            console.line('Учётные данные сохранены; запуск чата: gwagent')
+            return 0
         if argv[0] == 'trust':
             stamp = None
             if not args.revoke:
@@ -813,6 +827,9 @@ async def utility(argv, read=input, out=None, err=None):
         for check in checks:
             console.line(('✓ ' if check['ok'] else '✗ ') + check['message'])
         return 0 if all(c['ok'] for c in checks) else 1
+    except (EOFError, KeyboardInterrupt):
+        console.line('Настройка отменена: ввод прерван', err=True)
+        return 1
     except (ValueError, OSError) as exc:
         console.line(redact(str(exc)), err=True)
         return 2

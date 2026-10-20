@@ -59,7 +59,7 @@ def dispatch(argv):
             if argv[1:] != ['install']:
                 raise ValueError('использование: gwagent tui install')
             return install()
-        if argv and argv[0] in ('trust', 'doctor', 'config'):
+        if argv and argv[0] in ('trust', 'doctor', 'config', 'connect'):
             return None
         from .cli import parse_args
         args = parse_args(argv)

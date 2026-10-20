@@ -180,13 +180,22 @@ class ProviderManager:
         self.save()
 
     def connect(self, name, read=input, password=getpass.getpass):
+        try:
+            return self._connect(name, read, password)
+        except (EOFError, KeyboardInterrupt):
+            raise ValueError('Настройка подключения отменена; учётные данные не изменены') from None
+
+    def _connect(self, name, read, password):
         self.get(name)
-        kind = read('Авторизация [bearer/basic/none]: ').strip() or 'bearer'
+        kind = read('Тип авторизации [bearer/basic/none] (Enter — bearer, затем скрытый ввод ключа): ').strip() or 'bearer'
+        pasted_token = kind if kind.startswith('gw-') else ''
+        if pasted_token:
+            kind = 'bearer'
         if kind not in ('bearer', 'basic', 'none'):
-            raise ValueError('ожидается bearer/basic/none')
+            raise ValueError('Выберите bearer (API-ключ), basic (логин и пароль) или none; для ключа нажмите Enter, затем введите его в скрытом поле')
         secret = {'type': kind, 'endpoint_hash': hashlib.sha256(self.get(name)['url'].rstrip('/').encode()).hexdigest()}
         if kind == 'bearer':
-            secret['token'] = password('API-ключ: ')
+            secret['token'] = pasted_token or password('API-ключ / токен gw-… (ввод скрыт): ')
             if not secret['token']:
                 raise ValueError('пустой ключ')
         elif kind == 'basic':

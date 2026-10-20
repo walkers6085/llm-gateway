@@ -167,8 +167,8 @@ class Bridge:
             if '[bearer/basic/none/mtls]' in prompt:
                 event['choices'].insert(1, {'value': 'mtls', 'label': 'Клиентский сертификат', 'description': 'mTLS: сертификат PEM и приватный ключ'})
         elif not question_id and not secret and '[y/N]' in prompt:
-            event['choices'] = [{'value': 'n', 'label': 'Отмена'},
-                                {'value': 'y', 'label': 'Удалить подключение и ключи' if 'подключение' in prompt else 'Удалить историю', 'danger': True}]
+            event['choices'] = [{'value': 'n', 'label': 'Только новые' if prompt.startswith('Объединить') else 'Отмена'},
+                                {'value': 'y', 'label': 'Импортировать' if prompt.startswith('Импортировать') else 'Объединить' if prompt.startswith('Объединить') else 'Удалить подключение и ключи' if 'подключение' in prompt else 'Удалить историю', 'danger': True}]
         self.emit(event)
         try:
             return await future
@@ -261,8 +261,10 @@ class Bridge:
             rows = [[c['label'], c['model'], 'включён' if c['enabled'] else 'отключён'] for c in choices]
             self.offered_providers = {c['provider'] for c in choices if c['enabled']}
             self.selection_sessions['provider'] = app.session.id
+            choices.extend([{'label': 'Импорт из OpenCode', 'command': '/provider import', 'group': 'Обмен настройками'}, {'label': 'Экспорт в OpenCode', 'command': '/provider export', 'group': 'Обмен настройками'}])
             choices.append({'label': 'Добавить провайдера', 'command': '/provider add', 'description': 'Имя → URL → ключ или сертификат', 'group': 'Управление'})
             for name, provider in app.providers.config['providers'].items():
+                choices.append({'label': f'Параметры моделей {name}', 'command': f'/provider model {name}', 'description': 'Имена, лимиты контекста и параметры генерации', 'group': 'Управление'})
                 choices.append({'label': f'Изменить {name}', 'command': f'/provider edit {name}', 'description': provider['url'], 'group': 'Управление'})
                 action = 'disable' if provider.get('enabled', True) else 'enable'
                 if action == 'enable' or name not in (app.provider, app.providers.config['default']):
@@ -420,6 +422,25 @@ class Bridge:
                     await self.app.switch_provider(name)
                     self.snapshot(history=True)
                     self.emit({'type': 'notice', 'message': 'Учётные данные сохранены; подключение выбрано'})
+                elif cmd == '/provider' and arg in ('import', 'export'):
+                    def read(prompt):
+                        return asyncio.run_coroutine_threadsafe(self.dialog(prompt), self.loop).result()
+                    if arg == 'import':
+                        if await asyncio.to_thread(self.app.import_providers, read=read):
+                            await self.app.switch_provider(self.app.providers.config['default'])
+                            self.emit({'type': 'notice', 'message': 'Провайдеры импортированы'})
+                    else:
+                        await asyncio.to_thread(self.app.export_providers, read=read)
+                    self.snapshot(history=arg == 'import')
+                elif cmd == '/provider' and len(provider_fields) in (2, 3) and provider_fields[0] == 'model':
+                    def read(prompt):
+                        return asyncio.run_coroutine_threadsafe(self.dialog(prompt), self.loop).result()
+                    name = provider_fields[1]
+                    await asyncio.to_thread(self.app.providers.configure_model, name, provider_fields[2] if len(provider_fields) == 3 else None, read=read)
+                    if self.app.provider == name:
+                        self.app.apply_model_profiles(name);self.app.rebuild()
+                    self.snapshot()
+                    self.emit({'type': 'notice', 'message': 'Параметры модели сохранены'})
                 elif cmd == '/provider' and len(provider_fields) == 2 and provider_fields[0] in ('enable', 'disable', 'remove'):
                     def read(prompt):
                         return asyncio.run_coroutine_threadsafe(self.dialog(prompt), self.loop).result()

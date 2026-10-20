@@ -645,3 +645,36 @@ async def test_provider_wizard_edit_manage_and_cancel_are_interactive(gw, tmp_pa
         assert any(e['type'] == 'error' and 'Сначала выберите' in e['message'] for e in events)
     finally:
         await stop(proc)
+
+
+async def test_opencode_import_model_settings_and_export_dialogs(gw,tmp_path):
+    source=tmp_path/'input.json';source.write_text(json.dumps({'model':'custom/chat','provider':{'custom':{
+        'options':{'baseURL':'https://example.test/v1','apiKey':'ui-import-hidden-key'},'models':{'chat':{}}}}}))
+    proc=await launch(gw,tmp_path)
+    try:
+        await receive(proc,'ready')
+        send(proc,type='submit',text='/provider import')
+        for value in (str(source),'n','y'):
+            request,_=await receive(proc,'input_request')
+            send(proc,type='answer',id=request['id'],value=value)
+        _,events=await receive(proc,'idle')
+        assert not any(e['type']=='error' for e in events),events
+        assert next(e['provider'] for e in events if e['type']=='snapshot')=='custom'
+        assert 'ui-import-hidden-key' not in json.dumps(events)
+        send(proc,type='submit',text='/provider model custom chat')
+        for value in ('Понятное имя','8192','256','.4','.8','low'):
+            request,_=await receive(proc,'input_request')
+            send(proc,type='answer',id=request['id'],value=value)
+        _,events=await receive(proc,'idle')
+        assert not any(e['type']=='error' for e in events),events
+        assert next(e['context']['max_input_tokens'] for e in events if e['type']=='snapshot')==8192
+        output=tmp_path/'output.json'
+        send(proc,type='submit',text='/provider export')
+        request,_=await receive(proc,'input_request');send(proc,type='answer',id=request['id'],value='custom')
+        request,_=await receive(proc,'input_request');send(proc,type='answer',id=request['id'],value=str(output))
+        _,events=await receive(proc,'idle')
+        assert not any(e['type']=='error' for e in events),events
+        assert 'ui-import-hidden-key' not in output.read_text()
+        exported=json.loads(output.read_text())['provider']['custom']['models']['chat']
+        assert exported['name']=='Понятное имя' and exported['limit']['context']==8448
+    finally:await stop(proc)

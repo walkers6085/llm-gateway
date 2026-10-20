@@ -59,3 +59,9 @@ assistant, включая историю для следующего запро�
 блок рассуждений не появляется. Содержимое ответов не записывается в журнал метаданных.
 Из текущего контекста `agent/tracing.py` передаются `X-Request-ID`, `X-Span-ID`, `X-Parent-Span-ID`.
 Каждый вызов модели имеет свой span; root request остаётся общим для дочерних задач.
+
+
+Параметры профиля temperature_value, top_p, reasoning_effort попадают в реальное тело
+chat/completions; api_model заменяет ID на стороне API, сохраняя локальное имя сессии.
+Ключевые model/messages/stream нельзя заменить произвольным JSON. Модельные лимиты ответа
+применяются через штатный max_tokens/max_completion_tokens. [Обмен OpenCode](opencode.md).

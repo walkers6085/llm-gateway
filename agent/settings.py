@@ -106,11 +106,18 @@ MCP_SERVER["required"] = ["type"]
 HOOK = _obj({"matcher": STR, "command": {"type": "string", "minLength": 1}, "timeout": POS})
 HOOK["required"] = ["command"]
 
-MODEL_PROFILE = _obj({
-    "max_input_tokens": POS, "max_output_tokens": POS, "max_turn_tokens": POS,
-    "options": _obj({"tools": BOOL, "stream": BOOL, "usage": BOOL, "temperature": BOOL,
-                     "max_tokens_field": {"enum": ["max_tokens", "max_completion_tokens"]}}),
+MODEL_OPTIONS = _obj({
+    'tools': BOOL, 'stream': BOOL, 'usage': BOOL, 'temperature': BOOL,
+    'max_tokens_field': {'enum': ['max_tokens', 'max_completion_tokens']},
+    'api_model': STR, 'temperature_value': {'type': 'number', 'minimum': 0, 'maximum': 2},
+    'top_p': {'type': 'number', 'minimum': 0, 'maximum': 1},
+    'reasoning_effort': {'type': 'string', 'enum': ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']},
 })
+MODEL_PROFILE = _obj({
+    'max_input_tokens': POS, 'max_output_tokens': POS, 'max_turn_tokens': POS,
+    'options': MODEL_OPTIONS,
+})
+
 
 SCHEMA = _obj({
     "model": STR,

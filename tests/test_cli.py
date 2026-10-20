@@ -296,3 +296,21 @@ async def test_repl_connect_eof_does_not_crash(gw):
     code = await amain(['--cwd', str(ws), '--settings', str(cfg)], read=read, out=out, err=err)
     assert code == 0
     assert 'отменена' in err.getvalue()
+
+
+async def test_provider_model_profiles_apply_to_requests_without_leaking_between_providers(gw, tmp_path):
+    cfg, ws, _ = gw
+    url = json.loads(cfg.read_text())['gateway']['url']
+    providers = {name: {'url':url,'token_env':'GW_TOKEN','model':'','models':['alpha']} for name in ('first','second')}
+    providers['first']['model_profiles'] = {'alias':{'max_input_tokens':32768,'max_output_tokens':128,
+        'options':{'api_model':'alpha','temperature_value':.25,'top_p':.9,'reasoning_effort':'low'}}}
+    registry = tmp_path/'providers.json';registry.write_text(json.dumps({'default':'first','selected':True,'providers':providers}))
+    SCRIPT.extend([{'content':'Первый ответ'},{'content':'Второй ответ'}])
+    out, err, read = run_cli(['/model alias','Первый запрос','/provider second','/model alpha','Второй запрос'])
+    assert await amain(['--cwd',str(ws),'--settings',str(cfg),'--providers-file',str(registry)],read=read,out=out,err=err) == 0
+    requests = [entry['body'] for entry in SEEN if entry['path']=='chat']
+    assert len(requests)==2
+    assert requests[0]['model']=='alpha' and requests[0]['temperature']==.25 and requests[0]['max_tokens']==128
+    assert requests[0]['top_p']==.9 and requests[0]['reasoning_effort']=='low'
+    assert requests[1]['model']=='alpha' and 'top_p' not in requests[1] and 'reasoning_effort' not in requests[1]
+    assert 'temperature' not in requests[1]

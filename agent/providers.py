@@ -20,6 +20,7 @@ import httpx
 
 from .credentials import Credentials, protect, redact, register
 from .schema import validate
+from .settings import MODEL_PROFILE
 from .data import location
 from .storage import digest, file_lock, write_json
 
@@ -37,7 +38,9 @@ PROVIDER_SCHEMA = {'type': 'object', 'required': ['url', 'token_env', 'model', '
     'properties': {'url': STR, 'token_env': STR, 'model': STR, 'id': STR,
                    'enabled': {'type': 'boolean'}, 'auth': {'type': 'string', 'enum': ['none', 'env', 'stored']},
                    'models': {'type': 'array', 'items': {'type': 'string', 'minLength': 1}},
-                   'tags': TAGS,
+                   'tags': TAGS, 'name': STR,
+                   'model_names': {'type': 'object', 'additionalProperties': STR},
+                   'model_profiles': {'type': 'object', 'additionalProperties': MODEL_PROFILE},
                    'options': {'type': 'object', 'properties': {
                        'tools': {'type': 'boolean'}, 'stream': {'type': 'boolean'},
                        'usage': {'type': 'boolean'}, 'temperature': {'type': 'boolean'},
@@ -260,24 +263,70 @@ class ProviderManager:
             self.config = previous
 
     def _save_connection(self, candidate, name, secret):
-        self._validate_candidate(candidate)
         identity = candidate['providers'][name].get('id') or 'legacy:' + name
+        self.save_connections(candidate, {identity: secret})
+
+    def save_connections(self, candidate, secrets):
+        self._validate_candidate(candidate)
         with file_lock(self.path):
             if digest(self.path) != self._revision:
                 raise ValueError('Реестр изменился во время ввода; откройте настройку заново')
-            old_secret = self.credentials.get(identity)
-            self.credentials.set(identity, secret)
-            try:
-                write_json(self.path, candidate)
-            except Exception:
-                if old_secret:
-                    self.credentials.set(identity, old_secret)
-                else:
-                    self.credentials.delete(identity)
-                raise
+            with file_lock(self.credentials.path):
+                existed = self.credentials.path.exists()
+                previous = self.credentials.read()
+                try:
+                    if secrets:
+                        write_json(self.credentials.path, {**previous, **secrets})
+                        self.credentials.read()
+                    write_json(self.path, candidate)
+                except Exception:
+                    if secrets:
+                        if existed:
+                            write_json(self.credentials.path, previous)
+                        else:
+                            self.credentials.path.unlink(missing_ok=True)
+                    raise
             self.config = candidate
             self._revision = digest(self.path)
             self._saved = copy.deepcopy(candidate)
+
+    def configure_model(self, name, model=None, read=input):
+        self.get(name)
+        try:
+            model = model or read('ID модели (как в API): ').strip()
+            if not model or len(model) > 500:
+                raise ValueError('Нужен ID модели до 500 символов')
+            provider = copy.deepcopy(self.get(name))
+            profile = copy.deepcopy(provider.get('model_profiles', {}).get(model, {}))
+            label = provider.get('model_names', {}).get(model, model)
+            display = read(f'Название модели (Enter — {label}): ').strip() or label
+            for key, label in (('max_input_tokens', 'Лимит входного контекста'), ('max_output_tokens', 'Максимум токенов ответа')):
+                value = read(f'{label} (Enter — {profile.get(key, "наследовать")}, - — наследовать): ').strip()
+                if value == '-':
+                    profile.pop(key, None)
+                elif value:
+                    try:profile[key] = int(value)
+                    except ValueError:raise ValueError(label + ': нужно целое число') from None
+            options = profile.setdefault('options', {})
+            for key, label, convert in (('temperature_value', 'Температура 0–2', float), ('top_p', 'Top-p 0–1', float),
+                                         ('reasoning_effort', 'Усилие reasoning: none/minimal/low/medium/high/xhigh', str)):
+                value = read(f'{label} (Enter — {options.get(key, "наследовать")}, - — наследовать): ').strip()
+                if value == '-':
+                    options.pop(key, None)
+                elif value:
+                    try:options[key] = convert(value)
+                    except ValueError:raise ValueError(label + ': неверное числовое значение') from None
+            provider.setdefault('model_profiles', {})[model] = profile
+            provider.setdefault('model_names', {})[model] = display
+            provider['models'] = list(dict.fromkeys([*provider['models'], model]))
+            candidate = copy.deepcopy(self.config);candidate['providers'][name] = provider
+            self._validate_candidate(candidate)
+            self.config = candidate
+            self.save()
+            return model
+        except (EOFError, KeyboardInterrupt):
+            raise ValueError('Настройка модели отменена; изменения не сохранены') from None
+
 
     def connect(self, name, read=input, password=getpass.getpass):
         try:
@@ -361,10 +410,30 @@ def main(argv=None):
         p = sub.add_parser(command)
         p.add_argument('name', nargs='?' if command == 'models' else None)
         if command == 'use': p.add_argument('--model')
+    command = sub.add_parser('import-opencode')
+    command.add_argument('source')
+    command.add_argument('--replace', action='store_true', help='объединить существующие провайдеры')
+    command.add_argument('--apply', action='store_true', help='сохранить после проверки; без флага только проверка')
+    command = sub.add_parser('export-opencode')
+    command.add_argument('output')
+    command.add_argument('--provider', action='append', help='выбрать провайдера (можно повторять)')
+    command = sub.add_parser('model-config')
+    command.add_argument('name');command.add_argument('model', nargs='?')
     args = parser.parse_args(argv)
     try:
         manager = ProviderManager(args.file)
-        if args.command == 'list':
+        if args.command == 'import-opencode':
+            from .opencode import import_config
+            names = import_config(manager,args.source,replace=args.replace,dry_run=not args.apply)
+            print(('Импортировано: ' if args.apply else 'Проверка успешна; для записи добавьте --apply: ')+', '.join(names))
+        elif args.command == 'export-opencode':
+            from .opencode import export_config
+            variables = export_config(manager,args.output,providers=args.provider)
+            print('Экспорт создан без секретов'+('; задайте переменные: '+', '.join(variables) if variables else ''))
+        elif args.command == 'model-config':
+            manager.configure_model(args.name,args.model)
+            print('Параметры модели сохранены')
+        elif args.command == 'list':
             for name, p in manager.config['providers'].items():
                 mark = '*' if name == manager.config['default'] and manager.selected else ' '
                 print(f"{mark} {name}: {p['url']} · {p['model'] or '(без модели)'} · "

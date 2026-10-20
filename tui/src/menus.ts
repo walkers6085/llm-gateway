@@ -22,9 +22,9 @@ export function createPicker(event:any,draft:string):PickerState{
     if(kind==='provider'&&item.command)return {key:item.command,command:item.command,name:item.label,label:item.label+' '+(item.description||''),description:item.description,group:item.group||'Управление'};
     if(kind==='model'){
       const tags=(item.tags||[]).map(String);
-      return {key:JSON.stringify([item.provider,item.model]),provider:item.provider,model:item.model,name:item.model,group:item.provider_name,
-        label:`${item.provider_name} / ${item.model} ${tags.join(' ')} ${item.available?'':'API недоступен'}`,
-        description:item.available?'': 'Из конфига · API недоступен',badges:[...tags.map(badgeForTag),...(item.available?[]:[{text:'API недоступен',tone:'warning' as const}])]};
+      return {key:JSON.stringify([item.provider,item.model]),provider:item.provider,model:item.model,name:item.display_name||item.model,group:item.provider_name,
+        label:`${item.provider_name} / ${item.display_name||""} ${item.model} ${tags.join(' ')} ${item.available?'':'API недоступен'}`,
+        description:(item.display_name&&item.display_name!==item.model?item.model+' · ':'')+(item.available?'': 'Из конфига · API недоступен'),badges:[...tags.map(badgeForTag),...(item.available?[]:[{text:'API недоступен',tone:'warning' as const}])]};
     }
     if(kind==='provider')return {key:JSON.stringify([item.provider]),provider:item.provider,name:item.label,label:`${item.label} / ${item.model||''}`,
       description:item.model?'Модель: '+item.model:'Модель не выбрана',group:'Подключения',disabled:item.enabled===false,badges:[]};

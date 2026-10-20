@@ -84,7 +84,7 @@ class LLMClient:
                      temperature: float | None = None) -> AsyncIterator[dict]:
         """События: {"type": "text", "text"} … и в конце {"type": "message", "message", "usage", "finish_reason"}."""
         streaming = self.options.get('stream', True)
-        body: dict = {"model": model, "messages": messages, "stream": streaming,
+        body: dict = {"model": self.options.get("api_model") or model, "messages": messages, "stream": streaming,
                       self.options.get('max_tokens_field', 'max_tokens'): self.max_tokens}
         if streaming and self.options.get('usage', True):
             body['stream_options'] = {'include_usage': True}
@@ -92,6 +92,10 @@ class LLMClient:
             raise LLMError(400, 'модель не поддерживает инструменты; отключите tools.enabled')
         if tools:
             body["tools"] = tools
+        temperature = self.options.get('temperature_value', temperature)
+        for key in ('top_p', 'reasoning_effort'):
+            if key in self.options:
+                body[key] = self.options[key]
         if temperature is not None and self.options.get("temperature", True):
             body["temperature"] = temperature
         trace = current.get()

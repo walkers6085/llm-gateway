@@ -9,6 +9,7 @@
 
 import argparse
 import asyncio
+import copy
 import json
 import getpass
 import os
@@ -32,6 +33,9 @@ from .store import Session, SessionStore, task_title
 
 OWNER = "local"
 COMMANDS = [
+    {'command': '/provider import', 'description': 'Импортировать провайдеров из OpenCode', 'arguments': 'none'},
+    {'command': '/provider export', 'description': 'Экспортировать провайдеров в OpenCode без секретов', 'arguments': 'none'},
+    {'command': '/provider model', 'description': 'Настроить модель, контекст и параметры генерации', 'arguments': 'required', 'usage': '/provider model NAME [MODEL]'},
     {'command': '/data', 'description': 'Показать каталог настроек и данных', 'arguments': 'none'},
     {'command': '/mode', 'description': 'Выбрать агента build или plan', 'arguments': 'optional', 'usage': '/mode [build|plan]'},
     {'command': '/revert', 'description': 'Изменить прошлое сообщение или откатить файлы', 'arguments': 'none'},
@@ -60,6 +64,8 @@ COMMANDS = [
 ]
 HELP = """Команды:
   /data              показать единый каталог данных
+  /provider model NAME [MODEL]  параметры модели и лимиты
+  /provider import|export  обмен настройками OpenCode
   /mode [build|plan]  показать или сменить активного агента
   /revert            выбрать прошлое сообщение и режим отката
   /agent задача      запустить отдельного сабагента
@@ -167,6 +173,7 @@ class App:
         self.providers = ProviderManager(args.providers_file)
         self.store = SessionStore(expand(settings["sessions"]["db"]))
         self.provider = None
+        self.base_profiles = copy.deepcopy(settings["model_profiles"])
         self.base_model = settings["model"]
         self.connection = None
 
@@ -189,6 +196,12 @@ class App:
         self.http = self.llm = None
         self.provider, self.connection = name, connection
         self.settings['model'] = connection.model
+        self.apply_model_profiles(name)
+
+    def apply_model_profiles(self, name):
+        from .settings import merge
+        profiles = self.providers.get(name).get('model_profiles', {}) if name is not None else {}
+        self.settings['model_profiles'] = merge(self.base_profiles, profiles)
 
     async def model_client(self):
         if self.llm is None:
@@ -202,7 +215,7 @@ class App:
         self.console.line(f"Провайдер: {name}; модель: {self.session.model or '(не выбрана)'}; новая сессия {self.session.id}")
 
     def provider_choices(self):
-        choices = [{'provider': name, 'label': name, 'model': self.session.model if name == self.provider and self.session else config['model'],
+        choices = [{'provider': name, 'label': name + (' · ' + config['name'] if config.get('name') else ''), 'model': self.session.model if name == self.provider and self.session else config['model'],
                     'enabled': config.get('enabled', True)}
                    for name, config in self.providers.config['providers'].items()]
         gw = self.settings['gateway']
@@ -230,8 +243,9 @@ class App:
             except (ValueError, OSError, SettingsError, LLMError, httpx.HTTPError, httpx.InvalidURL, TimeoutError) as exc:
                 error = redact(str(exc)) or type(exc).__name__
                 models = [*config.get('models', []), config['model']]
-            models = [*models, *(m for m in tags if m)]
+            models = [*models, *config.get('models', []), *config.get('model_profiles', {}), *config.get('model_names', {}), *(m for m in tags if m)]
             entries = [{'provider': name, 'provider_name': choice['label'], 'model': model,
+                        'display_name': config.get('model_names', {}).get(model, model),
                         'available': error is None, 'tags': sorted(tags.get(model, []))}
                        for model in dict.fromkeys(models) if model]
             return entries, ({'provider': choice['label'], 'message': error} if error else None)
@@ -254,6 +268,23 @@ class App:
         return self.providers.configure(name, read=read, password=password,
             default_url=self.settings['gateway']['url'] if name == 'gateway' and not self.providers.path.exists() else None,
             default_model=self.base_model if name == 'gateway' else '')
+
+    def import_providers(self, read=input):
+        from .opencode import prepare
+        path = read('Путь к opencode.json или opencode.jsonc: ').strip()
+        replace = read('Объединить совпадающие провайдеры? [y/N]: ').strip().lower() in ('y', 'да')
+        candidate, secrets, names = prepare(self.providers, path, replace=replace)
+        if read('Импортировать проверенные подключения ' + ', '.join(names) + '? [y/N]: ').strip().lower() not in ('y', 'да'):
+            return False
+        self.providers.save_connections(candidate, secrets)
+        return True
+
+    def export_providers(self, read=input):
+        from .opencode import export_config
+        name = read('Провайдер для экспорта (Enter — все): ').strip()
+        path = read('Путь нового файла экспорта OpenCode: ').strip()
+        variables = export_config(self.providers, path, providers=[name] if name else None)
+        self.console.line('Экспорт создан без секретов' + ('; задайте переменные: ' + ', '.join(variables) if variables else ''))
 
     def manage_provider(self, action, name, read=input):
         if action != 'enable' and (name == self.provider or name == self.providers.config['default']):
@@ -305,6 +336,7 @@ class App:
         self.connection = connection
         self.provider = name
         self.settings["model"] = model
+        self.apply_model_profiles(name)
 
     async def activate_session(self, session, enforce_explicit=False):
         if Path(session.workspace).resolve() != self.workspace:
@@ -647,6 +679,27 @@ class App:
                 con.line(f"Текущий провайдер: {self.provider or '(gateway из настроек)'}")
                 for name, provider in self.providers.config["providers"].items():
                     con.line(f"  {name}: {provider['url']} · {provider['model'] or '(без модели)'}")
+            elif arg in ('import', 'export'):
+                try:
+                    if arg == 'import':
+                        if self.import_providers(read=self.read):
+                            await self.switch_provider(self.providers.config['default'])
+                            con.line('Провайдеры импортированы')
+                    else:
+                        self.export_providers(read=self.read)
+                except (EOFError, KeyboardInterrupt):
+                    con.line('Операция отменена', err=True)
+                except (ValueError, OSError) as exc:
+                    con.line(redact(str(exc)), err=True)
+            elif arg.startswith('model '):
+                fields = arg.split(maxsplit=2)
+                try:
+                    self.providers.configure_model(fields[1], fields[2] if len(fields) == 3 else None, read=self.read)
+                    if self.provider == fields[1]:
+                        self.apply_model_profiles(self.provider);self.rebuild()
+                    con.line('Параметры модели сохранены')
+                except (ValueError, OSError) as exc:
+                    con.line(redact(str(exc)), err=True)
             elif arg == 'add' or (arg.startswith(('add ', 'edit ')) and len(arg.split()) == 2):
                 fields = arg.split()
                 name = fields[1] if len(fields) == 2 else None

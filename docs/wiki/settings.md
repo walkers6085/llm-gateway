@@ -185,3 +185,13 @@ max_turn_tokens ограничивает суммарный расход: сжа
 глобальный settings.json не проверяется повторно как проектный конфиг: это один и тот же файл.
 Проектный `.gwagent/settings.json` по-прежнему необязателен и требует доверия, если отличается
 от глобального файла. Подробнее: [единое хранилище](data.md).
+
+
+Профиль модели поддерживает options.api_model (реальный ID в API), options.temperature_value
+(0–2), options.top_p (0–1), options.reasoning_effort (none/minimal/low/medium/high/xhigh).
+Флаги tools, stream, usage, temperature и max_tokens_field сохраняются. Профили в
+providers.NAME.model_profiles накладываются на общие model_profiles при выборе провайдера;
+переключение провайдера сбрасывает его переопределения к исходным настройкам.
+Пошаговая настройка через `/provider model NAME [MODEL]`; Enter сохраняет значение,
+`-` у числовых параметров и effort возвращает наследование. Неподдерживаемые значения
+отклоняются до записи. [Импорт/экспорт OpenCode](opencode.md).

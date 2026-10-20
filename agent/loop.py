@@ -61,6 +61,9 @@ class Agent:
         return self.active_mode or self.session.agent_mode
 
     def tool_specs(self):
+        profile = self.settings.get('model_profiles', {}).get(self.model, {})
+        if profile.get('options', {}).get('tools', getattr(self.llm, 'base_options', {}).get('tools', self.settings.get('model_options', {}).get('tools', True))) is False:
+            return []
         return [tool.spec() for tool in self.registry.tools.values() if self.mode != 'plan' or tool.plan_safe]
 
     async def _question(self, request):

@@ -18,6 +18,7 @@ from .hooks import Hooks
 from .credentials import sanitize, redact
 from .llm import LLMClient, LLMError
 from .retry import delay_for
+from .loop_guard import LoopGuard
 from .context import clean_messages
 from .compaction import compact, manual_compact
 from .model_limits import resolve, estimate_tokens
@@ -59,6 +60,8 @@ class Agent:
         self.model_metadata = getattr(llm, "model_metadata", {})
         self.context_limit = None
         self.last_compaction = {'method': 'unchanged'}
+        self.loop_guard = LoopGuard(self.settings.get('loop_guard'))
+        self.step_state = None
         self.session_context: str | None = None  # additional_context хуков SessionStart
 
     @property
@@ -127,12 +130,12 @@ class Agent:
                          'В Plan сначала делегируй самостоятельные направления исследования, затем сверь факты и при существенных рисках запроси reviewer перед финальным планом. '
                          'В Build используй explorer для изучения зависимостей и reviewer после значимых изменений, worker — для отдельной задачи реализации, если права разрешают. '
                          'Включай роли и ожидаемые результаты в план. Передавай подзадаче цель, пути и нужные факты в task/context. '
-                         'Проверяй выводы сабагента, учитывай max_calls и остаток шагов; для простого ответа делегация не нужна. '
+                         'Проверяй выводы сабагента, учитывай max_calls и таймаут подзадачи; для простого ответа делегация не нужна. '
                          'Сабагенты работают последовательно, поэтому дели независимые направления без обещания параллельного исполнения. Факты из отчётов не подменяют пользовательские ограничения.')
             config = self.settings.get('subagents', {})
             trace = current.get()
             remaining = max(0, config.get('max_calls', 3) - (trace.budget['children'] if trace else 0))
-            parts.append(f"Осталось делегаций на текущий запрос: {remaining}. Лимит ребёнка: {config.get('max_steps', 8)} шагов и {config.get('timeout', 120)} с. "
+            parts.append(f"Осталось делегаций на текущий запрос: {remaining}. Блок ребёнка: {min(self.settings.get('max_steps', 25), config.get('max_steps', 8))} шагов; таймаут {config.get('timeout', 120)} с. "
                          'При нулевом остатке выполняй доступные проверки самостоятельно, не обещай дополнительное ревью сабагентом.')
         if self.output_unlimited():
             parts.append('Длина ответа технически не ограничена, но держи её в рамках задачи: '
@@ -158,6 +161,8 @@ class Agent:
         return result, [{"type": "warning", "message": w} for w in result.warnings]
 
     async def run(self, text: str, *, request_id=None, delegate=False) -> AsyncIterator[dict]:
+        self.loop_guard.reset()
+        self.step_state = None
         self.active_mode = self.session.agent_mode
         turn = self.store.begin_turn(self.session.id)
         parent = current.get()
@@ -190,6 +195,7 @@ class Agent:
                 current.reset(token)
                 self.active_mode = None
                 self.running_request_id = None
+                self.step_state = None
 
     def _checkpoint(self, request_id, *, before):
         excluded = [self.store.path + suffix for suffix in ('', '-wal', '-shm')]
@@ -375,6 +381,7 @@ class Agent:
                 self.segment_id = item['id']
                 self._checkpoint(self.segment_id, before=True)
             self.input_id = item['id']
+            self.loop_guard.reset()
             text = item['text'] + ('\n\n<context>\n' + hook.context + '\n</context>' if hook.context else '')
             self._save({'role': 'user', 'content': text}, user_input=item['text'], steering={**item, 'recovered': recovered})
             record(self.store, 'input.applied', input_id=item['id'], source_request_id=item['request_id'], recovered=recovered)
@@ -429,7 +436,14 @@ class Agent:
             self.llm.options = {**self.llm.base_options, **limits.get('options', {})}
         effective_input_limit = limits['max_input_tokens']
         self.context_limit = effective_input_limit
-        for _step in range(max_steps):
+        total_steps = 0
+        while True:
+            extended = total_steps > 0 and total_steps % max_steps == 0
+            if extended:
+                if not self.loop_guard.config['enabled']:
+                    yield {"type": "error", "message": f"Достигнут лимит шагов ({max_steps})"}
+                    yield {"type": "done", "reason": "max_steps"}
+                    return
             async for event in self._drain_inputs():
                 yield event
             reserve = limits['max_output_tokens']
@@ -461,6 +475,13 @@ class Agent:
                 streamed = False
                 partial_bytes = 0
                 message, usage, metrics = None, (0, 0), None
+                if retries == 0 and not overflow_retried:
+                    total_steps += 1
+                    self.step_state = {'current': (total_steps - 1) % max_steps + 1,
+                                       'limit': max_steps, 'total': total_steps, 'extended': extended}
+                    if extended:
+                        record(self.store, 'loop_guard.extended', total=total_steps - 1, limit=max_steps)
+                    yield {"type": "step", **self.step_state}
                 try:
                     async for ev in self._model_events(messages, tools):
                         if ev["type"] in ("text", "reasoning"):
@@ -537,7 +558,11 @@ class Agent:
 
             done_ids: set[str] = set()
             try:
+                self.loop_guard.action = None
                 for call in calls:
+                    if self.loop_guard.action:
+                        yield self._skip_loop_call(call)
+                        continue
                     pending = self.store.pending_inputs(self.session.id)
                     if pending:
                         content = 'Не выполнено: поступило уточнение пользователя; пересмотри действие с учётом нового запроса'
@@ -555,9 +580,20 @@ class Agent:
             except asyncio.CancelledError:
                 self.store.repair_calls(self.session.id, CANCELLED)
                 raise
+            if self.loop_guard.action == 'stopped':
+                yield {"type": "error", "message": "Запрос остановлен: повторное зацикливание после попытки сменить подход. Сессия сохранена; уточните задачу, чтобы продолжить"}
+                yield {"type": "done", "reason": "loop_detected"}
+                return
 
-        yield {"type": "error", "message": f"Достигнут лимит шагов ({max_steps})"}
-        yield {"type": "done", "reason": "max_steps"}
+    def _skip_loop_call(self, call):
+        name = call.get('function', {}).get('name', '')
+        content = 'Не выполнено: обнаружено зацикливание; пересмотри подход с учётом предыдущего результата'
+        self._save({'role': 'tool', 'tool_call_id': call['id'], 'content': content})
+        record(self.store, 'tool.skipped', call_id=call['id'], tool=name, decision='loop_guard:skip')
+        self.store.record_tool(self.session.id, call['id'], name, {}, 'loop_guard:skip', False, 0,
+                               request_id=current.get().request_id, span_id=current.get().span_id)
+        return {"type": "tool_result", "id": call['id'], "name": name, "ok": False,
+                "content": content, "decision": "loop_guard:skip", "ms": 0}
 
     async def _execute(self, call):
         parent = current.get()
@@ -641,7 +677,7 @@ class Agent:
         fn = call.get("function") or {}
         name, call_id = fn.get("name", ""), call["id"]
         started = time.monotonic()
-        decision, args = "error", {}
+        decision, args, tool = "error", {}, None
         try:
             args = parse_arguments(fn.get("arguments"))
             tool = self.registry.get(name)
@@ -722,6 +758,16 @@ class Agent:
                 result.content += f"\n\n<context>\n{hook.context}\n</context>"
 
         content = truncate(redact(result.content), self.settings.get("max_tool_output_chars", 30000))
+        detected = self.loop_guard.observe(name, args, result.is_error, content)
+        if detected:
+            details = {**(self.step_state or {}), **detected}
+            record(self.store, 'loop_guard.detected', **details)
+            record(self.store, 'loop_guard.' + detected['action'], **details)
+            instruction = ('Обнаружены повторяющиеся действия без новых данных. Смени подход либо заверши ответ, объяснив препятствие'
+                           if detected['action'] == 'corrected' else 'Повторное зацикливание после коррекции. Текущий запрос остановлен')
+            content += '\n\n<loop_guard>\n' + instruction + '\n</loop_guard>'
+            if detected['action'] == 'corrected':
+                yield {"type": "warning", "message": instruction, "loop_guard": detected}
         ms = int((time.monotonic() - started) * 1000)
         if result.is_error:
             planning = None

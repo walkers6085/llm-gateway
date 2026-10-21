@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from agent import tui
+from agent import __version__, tui
 from agent.tui_backend import Bridge
 from tests.test_cli import gw  # общая mTLS-фикстура CLI
 from tests.fakes import SCRIPT, SEEN, tool_call
@@ -62,6 +62,7 @@ async def test_every_catalog_command_opens_selection_without_model_or_credential
     try:
         _, events = await receive(proc, 'ready')
         snapshot = next(event for event in events if event['type'] == 'snapshot')
+        assert snapshot['version'] == __version__
         session = snapshot['session']['id']
         commands = [item['command'] for item in snapshot['catalog']]
         assert len(commands) == 13 and '/providers' in commands and '/permissions' in commands

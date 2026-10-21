@@ -33,6 +33,7 @@ DEFAULTS: dict = {
     "system_prompt": DEFAULT_SYSTEM_PROMPT,
     "temperature": None,
     "max_steps": 25,
+    "loop_guard": {"enabled": True, "window": 24, "repetitions": 3, "max_pattern_length": 4},
     "model_retry": {"max_retries": 5, "initial_delay": 2, "max_delay": 60, "max_elapsed": 180},
     "context_compaction": {"mode": "model", "timeout": 180, "max_output_tokens": 512},
     "context_cleanup": {"enabled": True, "compact_json": True, "collapse_blank_lines": True, "deduplicate_lines": False},
@@ -129,6 +130,7 @@ SCHEMA = _obj({
     "system_prompt": STR,
     "temperature": {"type": ["number", "null"], "minimum": 0, "maximum": 2},
     "max_steps": POS,
+    "loop_guard": _obj({"enabled": BOOL, "window": POS, "repetitions": {"type": "integer", "minimum": 2}, "max_pattern_length": POS}),
     "model_retry": _obj({"max_retries": {"type": "integer", "minimum": 0, "maximum": 10},
                          "initial_delay": {"type": "number", "minimum": 0},
                          "max_delay": {"type": "number", "minimum": 0},
@@ -183,6 +185,13 @@ def check(data: dict, source: str = "") -> dict:
         validate(data, SCHEMA)
     except SchemaError as exc:
         raise SettingsError(f"{source or 'настройки'}: {exc}") from None
+    guard = data.get('loop_guard', {})
+    if all(key in guard for key in ('window', 'repetitions', 'max_pattern_length')):
+        from .loop_guard import check_window
+        try:
+            check_window(guard)
+        except ValueError as exc:
+            raise SettingsError(f"{source or 'настройки'}: {exc}") from None
     return data
 
 
@@ -225,7 +234,7 @@ def load(project_dir: str | Path | None = None, extra: str | Path | None = None,
             result = merge(result, project_data)
     if overrides:
         result = merge(result, check(overrides, "параметры командной строки"))
-    return result
+    return check(result, 'итоговые настройки')
 
 
 def load_profiles(path: str | Path) -> dict[str, dict]:
@@ -240,7 +249,7 @@ def load_profiles(path: str | Path) -> dict[str, dict]:
     unknown = set(data) - {"profiles"}
     if unknown:
         raise SettingsError(f"{path}: неизвестные ключи верхнего уровня: {', '.join(sorted(unknown))}")
-    return {name: merge(DEFAULTS, check(p, f"{path}: profiles.{name}"))
+    return {name: check(merge(DEFAULTS, check(p, f"{path}: profiles.{name}")), f"{path}: profiles.{name}")
             for name, p in profiles.items()}
 
 

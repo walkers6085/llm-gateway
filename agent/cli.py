@@ -138,6 +138,8 @@ class Console:
                 self.line("↳ Сабагент:\n" + ev["content"])
         elif kind == "input_applied":
             self.line('↳ Уточнение учтено: ' + short(ev['text'], 160))
+        elif kind == "step" and ev.get('extended'):
+            self.line(self.c('2', f"↳ Начат новый блок из {ev['limit']} шагов; выполнено {ev['total'] - 1}"))
         elif kind == "input_rejected":
             self.line(ev['message'], err=True)
         elif kind == "warning":

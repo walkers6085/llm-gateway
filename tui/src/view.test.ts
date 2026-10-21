@@ -7,18 +7,19 @@ test('настоящие кадры: поток, Markdown, таблица JSON, 
   const sent:Command[]=[];
   const view=new AgentView(setup.renderer,c=>sent.push(c),()=>{});
   try{
-    view.accept({type:'snapshot',session:{id:'test',model:'alpha',workspace:'/tmp'},provider:'local'});
+    view.accept({type:'snapshot',version:'1.0.0',session:{id:'test',model:'alpha',workspace:'/tmp'},provider:'local'});
     view.accept({type:'ready'});
     view.accept({type:'text',text:'**Важно:** сохраните результат.\n\n```json\n[{"Модель":"альфа","Балл":42}]\n```'});
     view.accept({type:'done',reason:'stop'});
     await setup.flush();
     let frame=setup.captureCharFrame();
+    expect(frame.split('\n')[0]!.trimEnd()).toEndWith('v1.0.0');
     expect(frame).toContain('альфа');expect(frame).toContain('42');expect(frame).toContain('ВАЖНО');
     setup.mockInput.pressKey('r',{ctrl:true});await setup.flush();
     expect(setup.captureCharFrame()).toContain('```json');
     setup.mockInput.pressKey('r',{ctrl:true});
     setup.resize(65,30);await setup.flush();
-    frame=setup.captureCharFrame();expect(frame).toContain('сохраните результат');expect(frame).toContain('альфа');
+    frame=setup.captureCharFrame();expect(frame.split('\n')[0]!.trimEnd()).toEndWith('v1.0.0');expect(frame).toContain('сохраните результат');expect(frame).toContain('альфа');
   }finally{view.dispose();await setup.dispose();}
 });
 
@@ -467,7 +468,7 @@ test('429 показывает ожидание повтора и позволя
   }finally{view.dispose();await setup.dispose();}
 });
 
-test('режим доступа виден в заголовке, меню переключается стрелками и сохраняет черновик',async()=>{
+test('режим доступа виден в нижней панели, меню переключается стрелками и сохраняет черновик',async()=>{
   const setup=await createTestRenderer({width:130,height:38});const sent:Command[]=[];
   const view=new AgentView(setup.renderer,c=>sent.push(c),()=>{});
   try{
@@ -605,4 +606,56 @@ test('повтор после обрыва убирает только теку�
     const frame=setup.captureCharFrame();expect(frame).toContain('Сохранённый ответ');expect(frame).toContain('Восстановленный ответ');
     expect(frame).not.toContain('Оборванный фрагмент');expect(frame).not.toContain('Reasoning');
   }finally{await view.dispose();setup.renderer.destroy();}
+});
+
+
+test('название и версия сверху, состояние сессии под вводом; узкий экран и уведомления не скрывают контекст',async()=>{
+  const setup=await createTestRenderer({width:130,height:32});
+  const view=new AgentView(setup.renderer,()=>{},()=>{});
+  try{
+    view.accept({type:'snapshot',version:'1.0.0',provider:'glm',permissions_mode:'read_only',
+      session:{id:'layout',title:'Доработка интерфейса',model:'glm-4.5-flash',workspace:'/home/deb/project',agent_mode:'build'},
+      context:{estimated_tokens:25000,max_input_tokens:100000}});
+    view.accept({type:'ready'});view.editor.setText('Сохранённый черновик');
+    for(const width of [130,65,40]){
+      setup.resize(width,32);await setup.flush();
+      const lines=setup.captureCharFrame().split('\n');
+      expect(lines[0]).toContain('Доработка');expect(lines[0]!.trimEnd()).toEndWith('v1.0.0');
+      expect(lines[0]).not.toContain('BUILD');expect(lines[0]).not.toContain('glm');
+      const modeRow=lines.findIndex(line=>line.includes('BUILD'));
+      const directoryRow=lines.findIndex(line=>line.includes('Папка:'));
+      expect(modeRow).toBeGreaterThan(view.editor.y+view.editor.height);
+      expect(directoryRow).toBe(modeRow+1);expect(lines[modeRow]).toContain('glm');
+      expect(lines[directoryRow]).toContain('project');
+      if(width<100)expect(lines[directoryRow]).toContain('Контекст ~25%');
+      expect(view.editor.plainText).toBe('Сохранённый черновик');
+    }
+    view.accept({type:'agent_mode',mode:'plan',next_mode:'build'});view.notificationStatus('Уведомления доступны');
+    await setup.flush();let frame=setup.captureCharFrame();
+    expect(frame).toContain('PLAN → BUILD');expect(frame).toContain('glm');expect(frame).toContain('Контекст ~25%');
+    setup.resize(130,32);await setup.flush();frame=setup.captureCharFrame();
+    expect(frame).toContain('Только чтение');expect(frame).toContain('/home/deb/project');expect(frame).toContain('Уведомления доступны');
+  }finally{view.dispose();await setup.dispose();}
+});
+
+test('счётчики шагов и новые блоки обновляются во время работы, включая узкий экран',async()=>{
+  const setup=await createTestRenderer({width:110,height:36});
+  const view=new AgentView(setup.renderer,()=>{},()=>{});
+  try{
+    view.accept({type:'snapshot',provider:'glm',session:{id:'steps',workspace:'/tmp'}});view.accept({type:'ready'});
+    view.editor.setText('Задача');view.submit();
+    view.accept({type:'step',current:25,limit:25,total:25,extended:false});
+    await setup.flush();expect(setup.captureCharFrame()).toContain('Шаг 25/25 · всего 25');
+    view.accept({type:'step',current:1,limit:25,total:26,extended:true});
+    for(const width of [110,65,40]){
+      setup.resize(width,36);await setup.flush();expect(setup.captureCharFrame()).toContain('Шаг 1/25 · всего 26');
+    }
+    view.accept({type:'subagent_start',session_id:'child',role:'explorer',task:'Проверка'});
+    view.accept({type:'subagent_event',session_id:'child',event:{type:'step',current:1,limit:8,total:9,extended:true}});
+    setup.resize(110,36);await setup.flush();expect(setup.captureCharFrame()).toContain('Шаг 1/8 · всего 9');
+    expect(setup.captureCharFrame()).toContain('Шаг 1/25 · всего 26');
+    view.accept({type:'done',reason:'loop_detected'});view.accept({type:'idle'});
+    view.editor.setText('Продолжить иначе');view.submit();await setup.flush();
+    expect(setup.captureCharFrame()).not.toContain('Шаг 1/25 · всего 26');
+  }finally{view.dispose();await setup.dispose();}
 });

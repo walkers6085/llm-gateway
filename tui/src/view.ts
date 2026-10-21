@@ -93,7 +93,10 @@ type ToolCard={name:string;box:BoxRenderable;title:TextRenderable;details:TextRe
 export class AgentView {
   readonly root:BoxRenderable;readonly log:ScrollBoxRenderable;readonly editor:TextareaRenderable;
   private planActions:BoxRenderable;private planReady=false;
-  private header:TextRenderable;private status:TextRenderable;private footer:TextRenderable;
+  private header:TextRenderable;private version:TextRenderable;private status:TextRenderable;private footer:TextRenderable;
+  private modeLabel:TextRenderable;private connectionLabel:TextRenderable;private accessLabel:TextRenderable;private directoryLabel:TextRenderable;private sessionDetails:TextRenderable;
+  private notificationHint='';
+  private stepState?:{current:number;limit:number;total:number};
   private rail:Sidebar;private prompt:TextRenderable;private mask:TextRenderable;
   private approvalBox:BoxRenderable;private approvalText:TextRenderable;private syntax:SyntaxStyle;
   private answers:Answer[]=[];private entries:Renderable[]=[];private tools=new Map<string,ToolCard>();
@@ -133,8 +136,10 @@ export class AgentView {
       'markup.strong':{fg:palette.fg,bold:true},'markup.bold':{fg:palette.fg,bold:true},'markup.link':{fg:palette.blue,underline:true},
       'markup.raw':{fg:palette.green},'markup.list':{fg:palette.blue},keyword:{fg:'#c4a7e7'},string:{fg:palette.green},comment:{fg:palette.muted,italic:true}},renderer.nativeScene);
     this.root=new BoxRenderable(renderer,{id:'gw-root',width:'100%',height:'100%',backgroundColor:palette.bg,flexDirection:'column',paddingX:1});
-    this.header=new TextRenderable(renderer,{id:'header',height:2,content:'gwagent · подключение…',fg:palette.blue,wrapMode:'word',flexShrink:0});
-    this.root.add(this.header);
+    const heading=new BoxRenderable(renderer,{id:'heading',height:1,flexDirection:'row',flexShrink:0,gap:1});
+    this.header=new TextRenderable(renderer,{id:'header',height:1,flexGrow:1,flexShrink:1,minWidth:0,content:'gwagent · подключение…',fg:palette.blue,wrapMode:'none',truncate:true});
+    this.version=new TextRenderable(renderer,{id:'version',height:1,content:'',fg:palette.muted,flexShrink:0});
+    heading.add(this.header);heading.add(this.version);this.root.add(heading);
     const body=new BoxRenderable(renderer,{id:'body',flexDirection:'row',flexGrow:1,minHeight:0,gap:1});this.root.add(body);
     this.log=new ScrollBoxRenderable(renderer,{id:'conversation',flexGrow:1,minWidth:0,height:'100%',scrollY:true,scrollX:false,stickyScroll:true,stickyStart:'bottom',contentOptions:{flexDirection:'column',gap:1,paddingRight:1}});
     body.add(this.log);
@@ -164,22 +169,34 @@ export class AgentView {
     this.editor=new TextareaRenderable(renderer,{id:'message',width:'100%',height:2,placeholder:'Введите задачу…',textColor:palette.fg,backgroundColor:palette.bg,focusedBackgroundColor:palette.bg,cursorColor:palette.blue,
       keyBindings:[{name:'return',action:'submit'},{name:'return',shift:true,action:'newline'},{name:'a',ctrl:true,action:'select-all'}],onSubmit:()=>this.submit(),onContentChange:()=>{if(this.editor){this.history.changed(this.editor.plainText);this.updateMenu();}}});composer.add(this.editor);
     this.mask=new TextRenderable(renderer,{content:'',height:2,fg:palette.fg,visible:false});composer.add(this.mask);this.root.add(composer);
-    this.footer=new TextRenderable(renderer,{height:1,content:'Enter — отправить · Shift+Enter — строка · Esc — отмена · Ctrl+D — выход',fg:palette.muted,flexShrink:0});this.root.add(this.footer);
+    const sessionBar=new BoxRenderable(renderer,{id:'session-bar',width:'100%',height:2,flexShrink:0,flexDirection:'column',backgroundColor:palette.panel,paddingX:1});
+    const sessionRow=new BoxRenderable(renderer,{id:'session-status',height:1,flexDirection:'row',gap:2});
+    this.modeLabel=new TextRenderable(renderer,{id:'session-mode',height:1,content:'BUILD',fg:palette.green,flexShrink:0});
+    this.connectionLabel=new TextRenderable(renderer,{id:'session-connection',height:1,content:'Подключение…',fg:palette.fg,flexGrow:1,flexShrink:1,minWidth:0,wrapMode:'none',truncate:true});
+    this.accessLabel=new TextRenderable(renderer,{id:'session-access',height:1,content:'',fg:palette.muted,flexShrink:0});
+    sessionRow.add(this.modeLabel);sessionRow.add(this.connectionLabel);sessionRow.add(this.accessLabel);sessionBar.add(sessionRow);
+    const directoryRow=new BoxRenderable(renderer,{height:1,flexDirection:'row',gap:2});
+    this.directoryLabel=new TextRenderable(renderer,{id:'session-directory',height:1,content:'',fg:palette.muted,flexGrow:1,flexShrink:1,minWidth:0,wrapMode:'none',truncate:true});
+    this.sessionDetails=new TextRenderable(renderer,{id:'session-details',height:1,content:'',fg:palette.muted,flexShrink:0,maxWidth:'50%',wrapMode:'none',truncate:true});
+    directoryRow.add(this.directoryLabel);directoryRow.add(this.sessionDetails);sessionBar.add(directoryRow);this.root.add(sessionBar);
+    this.footer=new TextRenderable(renderer,{id:'shortcuts',height:1,content:'',fg:palette.muted,flexShrink:0,wrapMode:'none',truncate:true});this.root.add(this.footer);
     renderer.root.add(this.root);
     this.keyHandler=event=>this.onKey(event);
     this.pasteHandler=event=>{if(this.pending||this.dialog?.choices){event.preventDefault();event.stopPropagation();return;}if(this.dialog?.secret){event.preventDefault();event.stopPropagation();this.secret+=safeText(new TextDecoder().decode(event.bytes)).replace(/\n/g,'');this.mask.content='•'.repeat(Math.min(60,[...this.secret].length));}};
-    this.resizeHandler=()=>{this.rail.visible=renderer.width>=100;this.permission.resizePanel();this.updateMenu();this.metrics();renderer.requestRender();};
+    this.resizeHandler=()=>{this.rail.visible=renderer.width>=100;this.permission.resizePanel();this.updateMenu();this.updateHeader();this.metrics();renderer.requestRender();};
     renderer.keyInput.on('keypress',this.keyHandler);renderer.keyInput.on('paste',this.pasteHandler);renderer.on('resize',this.resizeHandler);
     this.resizeHandler();this.editor.focus();
   }
 
-  notificationStatus(status:string){if(this.disposed)return;this.footer.content='Enter — отправить · ↑ — история · Esc — отмена · '+status;}
+  notificationStatus(status:string){if(this.disposed)return;this.notificationHint=safeText(status);this.metrics();}
 
   accept(event:AgentEvent){
     if(this.disposed)return;
     if(event.request_id)this.requestId=safeText(event.request_id);
     switch(event.type){
       case 'snapshot':{
+        this.stepState=event.step||undefined;
+        this.version.content=event.version?`v${safeText(event.version)}`:'';
         const changedSession=this.sessionInfo&&this.sessionInfo.id!==event.session.id;
         const s=event.session;this.workspace=safeText(s.workspace);this.rail.update(event);
         s.permissions_mode=event.permissions_mode||s.permissions_mode||'allow_all';this.sessionInfo=s;this.providerName=safeText(event.provider);this.agentMode=s.agent_mode==='plan'?'plan':'build';this.nextAgentMode=event.next_agent_mode||undefined;this.metrics();
@@ -206,6 +223,7 @@ export class AgentView {
       case 'input_history':this.history.changed(this.editor.plainText);if(this.history.accept(event,this.sessionInfo?.id)&&event.error)this.notice(event.error,'error');break;
       case 'ready':this.ready=true;this.setBusy(false);this.status.content=this.completionStatus||'Готово к запросу';
         if(this.queuedMenu){const command=this.queuedMenu;this.queuedMenu=undefined;this.sendCommand(command);}break;
+      case 'step':this.stepState={current:event.current,limit:event.limit,total:event.total};this.animateActivity();break;
       case 'agent_mode':this.agentMode=event.mode==='plan'?'plan':'build';this.nextAgentMode=event.next_mode||undefined;this.updateHeader();this.metrics();break;
       case 'input_closed':if(this.dialog?.id===event.id&&this.dialog?.question)this.finishQuestion();break;
       case 'input_queued':this.queuedInput(event.id,event.text,event.status);this.metrics();break;
@@ -232,6 +250,10 @@ export class AgentView {
       case 'subagent_start':this.activity='Сабагент · '+(event.role||'worker');this.tool('child-'+event.session_id,'Сабагент · '+(event.role||'worker'),event.task);break;
       case 'subagent_event':{
         const child=event.event;
+        if(child.type==='step'){
+          const card=this.tools.get('child-'+event.session_id);
+          if(card)card.title.content=`${card.name} · Шаг ${child.current}/${child.limit} · всего ${child.total}`;
+        }
         if(child.type==='tool_call')this.activity='Сабагент · '+safeText(child.name);
         if(child.type==='reasoning')this.reasoning(child.text);
         if(child.type==='assistant'){this.thought=undefined;if(child.metrics){const card=this.tools.get('child-'+event.session_id);card?.box.add(new TextRenderable(this.renderer,{content:formatMetrics(child.metrics),fg:palette.muted,wrapMode:'word'}));}}
@@ -556,7 +578,9 @@ export class AgentView {
     const waiting=this.retryUntil?' · ещё '+Math.ceil((this.retryUntil-Date.now())/1000)+' с':'';
     const frames=['● ○ ○','○ ● ○','○ ○ ●','○ ● ○'];
     this.status.height=2;this.status.fg=palette.blue;
-    this.status.content=`${frames[this.frame++%frames.length]}  ${this.activity}${waiting} · ${Math.floor((Date.now()-this.busySince)/1000)} с\n${Date.now()<this.clipboardUntil?this.clipboardMessage:'Esc / Ctrl+C — отменить'+(this.requestId?' · запрос '+this.requestId:'')}`;
+    const step=this.stepState?`Шаг ${this.stepState.current}/${this.stepState.limit} · всего ${this.stepState.total}`:this.activity+waiting;
+    this.status.wrapMode='none';this.status.truncate=true;
+    this.status.content=`${frames[this.frame++%frames.length]}  ${step} · ${Math.floor((Date.now()-this.busySince)/1000)} с\n${Date.now()<this.clipboardUntil?this.clipboardMessage:(this.stepState?this.activity+waiting+' · ':'')+'Esc / Ctrl+C — отменить'+(this.renderer.width>=110&&this.requestId?' · запрос '+this.requestId:'')}`;
     this.renderer.requestRender();
   }
   private addTable(title:string,table:Table){
@@ -584,7 +608,11 @@ export class AgentView {
     const s=this.sessionInfo;if(!s)return;
     const mode=this.agentMode.toUpperCase()+(this.nextAgentMode&&this.nextAgentMode!==this.agentMode?' → '+this.nextAgentMode.toUpperCase():'');
     const access=({allow_all:'Полный доступ',default:'С подтверждениями',read_only:'Только чтение'} as Record<string,string>)[s.permissions_mode]||s.permissions_mode;
-    this.header.content=`gwagent · ${mode} · ${safeText(access)} · ${this.providerName} / ${safeText(s.model||'модель не выбрана')} · ${safeText(s.title||s.id)}\n${safeText(s.workspace)} · ${safeText(s.id)}`;
+    this.header.content=`gwagent · ${safeText(s.title||s.id)}`;
+    this.modeLabel.content=mode;this.modeLabel.fg=this.agentMode==='plan'?palette.blue:palette.green;
+    this.connectionLabel.content=`${this.providerName||'провайдер не выбран'} / ${safeText(s.model||'модель не выбрана')}`;
+    this.accessLabel.content=safeText(this.renderer.width<60?({allow_all:'Всё',read_only:'Чтение',default:'Спросить'} as Record<string,string>)[s.permissions_mode]||access:access);
+    this.directoryLabel.content=`Папка: ${safeText(s.workspace)}`;
   }
   private finishQuestion(){
     this.dialog=undefined;this.menu.visible=false;this.approvalBox.visible=false;this.secret='';this.mask.visible=false;this.editor.visible=true;
@@ -593,9 +621,14 @@ export class AgentView {
     this.activity='Продолжение запроса';if(this.ready)this.editor.focus();
   }
   private metrics(){
-    const keys=this.renderer.width>=140?Object.entries(menuShortcuts).map(([key,item])=>(key==='f1'?'F1/Ctrl+P':key.toUpperCase())+' '+item.label).join(' · '):'F1/Ctrl+P команды';
-    const usage=this.renderer.width>=110?`Токены: ${this.usage.prompt} → ${this.usage.completion} · `:'';
-    this.footer.content=(this.renderer.width<100?this.rail.compactLabel()+' · ':'')+this.agentMode.toUpperCase()+(this.nextAgentMode&&this.nextAgentMode!==this.agentMode?' → '+this.nextAgentMode.toUpperCase()+' со следующего запроса':'')+' · Tab — агент · '+(this.pendingSteering.size?`Уточнений: ${this.pendingSteering.size} · `:'')+usage+'Esc отмена · Ctrl+C копия/отмена · Ctrl+Y ответ · '+keys+' · Ctrl+D выход';
+    const width=this.renderer.width;
+    const keys=width>=170?Object.entries(menuShortcuts).map(([key,item])=>(key==='f1'?'F1/Ctrl+P':key.toUpperCase())+' '+item.label).join(' · '):'F1 команды';
+    const hints=width<80?'Enter отправить · Tab режим · / команды · Esc отмена':
+      'Enter отправить · ↑ история · Tab режим · '+keys+' · Esc отмена'+(width>=120?' · Ctrl+Y копия · Ctrl+D выход':'');
+    const details=width<100?[this.rail.compactLabel()]:[this.pendingSteering.size?`Уточнений: ${this.pendingSteering.size}`:'',
+      width>=140?`Токены: ${this.usage.prompt} → ${this.usage.completion}`:'',this.notificationHint].filter(Boolean);
+    this.footer.content=hints;
+    this.sessionDetails.content=details.join(' · ');
   }
   private setBusy(value:boolean){
     this.busy=value;
@@ -603,7 +636,7 @@ export class AgentView {
     if(!this.pending&&!this.dialog)this.prompt.content=value?'Уточнение в текущий цикл · Enter — отправить':'Сообщение или /help';
     if(this.activityTimer){clearInterval(this.activityTimer);this.activityTimer=undefined;}
     if(!value && this.ready)this.editor.focus();else if(value && !this.pending && !this.dialog && this.ready)this.editor.focus();
-    if(value){this.retryUntil=0;this.completionStatus=undefined;this.busySince=Date.now();this.activity='Подготовка запроса';this.requestId='';this.animateActivity();this.activityTimer=setInterval(()=>this.animateActivity(),180);}
+    if(value){this.stepState=undefined;this.retryUntil=0;this.completionStatus=undefined;this.busySince=Date.now();this.activity='Подготовка запроса';this.requestId='';this.animateActivity();this.activityTimer=setInterval(()=>this.animateActivity(),180);}
     else{this.status.height=1;this.status.fg=palette.muted;}
     this.updateMenu();this.metrics();
   }

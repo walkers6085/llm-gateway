@@ -10,6 +10,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+from . import __version__
 from .cli import App, Console, OWNER, parse_args
 from .credentials import sanitize
 from .runtime import make_registry, make_agent
@@ -89,6 +90,7 @@ class Bridge:
         agent = app.agent or make_agent(llm=None, settings=app.settings, store=app.store, session=app.session, mcp=app.mcp)
         agent.model_metadata = app.get_model_metadata()
         return {'session_id': app.session.id, 'permissions_mode': app.permissions_mode(), 'planning': app.store.planning_state(app.session.id),
+                'step': agent.step_state,
                 'context': agent.context_status(),
                 'mcp': app.mcp.status(include_disabled=True) if app.mcp else [],
                 'pending_inputs': app.store.pending_inputs(app.session.id)}
@@ -101,7 +103,7 @@ class Bridge:
         from .tui_commands import navigation_catalog
         session = self.app.session
         session.title = self.app.store.ensure_title(session.id)
-        event = {'type': 'snapshot', 'protocol': PROTOCOL_VERSION,
+        event = {'type': 'snapshot', 'protocol': PROTOCOL_VERSION, 'version': __version__,
                  'session': session.to_dict(), 'provider': self.app.provider or 'gateway',
                  'notifications': self.app.settings.get('tui', {}).get('notifications', {}), 'catalog': navigation_catalog(), 'next_agent_mode': self.requested_mode[1] if self.requested_mode and self.requested_mode[0] == session.id else None, **self.dashboard_data()}
         if history:

@@ -47,7 +47,7 @@ data: {"type": "tool_result", "id": "call_1", "name": "write_file", "ok": true, 
 ```
 
 Первое — `{"type": "session", "id", "model"}`, дальше события цикла ([agent-loop.md](agent-loop.md)),
-последнее — `done` (`stop`, `max_steps`, `error`, `blocked` или `cancelled`). Пока агент ждёт
+последнее — `done` (`stop`, `loop_detected`, `max_steps`, `budget`, `error`, `blocked` или `cancelled`). Пока агент ждёт
 подтверждения, раз в 15 с приходит комментарий `: ping` (чтобы nginx/прокси не закрыли поток).
 
 **Подтверждение**: пришло `permission_request` с `id` → отправьте `POST …/approve` с этим `id`
@@ -141,3 +141,8 @@ completion_tokens и tokens_per_second. Ядро сервера также со�
 Версия метаданных FastAPI/OpenAPI совпадает с agent.__version__. Административная
 команда gwtoken включена в wheel; checkout-скрипт делегирует gateway/token_cli.py.
 Соединение TokenStore закрывается после каждой команды, включая ошибку дубликата.
+
+
+SSE также передаёт step с current/limit/total/extended для счётчиков шагов.
+max_steps по умолчанию задаёт продлеваемый блок, а не общий предел. Временные ретраи
+не увеличивают счётчик. Подробности детектора и сохранения истории — [цикл](agent-loop.md).

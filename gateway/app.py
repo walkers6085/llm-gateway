@@ -19,6 +19,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import httpx
+from agent import __version__
+
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
@@ -186,6 +188,7 @@ def create_app(settings: Settings | None = None, store: TokenStore | None = None
 
     app = FastAPI(
         title="LLM Gateway",
+        version=__version__,
         lifespan=lifespan,
         docs_url=None if settings.prod else "/docs",
         redoc_url=None,

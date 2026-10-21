@@ -50,6 +50,8 @@ async def execute(args):
 
 def main():
     parser = argparse.ArgumentParser(description="Бенчмарки модели (выполняют реальные запросы к API)")
+    from agent import __version__
+    parser.add_argument("--version", action="version", version="%(prog)s " + __version__)
     parser.add_argument("--model")
     parser.add_argument("--url", help="API URL; по умолчанию http://127.0.0.1:7700/v1")
     parser.add_argument("--provider")

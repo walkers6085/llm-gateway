@@ -759,6 +759,8 @@ class App:
 
 def parse_args(argv):
     p = argparse.ArgumentParser(prog="gwagent", description="Терминальный агент через LLM Gateway")
+    from agent import __version__
+    p.add_argument("--version", action="version", version="%(prog)s " + __version__)
     p.add_argument("-p", "--prompt", help="выполнить один запрос и выйти")
     p.add_argument("--cwd", help="рабочая папка (по умолчанию текущая)")
     p.add_argument("--model", help="модель")
@@ -770,7 +772,7 @@ def parse_args(argv):
                    help="продолжить последнюю сессию в этой папке")
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--allow-all", action="store_true", help="не спрашивать подтверждений (permissions.mode=allow_all)")
-    mode.add_argument("--read-only", action="store_true", help="строгое чтение: без shell, записи, MCP и делегации")
+    mode.add_argument("--read-only", action="store_true", help="строгое чтение: без shell, записи, MCP и сабагентов-исполнителей")
     p.add_argument("--json", action="store_true", help="события построчно в JSON (с -p)")
     display = p.add_mutually_exclusive_group()
     display.add_argument("--tui", action="store_true", help="интерфейс OpenTUI (Bun)")

@@ -453,6 +453,8 @@ def tags_line(provider):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Менеджер OpenAI-совместимых провайдеров')
+    from agent import __version__
+    parser.add_argument("--version", action="version", version="%(prog)s " + __version__)
     parser.add_argument('--file', default=None, help='реестр провайдеров; по умолчанию GWAGENT_HOME/providers.json')
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('list')

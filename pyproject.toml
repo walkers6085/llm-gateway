@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llm-gateway-agent"
-version = "0.2.0"
 description = "Локальный агент, OpenAI-совместимый шлюз и бенчмарки моделей"
 readme = "README.md"
 requires-python = ">=3.12"
-dynamic = ["dependencies"]
+dynamic = ["dependencies", "version"]
 
 [project.scripts]
+gwtoken = "gateway.token_cli:main"
 gwagent = "agent.cli:main"
 gwbench = "bench.__main__:main"
 gwproviders = "agent.providers:main"
@@ -19,6 +19,7 @@ gwproviders = "agent.providers:main"
 include = ["agent*", "bench*", "gateway*"]
 
 [tool.setuptools.dynamic]
+version = {attr = "agent.__version__"}
 dependencies = {file = ["requirements.txt"]}
 
 [tool.setuptools.data-files]

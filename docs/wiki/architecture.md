@@ -186,3 +186,8 @@ agent/opencode.py выполняет явное преобразование п�
 Роли исследователя/ревьюера реализованы обычным Agent с отдельным промптом и реестром
 plan_safe инструментов, без фреймворков. runtime включает inspect из tools/inspection.py:
 проверки программы/пути и HTTP HEAD используют stdlib и существующий сетевой клиент.
+
+Версия 1.0 задаётся в agent.__version__, setuptools читает её как dynamic version.
+CLI и OpenAPI используют тот же источник. gateway/token_cli.py обеспечивает gwtoken
+как из checkout, так и после установки wheel. Исходники OpenTUI и чат поставляются
+как data-files; CI проверяет установку и запуск из посторонней папки.

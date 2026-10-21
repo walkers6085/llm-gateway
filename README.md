@@ -1,4 +1,6 @@
-# LLM Gateway
+# LLM Gateway 1.0
+
+[Версия 1.0: установка, обновление и готовность к запуску](docs/wiki/release-1.0.md).
 
 OpenAI-совместимый шлюз к инференсу, который доступен только по клиентскому сертификату (mTLS).
 Сертификат лежит **только на шлюзе**, пользователи ходят по личным токенам `gw-…`.
@@ -91,7 +93,7 @@ venv/bin/python -m bench --provider local --suites tools,structured,chain --quic
 ## Установка CLI и настройка подключения
 
 Linux, Python 3.12+. Установка пакета: `python -m pip install . -c requirements.lock`.
-Доступны gwagent, gwproviders, gwbench; из checkout сохраняются ./gwagent и python -m bench.
+Версия: `gwagent --version`. Доступны gwagent, gwproviders, gwbench, gwtoken; из checkout сохраняются ./gwagent и python -m bench.
 
 ```bash
 gwproviders add corp --url https://llm.example.org/v1 --model MODEL \
@@ -113,7 +115,7 @@ gwagent
 
 ## Терминальный интерфейс OpenTUI
 
-При установленном [Bun](https://bun.sh) >= 1.3.14:
+При установленном [Bun](https://bun.sh) (CI проверяет 1.3.8 и 1.3.14; launcher не ограничивает версию):
 
 ```bash
 ./gwagent tui install

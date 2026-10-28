@@ -358,6 +358,23 @@ class SessionStore:
         return [{"seq": row["seq"], "message": json.loads(row["data"]), "metadata": json.loads(row["meta"] or '{}')}
                 for row in self.db.execute("SELECT m.seq,m.data,x.data AS meta FROM agent_messages m LEFT JOIN agent_message_meta x USING(session_id,seq) WHERE m.session_id=? ORDER BY m.seq", (session_id,))]
 
+    def timeline_page(self, session_id, *, before=None, limit=100):
+        """Страница полной истории, независимо от границы контекста модели."""
+        condition, args = '', [session_id]
+        if before is not None:
+            condition = ' AND m.seq < ?'
+            args.append(before)
+        args.append(limit + 1)
+        rows = self.db.execute("SELECT m.seq,m.data,x.data AS meta FROM agent_messages m LEFT JOIN agent_message_meta x USING(session_id,seq) WHERE m.session_id=?" + condition + " ORDER BY m.seq DESC LIMIT ?", args).fetchall()
+        return ([{'seq': row['seq'], 'message': json.loads(row['data']), 'metadata': json.loads(row['meta'] or '{}')}
+                 for row in reversed(rows[:limit])], len(rows) > limit)
+
+    def tool_statuses(self, session_id, call_ids):
+        if not call_ids:
+            return {}
+        rows = self.db.execute('SELECT call_id,tool,ok,ms FROM agent_tool_runs WHERE session_id=? AND call_id IN (' + ','.join('?' for _ in call_ids) + ') ORDER BY ts', [session_id, *call_ids]).fetchall()
+        return {row['call_id']: {'name': row['tool'], 'ok': bool(row['ok']), 'ms': row['ms']} for row in rows}
+
     def revision(self, session_id):
         import hashlib
         return hashlib.sha256(json.dumps(self.timeline(session_id), sort_keys=True).encode()).hexdigest()

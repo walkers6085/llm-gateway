@@ -659,3 +659,146 @@ test('счётчики шагов и новые блоки обновляютс�
     expect(setup.captureCharFrame()).not.toContain('Шаг 1/25 · всего 26');
   }finally{view.dispose();await setup.dispose();}
 });
+
+test('быстрые действия и compact не вытесняют пользовательский диалог после 80 карточек',async()=>{
+  const setup=await createTestRenderer({width:110,height:36});const view=new AgentView(setup.renderer,()=>{},()=>{});
+  try{
+    view.accept({type:'snapshot',session:{id:'keep',workspace:'/tmp'},provider:'local'});view.accept({type:'ready'});
+    view.editor.setText('Исходная задача остаётся в чате');view.submit();view.accept({type:'user',text:'Исходная задача остаётся в чате'});
+    for(let index=0;index<95;index++){
+      view.accept({type:'tool_call',id:'fast-'+index,name:'shell',arguments:{command:`printf действие-${index}`}});
+      view.accept({type:'tool_result',id:'fast-'+index,name:'shell',content:'готово',ok:true,ms:1});
+    }
+    view.accept({type:'warning',message:'Контекст заполнен: создаю сводку. История чата сохраняется',compaction:{stage:'start'}});
+    view.accept({type:'snapshot',session:{id:'keep',workspace:'/tmp'},provider:'local'});
+    view.accept({type:'done',reason:'stop'});view.accept({type:'idle'});
+    await setup.flush();expect(setup.captureCharFrame()).toContain('действий 95');
+    view.log.scrollTo(0);await setup.flush();
+    expect(setup.captureCharFrame()).toContain('Исходная задача остаётся в чате');
+    expect(setup.captureCharFrame()).toContain('Команда: printf действие-0');
+  }finally{view.dispose();await setup.dispose();}
+});
+
+test('предыдущая история подгружается без потери черновика и текущего потока; устаревшие страницы игнорируются',async()=>{
+  const setup=await createTestRenderer({width:110,height:40});const sent:Command[]=[];
+  const copied:string[]=[];const view=new AgentView(setup.renderer,c=>sent.push(c),()=>{},async text=>{copied.push(text);return 'written';});
+  try{
+    view.accept({type:'snapshot',session:{id:'pages',workspace:'/tmp'},provider:'local',history_before:31,history_has_more:true,
+      history:[{seq:31,role:'user',content:'Последний вопрос'},{seq:32,role:'assistant',content:'Последний ответ'}]});
+    view.accept({type:'ready'});view.editor.setText('Следующий запрос');await setup.flush();view.log.scrollTo(0);
+    setup.mockInput.pressKey('\x1b[5~');
+    const request=sent.at(-1)!;expect(request.type).toBe('load_history');expect(request.before).toBe(31);
+    view.submit();view.accept({type:'text',text:'Новый поток'});view.editor.setText('Уточнение в редакторе');
+    const page={type:'history_page',id:request.id,session_id:'pages',history_before:1,history_has_more:false,
+      history:[{seq:1,role:'user',content:'Первый вопрос до сжатия'},{seq:2,role:'assistant',content:'Первый ответ до сжатия'}]};
+    view.accept(page);view.accept(page);
+    view.accept({type:'text',text:' продолжен'});view.accept({type:'done',reason:'stop'});view.accept({type:'idle'});
+    await setup.flush();view.log.scrollTo(0);await setup.flush();
+    let frame=setup.captureCharFrame();expect(frame).toContain('Первый вопрос до сжатия');expect(frame).toContain('Новый поток продолжен');
+    expect(frame.match(/Первый ответ до сжатия/g)).toHaveLength(1);expect(view.editor.plainText).toBe('Уточнение в редакторе');
+    setup.mockInput.pressKey('y',{ctrl:true});await Bun.sleep(30);expect(copied.at(-1)).toBe('Новый поток продолжен');
+    view.accept({type:'snapshot',session:{id:'other',workspace:'/tmp'},provider:'local',history:[]});view.accept(page);
+    await setup.flush();frame=setup.captureCharFrame();expect(frame).not.toContain('Первый вопрос до сжатия');
+  }finally{view.dispose();await setup.dispose();}
+});
+
+test('после быстрых команд видны аргументы и ошибки восстановленных действий',async()=>{
+  const setup=await createTestRenderer({width:110,height:36});const view=new AgentView(setup.renderer,()=>{},()=>{});
+  try{
+    view.accept({type:'snapshot',session:{id:'actions',workspace:'/tmp'},provider:'local',history:[
+      {seq:1,role:'assistant',tool_calls:[{id:'read',function:{name:'read_file',arguments:'{"path":"src/main.py"}'}}]},
+      {seq:2,role:'tool',tool_call_id:'read',name:'read_file',content:'нет файла',ok:false,ms:2}]});
+    view.accept({type:'ready'});view.editor.setText('Проверить');view.submit();
+    view.accept({type:'tool_call',id:'command',name:'shell',arguments:{command:'git status --short'}});
+    view.accept({type:'tool_result',id:'command',name:'shell',content:'готово',ok:true,ms:1});view.accept({type:'done',reason:'stop'});
+    await setup.flush();const frame=setup.captureCharFrame();
+    expect(frame).toContain('Чтение: src/main.py');expect(frame).toContain('× read_file');expect(frame).toContain('Команда: git status --short');
+  }finally{view.dispose();await setup.dispose();}
+});
+
+test('пробелы между инструментами не создают ответы; итог без текстовых дельт отображается целиком',async()=>{
+  const setup=await createTestRenderer({width:110,height:40});const view=new AgentView(setup.renderer,()=>{},()=>{});
+  const metrics={duration_ms:1000,completed_at:'2026-10-28T10:00:00Z',tokens_per_second:20};
+  try{
+    view.accept({type:'snapshot',session:{id:'normal-chat',workspace:'/tmp'},provider:'local'});view.accept({type:'ready'});
+    view.accept({type:'user',text:'Обычное сообщение пользователя'});
+    view.accept({type:'reasoning',text:'Скрытые рассуждения'});view.accept({type:'text',text:' '});
+    view.accept({type:'assistant',content:' ',tool_calls:[{id:'read',function:{name:'read_file',arguments:'{"path":"README.md"}'}}],metrics});
+    view.accept({type:'tool_call',id:'read',name:'read_file',arguments:{path:'README.md'}});
+    view.accept({type:'tool_result',id:'read',name:'read_file',content:'прочитано',ok:true,ms:1});
+    view.accept({type:'text',text:'\n'});view.accept({type:'assistant',content:'Полный обычный ответ модели',tool_calls:[],metrics});
+    await setup.flush();const frame=setup.captureCharFrame();
+    expect(frame).toContain('Обычное сообщение пользователя');expect(frame).toContain('Полный обычный ответ модели');
+    expect(frame).not.toContain('Скрытые рассуждения');
+    expect(view.log.getChildren().filter(child=>child.id.startsWith('answer-'))).toHaveLength(1);
+    expect(frame.match(/Worked for/g)).toHaveLength(2);
+  }finally{view.dispose();await setup.dispose();}
+});
+
+test('окончательный текст заменяет неполные дельты и сохраняется в восстановленном диалоге',async()=>{
+  const setup=await createTestRenderer({width:110,height:40});const copied:string[]=[];
+  const view=new AgentView(setup.renderer,()=>{},()=>{},async text=>{copied.push(text);return 'written';});
+  try{
+    view.accept({type:'ready'});view.accept({type:'text',text:'Неполный фрагмент'});
+    view.accept({type:'assistant',content:'Окончательный ответ целиком',tool_calls:[]});await setup.flush();
+    expect(setup.captureCharFrame()).toContain('Окончательный ответ целиком');expect(setup.captureCharFrame()).not.toContain('Неполный фрагмент');
+    setup.mockInput.pressKey('y',{ctrl:true});await Bun.sleep(30);expect(copied.at(-1)).toBe('Окончательный ответ целиком');
+    view.accept({type:'snapshot',session:{id:'restored',workspace:'/tmp'},provider:'local',history:[
+      {role:'user',content:'Сохранённый вопрос'},
+      {role:'assistant',content:' ',reasoning_content:'Промежуточная мысль',tool_calls:[{id:'tool',function:{name:'read_file',arguments:'{}'}}]},
+      {role:'tool',tool_call_id:'tool',content:'данные'},
+      {role:'assistant',content:'Сохранённый обычный ответ'}]});
+    await setup.flush();expect(setup.captureCharFrame()).toContain('Сохранённый вопрос');expect(setup.captureCharFrame()).toContain('Сохранённый обычный ответ');
+    expect(view.log.getChildren().filter(child=>child.id.startsWith('answer-'))).toHaveLength(1);
+  }finally{view.dispose();await setup.dispose();}
+});
+
+test('слеш-меню показывает английские команды, точно выбирает /mode и не запускает индикатор модели',async()=>{
+  const setup=await createTestRenderer({width:110,height:36});const sent:Command[]=[];
+  const view=new AgentView(setup.renderer,c=>sent.push(c),()=>{});
+  try{
+    view.accept({type:'snapshot',session:{id:'slash',workspace:'/tmp'},provider:'local',catalog:[
+      {kind:'command',label:'/models',command:'/models',description:'Выбрать модель',arguments:'none',aliases:['model','модели']},
+      {kind:'command',label:'/mode',command:'/mode',description:'Режим агента',arguments:'none'},
+      {kind:'command',label:'/providers',command:'/providers',description:'Подключения',arguments:'none'}]});view.accept({type:'ready'});
+    await setup.mockInput.typeText('/');await setup.flush();
+    expect(setup.captureCharFrame()).toContain('/models');expect(setup.captureCharFrame()).toContain('/providers');
+    view.editor.setText('/mode');setup.mockInput.pressEnter();await setup.flush();
+    expect(sent.at(-1)).toEqual({type:'submit',text:'/mode'});
+    expect(setup.captureCharFrame()).not.toContain('Подготовка запроса');expect(setup.captureCharFrame()).not.toContain('Уточнение в текущий цикл');
+    view.accept({type:'idle'});view.editor.setText('/mod');setup.mockInput.pressTab();expect(view.editor.plainText).toBe('/models');
+    setup.mockInput.pressEnter();await setup.flush();expect(setup.captureCharFrame()).toContain('Загружаю список моделей');
+    expect(sent.at(-1)).toEqual({type:'submit',text:'/models'});
+  }finally{view.dispose();await setup.dispose();}
+});
+
+test('переключение модели — операция интерфейса без шагов и reasoning; следующий обычный запрос запускает модель',async()=>{
+  const setup=await createTestRenderer({width:110,height:36});const sent:Command[]=[];
+  const view=new AgentView(setup.renderer,c=>sent.push(c),()=>{});
+  try{
+    readyWithCatalog(view);view.editor.setText('Черновик задачи');setup.mockInput.pressKey('F2');
+    view.accept({type:'table',selection:{kind:'model',provider:'local',session_id:'offline',current:'old',choices:[
+      {provider:'local',provider_name:'local',model:'alpha',available:true},{provider:'local',provider_name:'local',model:'beta',available:true}]}});view.accept({type:'idle'});
+    view.editor.setText('beta');setup.mockInput.pressEnter();await Bun.sleep(220);await setup.flush();
+    expect(sent.at(-1)).toEqual({type:'select',kind:'model',provider:'local',model:'beta',session_id:'offline'});
+    const frame=setup.captureCharFrame();expect(frame).toContain('Переключаю модель');expect(frame).not.toContain('Подготовка запроса');
+    expect(frame).not.toContain('Reasoning');expect(frame).not.toContain('Шаг ');expect(view.editor.plainText).toBe('Черновик задачи');
+    view.submit();expect(sent.at(-1)?.type).toBe('select');expect(view.editor.plainText).toBe('Черновик задачи');
+    view.accept({type:'snapshot',session:{id:'offline',workspace:'/tmp',model:'beta'},provider:'local'});view.accept({type:'idle'});
+    setup.mockInput.pressEnter();await setup.flush();expect(setup.captureCharFrame()).toContain('Подготовка запроса');
+    expect(sent.at(-1)).toEqual({type:'submit',text:'Черновик задачи'});
+  }finally{view.dispose();await setup.dispose();}
+});
+
+test('команда делегации включает режим работы только после настоящих событий агента',async()=>{
+  const setup=await createTestRenderer({width:110,height:36});const sent:Command[]=[];
+  const view=new AgentView(setup.renderer,c=>sent.push(c),()=>{});
+  try{
+    readyWithCatalog(view);view.editor.setText('/agent проверить');view.submit();await setup.flush();
+    expect(setup.captureCharFrame()).not.toContain('Уточнение в текущий цикл');
+    view.accept({type:'tool_call',id:'child',name:'subagent',arguments:{task:'Проверить'}});
+    view.accept({type:'step',current:1,limit:25,total:1,extended:false});await setup.flush();
+    expect(setup.captureCharFrame()).toContain('Шаг 1/25');expect(setup.captureCharFrame()).toContain('Уточнение в текущий цикл');
+    view.editor.setText('Уточняю задачу');view.submit();expect(sent.at(-1)?.type).toBe('steer');
+  }finally{view.dispose();await setup.dispose();}
+});

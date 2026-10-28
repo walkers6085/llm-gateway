@@ -298,3 +298,11 @@ PTY-smoke дожидается готовности Python-бэкенда, а н
 границы 25/50 шагов, сохранение бюджета, уточнения, compact, ретраи и дочерние блоки.
 Модули agent/loop.py и agent/loop_guard.py описаны на [странице цикла](agent-loop.md).
 TUI проверяет отображение current/limit/total и переход блока на узком экране.
+
+
+История TUI: test_history_pages_recover_messages_before_compaction_and_preserve_errors
+и test_history_pages_stay_below_frame_limit_without_skipping_large_messages проверяют
+полную timeline после compact, курсоры, ошибки инструментов и предел размера кадра.
+Native-тесты view.test.ts проверяют сохранение диалога после 95 быстрых действий,
+подгрузку предыдущих сообщений во время потока, черновик, отсутствие дубликатов,
+отбрасывание старого ответа другой сессии и копирование последнего ответа.

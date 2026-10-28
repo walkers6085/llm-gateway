@@ -88,7 +88,7 @@ class Answer {
   }
 }
 
-type ToolCard={name:string;box:BoxRenderable;title:TextRenderable;details:TextRenderable;result?:TextRenderable;expanded:boolean};
+type ToolCard={name:string;box:BoxRenderable;title:TextRenderable;summary:TextRenderable;details:TextRenderable;result?:TextRenderable;expanded:boolean};
 
 export class AgentView {
   readonly root:BoxRenderable;readonly log:ScrollBoxRenderable;readonly editor:TextareaRenderable;
@@ -97,10 +97,14 @@ export class AgentView {
   private modeLabel:TextRenderable;private connectionLabel:TextRenderable;private accessLabel:TextRenderable;private directoryLabel:TextRenderable;private sessionDetails:TextRenderable;
   private notificationHint='';
   private stepState?:{current:number;limit:number;total:number};
+  private historyButton:TextRenderable;private historyBefore?:number;private historyMore=false;private historyRequest?:string;
+  private historyGeneration=0;private historySeqs=new Set<number>();private prependAnchor?:Renderable;private prependIndex=0;private prependAnswerIndex=0;
+  private completedTools=0;private failedTools=0;
+  private modelMetrics=new Map<string,AgentEvent>();
   private rail:Sidebar;private prompt:TextRenderable;private mask:TextRenderable;
   private approvalBox:BoxRenderable;private approvalText:TextRenderable;private syntax:SyntaxStyle;
   private answers:Answer[]=[];private entries:Renderable[]=[];private tools=new Map<string,ToolCard>();
-  private active?:Answer;private last?:Answer;private raw=false;private ready=false;private busy=false;
+  private active?:Answer;private last?:Answer;private raw=false;private ready=false;private busy=false;private modelBusy=false;
   private permission:ApprovalPanel;private workspace='';
   private pending?:AgentEvent;private dialog?:AgentEvent;private secret='';private closed=false;private serial=0;
   private usage={prompt:0,completion:0};private streamingText='';private timer?:ReturnType<typeof setTimeout>;
@@ -143,6 +147,9 @@ export class AgentView {
     const body=new BoxRenderable(renderer,{id:'body',flexDirection:'row',flexGrow:1,minHeight:0,gap:1});this.root.add(body);
     this.log=new ScrollBoxRenderable(renderer,{id:'conversation',flexGrow:1,minWidth:0,height:'100%',scrollY:true,scrollX:false,stickyScroll:true,stickyStart:'bottom',contentOptions:{flexDirection:'column',gap:1,paddingRight:1}});
     body.add(this.log);
+    this.historyButton=new TextRenderable(renderer,{id:'history-load',content:'↑ Загрузить предыдущие сообщения',height:1,fg:palette.blue,visible:false,flexShrink:0,
+      onMouseDown:event=>{if(event.button===0){event.preventDefault();this.loadEarlierHistory();}}});
+    this.log.add(this.historyButton);
     this.rail=new Sidebar(renderer,()=>{if(!this.busy&&!this.pending&&!this.dialog&&this.ready){this.shortcutDraft=this.editor.plainText;this.sendCommand('/mcp');}});body.add(this.rail);
     this.permission=new ApprovalPanel(renderer,decision=>this.answerPermission(decision));this.root.add(this.permission);
     this.approvalBox=new BoxRenderable(renderer,{id:'approval',width:'100%',flexShrink:0,border:true,borderStyle:'rounded',borderColor:palette.yellow,paddingX:1,visible:false,flexDirection:'column'});
@@ -207,23 +214,27 @@ export class AgentView {
         this.updateHeader();
         if(Array.isArray(event.history)){
           this.clearHistory();
-          if(event.history_truncated)this.notice('Показана последняя часть истории. Полная доступна через /export.');
-          for(const m of event.history){
-            if(m.role==='user')this.user(m.content||'',m.message_id);
-            else if(m.role==='assistant'){
-              if(m.reasoning_content){this.reasoning(m.reasoning_content);this.thought=undefined;}
-              if(m.content){const answer=this.answer(m.content,true,m.agent_mode||'build');answer.setMetrics(m.metrics);}else if(m.metrics)this.answer('',true,m.agent_mode||'build').setMetrics(m.metrics);
-              for(const call of m.tool_calls||[])this.tool(call.id,call.function?.name||'',call.function?.arguments);
-            } else if(m.role==='tool')this.toolResult(m.tool_call_id,m.content||'',true);
-          }
+          this.setHistoryCursor(event);this.renderHistory(event.history);
+          if(event.history_truncated)this.notice('Длинные сообщения сокращены для отображения. Полный текст доступен через /export.');
         }
         this.restoreQueuedInputs(event.pending_inputs);
+        break;
+      }
+      case 'history_page':{
+        if(event.id!==this.historyRequest||event.session_id!==this.sessionInfo?.id)break;
+        this.historyRequest=undefined;
+        if(event.error){this.updateHistoryButton();this.notice(event.error,'error');break;}
+        const last=this.last,thought=this.thought,generation=this.historyGeneration;
+        this.prependAnchor=this.entries[0];this.prependIndex=this.prependAnswerIndex=0;this.thought=undefined;
+        try{this.renderHistory(event.history||[]);}finally{this.prependAnchor=undefined;this.last=last;this.thought=thought;}
+        this.setHistoryCursor(event);
+        this.renderer.once('frame',()=>{if(!this.disposed&&generation===this.historyGeneration)this.log.scrollTo(0);});this.renderer.requestRender();
         break;
       }
       case 'input_history':this.history.changed(this.editor.plainText);if(this.history.accept(event,this.sessionInfo?.id)&&event.error)this.notice(event.error,'error');break;
       case 'ready':this.ready=true;this.setBusy(false);this.status.content=this.completionStatus||'Готово к запросу';
         if(this.queuedMenu){const command=this.queuedMenu;this.queuedMenu=undefined;this.sendCommand(command);}break;
-      case 'step':this.stepState={current:event.current,limit:event.limit,total:event.total};this.animateActivity();break;
+      case 'step':this.ensureModelActivity();this.stepState={current:event.current,limit:event.limit,total:event.total};this.animateActivity();break;
       case 'agent_mode':this.agentMode=event.mode==='plan'?'plan':'build';this.nextAgentMode=event.next_mode||undefined;this.updateHeader();this.metrics();break;
       case 'input_closed':if(this.dialog?.id===event.id&&this.dialog?.question)this.finishQuestion();break;
       case 'input_queued':this.queuedInput(event.id,event.text,event.status);this.metrics();break;
@@ -237,17 +248,27 @@ export class AgentView {
       case 'dashboard':if(this.sessionInfo&&event.permissions_mode){this.sessionInfo.permissions_mode=event.permissions_mode;this.updateHeader();}this.restoreQueuedInputs(event.pending_inputs);this.rail.update(event);this.metrics();break;
       case 'context':this.retryUntil=0;this.activity='Запрос к модели';this.rail.setContext(event);this.metrics();break;
       case 'user':this.planReady=false;this.usage={prompt:0,completion:0};this.user(event.text,event.message_id);break;
-      case 'reasoning':this.activity='Модель рассуждает';this.reasoning(event.text);break;
+      case 'reasoning':this.ensureModelActivity();this.activity='Модель рассуждает';this.reasoning(event.text);break;
       case 'text':{
+        this.ensureModelActivity();
         this.activity='Модель отвечает';
-        if(!this.active){this.active=this.answer('',false);this.streamingText='';}
         this.streamingText+=safeText(event.text);
-        if(!this.timer)this.timer=setTimeout(()=>this.flush(),50);
+        if(!this.active&&this.streamingText.trim())this.active=this.answer('',false);
+        if(this.active&&!this.timer)this.timer=setTimeout(()=>this.flush(),50);
         break;
       }
-      case 'assistant':{const answer=this.active;this.finishAnswer();const completed=answer||this.answer(event.content||'',true);if(event.metrics)completed.setMetrics(event.metrics);this.thought=undefined;break;}
-      case 'tool_call':this.activity='Инструмент: '+safeText(event.name);this.tool(event.id,event.name,event.arguments);break;
-      case 'subagent_start':this.activity='Сабагент · '+(event.role||'worker');this.tool('child-'+event.session_id,'Сабагент · '+(event.role||'worker'),event.task);break;
+      case 'assistant':{
+        const final=safeText(event.content);
+        if(final.trim())this.streamingText=final;
+        const answer=this.active||(this.streamingText.trim()?this.answer(this.streamingText,true):undefined);
+        this.finishAnswer();
+        if(answer&&event.metrics)answer.setMetrics(event.metrics);
+        if(!answer&&event.metrics&&event.tool_calls?.length)this.modelMetrics.set(event.tool_calls[0].id,event.metrics);
+        if(!answer&&!event.tool_calls?.length)this.notice('Модель не вернула текст ответа. Рассуждения доступны отдельно.','warning');
+        this.thought=undefined;break;
+      }
+      case 'tool_call':this.ensureModelActivity();this.activity='Инструмент: '+safeText(event.name);this.tool(event.id,event.name,event.arguments);this.animateActivity();break;
+      case 'subagent_start':this.ensureModelActivity();this.activity='Сабагент · '+(event.role||'worker');this.tool('child-'+event.session_id,'Сабагент · '+(event.role||'worker'),event.task);break;
       case 'subagent_event':{
         const child=event.event;
         if(child.type==='step'){
@@ -264,9 +285,10 @@ export class AgentView {
       }
       case 'subagent_end':this.thought=undefined;this.toolResult('child-'+event.session_id,event.content||'Завершение: '+event.reason,event.reason==='stop');this.activity='Продолжение запроса';break;
       case 'tool_result':
+        this.completedTools++;if(!event.ok)this.failedTools++;
         if(this.pending?.id===event.id){this.pending=undefined;this.permission.visible=false;this.prompt.content=this.busy?'Уточнение в текущий цикл · Enter — отправить':'Сообщение или /help';if(this.ready)this.editor.focus();}
         if(!this.tools.has(event.id))this.tool(event.id,event.name||event.id,'');
-        this.toolResult(event.id,event.content,event.ok,event.ms);break;
+        this.toolResult(event.id,event.content,event.ok,event.ms);this.activity=`Завершено: ${safeText(event.name||event.id)} · действий ${this.completedTools}`;this.animateActivity();break;
       case 'permission_request':{
         this.closePicker();this.closePalette();this.pending=event;this.editor.blur();
         this.approvalBox.visible=false;this.permission.visible=false;
@@ -280,14 +302,14 @@ export class AgentView {
         if(event.secret){this.editor.blur();this.mask.content='';}else this.editor.focus();break;
       case 'draft':this.dialogDraft=undefined;this.editor.setText(safeText(event.text));this.editor.gotoBufferEnd();break;
       case 'usage':this.rail.usage(Number(event.prompt_tokens));this.usage.prompt+=Number(event.prompt_tokens)||0;this.usage.completion+=Number(event.completion_tokens)||0;this.metrics();break;
-      case 'warning':if(event.retry?.reset_response)this.resetResponse();if(event.retry){this.retryUntil=Date.now()+Number(event.retry.delay)*1000;this.activity='Ожидание повтора · HTTP '+event.retry.status;this.animateActivity();}this.notice(event.message,'warning');break;
+      case 'warning':if(event.compaction){this.activity='Сжатие контекста · история сохраняется';if(!this.modelBusy)this.status.content='Сжатие контекста · история сохраняется';this.animateActivity();}if(event.retry?.reset_response)this.resetResponse();if(event.retry){this.retryUntil=Date.now()+Number(event.retry.delay)*1000;this.activity='Ожидание повтора · HTTP '+event.retry.status;this.animateActivity();}this.notice(event.message,'warning');break;
       case 'error':case 'fatal':if(event.reset_response)this.resetResponse();this.finishAnswer();this.notice(event.message,'error');if(event.type==='fatal'){this.closePicker();this.closePalette();this.dialog=undefined;this.pending=undefined;this.secret='';this.mask.content='';this.mask.visible=false;this.editor.visible=true;this.ready=false;this.closed=true;this.setBusy(false);this.status.content='Не удалось подключиться · Ctrl+D — выход';}break;
       case 'notice':this.notice(event.message,event.level==='error'?'error':'important');break;
       case 'table':
         if(Object.hasOwn(menuSpecs,event.selection?.kind))this.openPicker(event);
         else this.addTable(event.title,{columns:event.columns.map(safeText),rows:event.rows.map((r:unknown[])=>r.map(safeText)),omittedRows:0,omittedColumns:0});
         break;
-      case 'done':this.planReady=event.reason==='stop'&&(event.agent_mode||this.agentMode)==='plan';if(event.reason==='cancelled'&&this.pendingNavigation)this.returnAfterCancel=true;this.finishAnswer();this.thought=undefined;if(this.activityTimer){clearInterval(this.activityTimer);this.activityTimer=undefined;}this.status.height=1;this.status.fg=palette.muted;this.pending=undefined;this.approvalBox.visible=false;this.permission.visible=false;this.status.content=this.completionStatus=({stop:'Готово',cancelled:'Отменено',error:'Ошибка',budget:'Достигнут бюджет',max_steps:'Лимит шагов',blocked:'Заблокировано'} as Record<string,string>)[event.reason]||safeText(event.reason);break;
+      case 'done':this.planReady=event.reason==='stop'&&(event.agent_mode||this.agentMode)==='plan';if(event.reason==='cancelled'&&this.pendingNavigation)this.returnAfterCancel=true;this.finishAnswer();this.thought=undefined;if(this.activityTimer){clearInterval(this.activityTimer);this.activityTimer=undefined;}this.status.height=1;this.status.fg=palette.muted;this.pending=undefined;this.approvalBox.visible=false;this.permission.visible=false;this.status.content=this.completionStatus=({stop:'Готово',cancelled:'Отменено',error:'Ошибка',budget:'Достигнут бюджет',max_steps:'Лимит шагов',blocked:'Заблокировано',loop_detected:'Повторное зацикливание'} as Record<string,string>)[event.reason]||safeText(event.reason);if(this.completedTools&&this.modelBusy){this.completionStatus+=` · действий ${this.completedTools}`+(this.failedTools?` · ошибок ${this.failedTools}`:'');this.status.content=this.completionStatus;}break;
       case 'idle':if(this.dialogDraft!==undefined){if(!this.picker){this.editor.setText(this.dialogDraft);this.editor.gotoBufferEnd();}this.dialogDraft=undefined;}this.dialog=undefined;this.secret='';this.mask.content='';this.mask.visible=false;this.editor.visible=true;this.prompt.content='Сообщение или /help';this.pending=undefined;this.approvalBox.visible=false;this.permission.visible=false;this.setBusy(false);this.shortcutDraft=undefined;this.status.content=this.completionStatus||'Готово к запросу';if(this.returnAfterCancel&&this.pendingNavigation){const frame=this.pendingNavigation;this.pendingNavigation=undefined;this.returnAfterCancel=false;this.restoreFrame(frame);}else if(this.pendingNavigation&&!this.picker)this.resetNavigation();break;
     }
     this.updateMenu();
@@ -320,10 +342,10 @@ export class AgentView {
     if(argumentInput){this.menu.visible=false;return;}
     const changed=query!==this.menuQuery;this.menuQuery=query;
     const selected=this.menuList.getSelectedIndex();
-    const score=(item:MenuItem)=>item.command.slice(1)===query||item.aliases?.includes(query)?0:(item.label||item.name||item.command.slice(1)).toLowerCase().startsWith(query)?1:2;
+    const score=(item:MenuItem)=>item.command.slice(1)===query?0:item.aliases?.includes(query)?1:item.command.slice(1).startsWith(query)?2:item.aliases?.some(alias=>alias.toLowerCase().startsWith(query))?3:4;
     this.menuItems=this.catalog.filter(item=>!query || `${item.command} ${item.label||''} ${item.name||''} ${(item.aliases||[]).join(' ')} ${item.description}`.toLowerCase().includes(query))
       .sort((a,b)=>score(a)-score(b));
-    this.menuList.options=this.menuItems.map(item=>({name:item.label||item.command+' — '+safeText(item.description).replace(/\s+/g,' '),group:query||item.label?'':item.kind==='tool'?'Инструменты':'Команды',badges:item.kind==='tool'?[{text:'инструмент',tone:'info' as const}]:[],value:item}));
+    this.menuList.options=this.menuItems.map(item=>({name:item.command+' — '+safeText(item.description).replace(/\s+/g,' '),group:query||item.label?'':item.kind==='tool'?'Инструменты':'Команды',badges:item.kind==='tool'?[{text:'инструмент',tone:'info' as const}]:[],value:item}));
     this.menuList.height=Math.min(12,Math.max(1,this.renderer.height-15),Math.max(1,this.menuItems.length+(query?0:2)));
     this.menuList.setSelectedIndex(changed?0:Math.max(0,Math.min(selected,this.menuItems.length-1)));
     this.menu.visible=true;this.menuDescription();this.renderer.requestRender();
@@ -348,6 +370,9 @@ export class AgentView {
   }
 
   private chooseMenu(completeOnly=false){
+    if(this.busy)return;
+    this.updateMenu();
+    if(!this.menu.visible){if(!completeOnly)this.submit();return;}
     const item=this.menuItems[this.menuList.getSelectedIndex()];
     if(!item)return;
     const savedDraft=this.paletteOpen?this.paletteDraft:undefined;
@@ -364,7 +389,7 @@ export class AgentView {
   private sendCommand(text:string){
     if(!this.ready||this.busy||this.closed||this.pending||this.dialog)return;
     if(text==='/help'){this.shortcutDraft=undefined;this.openPalette();return;}
-    this.setBusy(true);this.send({type:'submit',text});
+    this.setBusy(true,'command',text==='/models'?'Загружаю список моделей…':'Открываю '+text.split(/\s/,1)[0]+'…');this.send({type:'submit',text});
   }
 
   private cancelInput(){
@@ -440,6 +465,8 @@ export class AgentView {
   }
 
   private choosePicker(){
+    if(this.busy)return;
+    this.updatePicker();
     const picker=this.picker;
     const choice=this.menuList.getSelectedOption()?.value as PickerChoice|undefined;
     if(!picker || !choice || !picker.choices.some(item=>item.key===choice.key))return;
@@ -450,7 +477,7 @@ export class AgentView {
     }else if(choice.command){
       this.sendCommand(choice.command);
     }else if(choice.provider!==undefined){
-      this.setBusy(true);this.send({type:'select',kind:picker.kind,provider:choice.provider,...(choice.model?{model:choice.model}:{}),session_id:picker.sessionId});
+      this.setBusy(true,'command',picker.kind==='model'?'Переключаю модель…':'Переключаю провайдера…');this.send({type:'select',kind:picker.kind,provider:choice.provider,...(choice.model?{model:choice.model}:{}),session_id:picker.sessionId});
     }else{
       this.editor.setText('/model '+choice.model);this.menuDismissed=this.editor.plainText;
       this.submit();
@@ -474,11 +501,35 @@ export class AgentView {
   }
 
   private append(item:Renderable){
-    this.log.add(item);this.entries.push(item);
-    while(this.entries.length>80){
-      const old=this.entries.shift()!;this.log.remove(old);old.destroyRecursively();
-      this.answers=this.answers.filter(a=>a.box!==old);this.thoughts=this.thoughts.filter(a=>a.box!==old);this.notices=this.notices.filter(a=>a.box!==old);
-      for(const [id,card] of this.tools)if(card.box===old)this.tools.delete(id);
+    if(this.prependAnchor){this.log.insertBefore(item,this.prependAnchor);this.entries.splice(this.prependIndex++,0,item);}
+    else{this.log.add(item);this.entries.push(item);}
+  }
+  private setHistoryCursor(event:AgentEvent){
+    this.historyBefore=typeof event.history_before==='number'?event.history_before:undefined;
+    this.historyMore=!!event.history_has_more;this.updateHistoryButton();
+  }
+  private updateHistoryButton(){
+    this.historyButton.visible=this.historyMore;
+    this.historyButton.content=this.historyRequest?'Загрузка предыдущих сообщений…':'↑ Загрузить предыдущие сообщения · PageUp в начале истории';
+  }
+  private loadEarlierHistory(){
+    if(!this.historyMore||this.historyRequest||this.historyBefore===undefined||!this.sessionInfo||this.closed)return;
+    this.historyRequest=`history-${this.historyGeneration}-${++this.serial}`;this.updateHistoryButton();
+    this.send({type:'load_history',id:this.historyRequest,session_id:this.sessionInfo.id,before:this.historyBefore});
+  }
+  private renderHistory(messages:AgentEvent[]){
+    for(const m of messages){
+      if(typeof m.seq==='number'){if(this.historySeqs.has(m.seq))continue;this.historySeqs.add(m.seq);}
+      if(m.role==='user')this.user(m.content||'',m.message_id);
+      else if(m.role==='assistant'){
+        if(m.reasoning_content){this.reasoning(m.reasoning_content);this.thought=undefined;}
+        if(safeText(m.content).trim()){const answer=this.answer(m.content,true,m.agent_mode||'build');answer.setMetrics(m.metrics);}
+        else if(m.metrics&&m.tool_calls?.length)this.modelMetrics.set(m.tool_calls[0].id,m.metrics);
+        for(const call of m.tool_calls||[])this.tool(call.id,call.function?.name||'',call.function?.arguments);
+      }else if(m.role==='tool'){
+        if(!this.tools.has(m.tool_call_id))this.tool(m.tool_call_id,m.name||m.tool_call_id,'');
+        this.toolResult(m.tool_call_id,m.content||'',m.ok!==false,m.ms);
+      }
     }
   }
   private user(text:string,messageId?:string){
@@ -516,8 +567,10 @@ export class AgentView {
     this.pendingSteering.clear();for(const item of inputs)this.queuedInput(item.id,item.text,item.status);
   }
   private answer(text:string,complete:boolean,mode=this.agentMode){
-    const answer=new Answer(this.renderer,this.syntax,`answer-${++this.serial}`,mode);answer.raw=this.raw;answer.update(text,complete);this.answers.push(answer);this.last=answer;this.append(answer.box);
-    if(complete)this.highlights(analyseResponse(text.slice(0,textLimit)).highlights);
+    const answer=new Answer(this.renderer,this.syntax,`answer-${++this.serial}`,mode);answer.raw=this.raw;answer.update(text,complete);
+    if(this.prependAnchor)this.answers.splice(this.prependAnswerIndex++,0,answer);else this.answers.push(answer);
+    this.last=answer;this.append(answer.box);
+    if(complete&&!this.prependAnchor)this.highlights(analyseResponse(text.slice(0,textLimit)).highlights);
     return answer;
   }
   private flush(){
@@ -573,7 +626,7 @@ export class AgentView {
     this.renderer.requestRender();
   }
   private animateActivity(){
-    if(!this.busy||this.pending||this.dialog||this.completionStatus)return;
+    if(!this.busy||!this.modelBusy||this.pending||this.dialog||this.completionStatus)return;
     if(this.retryUntil&&this.retryUntil<=Date.now()){this.retryUntil=0;this.activity='Повторный запрос к модели';}
     const waiting=this.retryUntil?' · ещё '+Math.ceil((this.retryUntil-Date.now())/1000)+' с':'';
     const frames=['● ○ ○','○ ● ○','○ ○ ●','○ ● ○'];
@@ -583,19 +636,40 @@ export class AgentView {
     this.status.content=`${frames[this.frame++%frames.length]}  ${step} · ${Math.floor((Date.now()-this.busySince)/1000)} с\n${Date.now()<this.clipboardUntil?this.clipboardMessage:(this.stepState?this.activity+waiting+' · ':'')+'Esc / Ctrl+C — отменить'+(this.renderer.width>=110&&this.requestId?' · запрос '+this.requestId:'')}`;
     this.renderer.requestRender();
   }
+  private ensureModelActivity(){
+    if(this.busy&&!this.modelBusy){const requestId=this.requestId;this.setBusy(true,'model');this.requestId=requestId;}
+  }
   private addTable(title:string,table:Table){
     const box=new BoxRenderable(this.renderer,{width:'100%',flexShrink:0,flexDirection:'column',border:true,borderStyle:'rounded',borderColor:palette.border,title:safeText(title),paddingX:1});
     box.add(tableView(this.renderer,table,`table-${++this.serial}`));this.append(box);
   }
   private tool(id:string,name:string,args:unknown){
-    const existing=this.tools.get(id);if(existing)return existing;
+    const existing=this.tools.get(id);
+    if(existing){
+      if(args){existing.name=safeText(name);existing.summary.content=this.toolSummary(name,args);existing.details.content=safeText(typeof args==='string'?args:JSON.stringify(args,null,2)).slice(0,10000);}
+      return existing;
+    }
     const card={} as ToolCard;
     card.name=safeText(name);card.expanded=this.expanded;
     card.box=new BoxRenderable(this.renderer,{width:'100%',flexShrink:0,flexDirection:'column',border:true,borderStyle:'rounded',borderColor:palette.border,paddingX:1});
     card.title=new TextRenderable(this.renderer,{content:`… ${safeText(name)} · нажмите для подробностей`,fg:palette.blue,wrapMode:'word'});
     card.title.onMouseDown=()=>{card.expanded=!card.expanded;card.details.visible=card.expanded;if(card.result)card.result.visible=card.expanded;};
+    card.summary=new TextRenderable(this.renderer,{content:this.toolSummary(name,args),fg:palette.muted,wrapMode:'word'});
     card.details=new TextRenderable(this.renderer,{content:safeText(typeof args==='string'?args:JSON.stringify(args,null,2)).slice(0,10000),fg:palette.muted,visible:card.expanded,wrapMode:'word'});
-    card.box.add(card.title);card.box.add(card.details);this.tools.set(id,card);this.append(card.box);return card;
+    card.box.add(card.title);card.box.add(card.summary);card.box.add(card.details);
+    const modelMetrics=this.modelMetrics.get(id);
+    if(modelMetrics){card.box.add(new TextRenderable(this.renderer,{content:formatMetrics(modelMetrics),fg:palette.muted,wrapMode:'word'}));this.modelMetrics.delete(id);}
+    this.tools.set(id,card);this.append(card.box);return card;
+  }
+  private toolSummary(name:string,args:unknown){
+    let value:any=args;
+    if(typeof value==='string'){try{value=JSON.parse(value);}catch{return safeText(value).replace(/\s+/g,' ').slice(0,240);}}
+    if(!value||typeof value!=='object')return '';
+    if(name==='grep'||name==='glob')return `Поиск: ${safeText(String(value.pattern||value.query||'')).slice(0,160)} · ${safeText(String(value.path||'.')).slice(0,80)}`;
+    const target=value.command||value.path||value.url||value.query||value.pattern||value.task;
+    const action=name==='shell'?'Команда':name==='read_file'?'Чтение':name==='write_file'||name==='edit_file'?'Изменение':name==='grep'||name==='glob'?'Поиск':'Действие';
+    if(target)return `${action}: ${safeText(String(target)).replace(/\s+/g,' ').slice(0,240)}`;
+    return safeText(JSON.stringify(value)).slice(0,240);
   }
   private toolResult(id:string,text:string,ok:boolean,ms?:number){
     const card=this.tools.get(id)||this.tool(id,id,'');
@@ -630,13 +704,17 @@ export class AgentView {
     this.footer.content=hints;
     this.sessionDetails.content=details.join(' · ');
   }
-  private setBusy(value:boolean){
-    this.busy=value;
+  private setBusy(value:boolean,kind:'model'|'command'='command',label='Выполняю команду…'){
+    this.busy=value;this.modelBusy=value&&kind==='model';
     if(value&&this.planActions)this.planActions.visible=false;
-    if(!this.pending&&!this.dialog)this.prompt.content=value?'Уточнение в текущий цикл · Enter — отправить':'Сообщение или /help';
+    if(!this.pending&&!this.dialog)this.prompt.content=this.modelBusy?'Уточнение в текущий цикл · Enter — отправить':value?'Настройка интерфейса':'Сообщение или /help';
     if(this.activityTimer){clearInterval(this.activityTimer);this.activityTimer=undefined;}
     if(!value && this.ready)this.editor.focus();else if(value && !this.pending && !this.dialog && this.ready)this.editor.focus();
-    if(value){this.stepState=undefined;this.retryUntil=0;this.completionStatus=undefined;this.busySince=Date.now();this.activity='Подготовка запроса';this.requestId='';this.animateActivity();this.activityTimer=setInterval(()=>this.animateActivity(),180);}
+    if(value){
+      this.completionStatus=undefined;
+      if(this.modelBusy){this.completedTools=this.failedTools=0;this.stepState=undefined;this.retryUntil=0;this.busySince=Date.now();this.activity='Подготовка запроса';this.requestId='';this.animateActivity();this.activityTimer=setInterval(()=>this.animateActivity(),180);}
+      else{this.status.height=1;this.status.fg=palette.muted;this.status.content=label;}
+    }
     else{this.status.height=1;this.status.fg=palette.muted;}
     this.updateMenu();this.metrics();
   }
@@ -658,12 +736,13 @@ export class AgentView {
     const text=this.editor.plainText.trim();
     if(!text||!this.ready||this.pending)return;
     if(this.busy){
+      if(!this.modelBusy){this.status.content='Дождитесь завершения команды';return;}
       if(text.startsWith('/')){this.notice('Команды доступны после завершения; уточнение отправляется обычным текстом');return;}
       if(new TextEncoder().encode(text).length>65536){this.notice('Уточнение длиннее 65536 байт','error');return;}
       const id=`input-${crypto.randomUUID()}`;this.editor.setText('');this.send({type:'steer',id,text});return;
     }
     if(text==='/help'){this.editor.setText('');this.openPalette();return;}
-    this.editor.setText('');this.setBusy(true);this.send({type:'submit',text});
+    this.editor.setText('');this.setBusy(true,text.startsWith('/')?'command':'model',text==='/models'?'Загружаю список моделей…':'Открываю '+text.split(/\s/,1)[0]+'…');this.send({type:'submit',text});
   }
   private answerPermission(decision:Decision){
     const request=this.pending;if(!request)return;
@@ -704,6 +783,10 @@ export class AgentView {
   }
   private onKey(event:KeyEvent){
     const stop=()=>{event.preventDefault();event.stopPropagation();};
+    if(this.ready&&!this.busy&&!this.dialog&&!this.pending&&!event.ctrl&&!event.meta&&['return','tab','up','down','escape'].includes(event.name)){
+      if(this.picker)this.updatePicker();
+      else if(this.paletteOpen||this.menu.visible||this.editor.plainText.startsWith('/'))this.updateMenu();
+    }
     if(event.ctrl && event.name==='c' && (event.shift||!this.dialog?.secret&&this.selectedText())){stop();void this.copyText(this.selectedText()||((this.editor.focused&&this.editor.visible)?this.editor.plainText:'')||this.lastAnswer());return;}
     if(event.ctrl && event.name==='y'){stop();void this.copyText(this.lastAnswer());return;}
     if(event.ctrl && event.name==='d'){stop();this.exit();return;}
@@ -769,10 +852,12 @@ export class AgentView {
     if(event.ctrl && event.name==='t'){stop();this.thoughtsExpanded=!this.thoughtsExpanded;for(const card of this.thoughts){card.expanded=this.thoughtsExpanded;card.body.visible=card.expanded;this.updateThoughtTitle(card);}return;}
     if(event.ctrl && event.name==='r'){stop();this.raw=!this.raw;for(const answer of this.answers)answer.setRaw(this.raw);this.metrics();return;}
     if(event.ctrl && event.name==='o'){stop();this.expanded=!this.expanded;for(const card of this.tools.values()){card.expanded=this.expanded;card.details.visible=this.expanded;if(card.result)card.result.visible=this.expanded;}return;}
-    if(event.name==='pageup'||event.name==='pagedown'){stop();this.log.scrollBy(event.name==='pageup'?-10:10);return;}
+    if(event.name==='pageup'||event.name==='pagedown'){stop();if(event.name==='pageup'&&this.log.scrollTop===0)this.loadEarlierHistory();this.log.scrollBy(event.name==='pageup'?-10:10);return;}
     if(!this.ready){stop();if(this.closed && event.name==='q')this.exit();}
   }
   private clearHistory(){
+    this.modelMetrics.clear();
+    this.historyGeneration++;this.historyRequest=undefined;this.historyBefore=undefined;this.historyMore=false;this.historySeqs.clear();this.updateHistoryButton();
     if(this.clickTimer)clearTimeout(this.clickTimer);this.history.reset();
     this.finishAnswer();for(const entry of this.entries){this.log.remove(entry);entry.destroyRecursively();}
     this.steeringCards.clear();this.pendingSteering.clear();

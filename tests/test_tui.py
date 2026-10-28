@@ -64,6 +64,7 @@ async def test_every_catalog_command_opens_selection_without_model_or_credential
         snapshot = next(event for event in events if event['type'] == 'snapshot')
         assert snapshot['version'] == __version__
         session = snapshot['session']['id']
+        assert all(entry['label'] == entry['command'] and entry['command'].isascii() for entry in snapshot['catalog'])
         commands = [item['command'] for item in snapshot['catalog']]
         assert len(commands) == 13 and '/providers' in commands and '/permissions' in commands
         assert all(item.get('label') and item['kind'] == 'command' for item in snapshot['catalog'])
@@ -435,9 +436,12 @@ async def test_model_selection_metadata_persistence_and_next_request(gw,tmp_path
         _,events=await receive(proc,'idle')
         snapshot=next(e for e in events if e['type']=='snapshot')
         assert snapshot['session']['id']==session and snapshot['session']['model']=='alpha'
+        assert not any(event['type'] in ('user', 'assistant', 'reasoning', 'tool_call', 'text') for event in events)
+        assert len(SCRIPT) == 1  # выбор не расходует ответ модели
         store=SessionStore(db)
         try:
             assert store.get(session).model=='alpha'
+            assert store.messages(session) == [] and store.tool_runs(session) == []
         finally:
             store.close()
         send(proc,type='submit',text='Проверка выбранной модели')
@@ -545,7 +549,7 @@ async def test_sessions_picker_resume_workspace_guard_and_confirmed_delete(gw,tm
         snapshot=next(e for e in events if e['type']=='snapshot')
         assert snapshot['session']['id']==old.id
         assert len(snapshot['history']) == 1
-        assert snapshot['history'][0] == {'role': 'user', 'content': 'Сохранённая история', 'message_id': 'seq:1'}
+        assert snapshot['history'][0] == {'role': 'user', 'content': 'Сохранённая история', 'message_id': 'seq:1', 'seq': 1}
         for answer in ('n','y'):
             send(proc,type='submit',text='/delete')
             _,events=await receive(proc,'idle')
@@ -1095,3 +1099,59 @@ async def test_statistics_and_session_names_without_model(gw, tmp_path):
         assert current['messages'] == current['tokens'] == 0
     finally:
         await stop(proc)
+
+
+def test_history_pages_recover_messages_before_compaction_and_preserve_errors(tmp_path):
+    from types import SimpleNamespace
+    from agent.store import SessionStore
+    store = SessionStore(tmp_path / 'history.db')
+    session = store.create('local')
+    output = io.StringIO()
+    bridge = Bridge([], output=output)
+    bridge.app = SimpleNamespace(store=store, session=session)
+    bridge.ready = True
+    try:
+        for index in range(130):
+            store.add_message(session.id, {'role': 'user' if index % 2 == 0 else 'assistant', 'content': f'Сообщение {index}'})
+        original = store.messages(session.id)
+        store.compact(session.id)
+        assert store.get(session.id).context_seq > 0
+        recent = bridge.history_page_data()
+        assert recent['history_has_more'] and len(recent['history']) == 100
+        assert recent['history_before'] == 31
+        bridge.handle({'type': 'load_history', 'id': 'first-page', 'session_id': session.id, 'before': recent['history_before']})
+        earlier = json.loads(output.getvalue().splitlines()[-1])
+        assert earlier['type'] == 'history_page' and not earlier['history_has_more']
+        assert [m['content'] for m in earlier['history'] + recent['history']] == [m['content'] for m in original]
+        assert earlier['history'][0]['message_id'] == 'seq:1'
+        store.add_message(session.id, {'role': 'assistant', 'content': None, 'tool_calls': [tool_call('bad', 'shell', command='false')]})
+        store.add_message(session.id, {'role': 'tool', 'tool_call_id': 'bad', 'content': 'Ошибка команды'})
+        store.record_tool(session.id, 'bad', 'shell', {'command': 'false'}, 'allow', False, 12)
+        restored = bridge.history_page_data()['history'][-1]
+        assert restored['ok'] is False and restored['name'] == 'shell' and restored['ms'] == 12
+        for before, sid in [(0, session.id), ('31', session.id), (2**64, session.id), (31, 'other-session')]:
+            bridge.handle({'type': 'load_history', 'id': 'invalid', 'session_id': sid, 'before': before})
+            assert json.loads(output.getvalue().splitlines()[-1]).get('error')
+    finally:
+        store.close()
+
+
+def test_history_pages_stay_below_frame_limit_without_skipping_large_messages(tmp_path):
+    from types import SimpleNamespace
+    from agent.store import SessionStore
+    store = SessionStore(tmp_path / 'big-history.db')
+    session = store.create('local')
+    bridge = Bridge([], output=io.StringIO())
+    bridge.app = SimpleNamespace(store=store, session=session)
+    try:
+        for _ in range(30):
+            store.add_message(session.id, {'role': 'assistant', 'content': 'Я' * 20000})
+        page = bridge.history_page_data()
+        assert page['history_has_more'] and len(json.dumps(page, ensure_ascii=False).encode()) < 600000
+        seqs = [m['seq'] for m in page['history']]
+        while page['history_has_more']:
+            page = bridge.history_page_data(page['history_before'])
+            seqs = [m['seq'] for m in page['history']] + seqs
+        assert seqs == list(range(1, 31))
+    finally:
+        store.close()

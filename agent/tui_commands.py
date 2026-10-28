@@ -21,8 +21,8 @@ SECTIONS = (
 
 
 def navigation_catalog():
-    return [{'kind': 'command', 'label': label, 'command': command, 'description': description,
-             'aliases': aliases, 'arguments': 'none'} for label, command, description, aliases in SECTIONS]
+    return [{'kind': 'command', 'label': command, 'command': command, 'description': description,
+             'aliases': [*aliases, label.lower()], 'arguments': 'none'} for label, command, description, aliases in SECTIONS]
 
 
 NATIVE_PAGES = {'/_ui/sessions/view': '/sessions', '/_ui/sessions/remove': '/delete',

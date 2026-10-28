@@ -456,7 +456,7 @@ class Agent:
                         yield result
             if compacted:
                 record(self.store, "context.compacted", estimated=estimated, automatic=True)
-                yield {"type": "warning", "message": "Контекст автоматически сокращён; цель и последний запрос сохранены"}
+                yield {"type": "warning", "message": "Контекст автоматически сокращён; цель и последний запрос сохранены. История чата не удалена"}
             message, usage, metrics = None, (0, 0), None
             overflow_retried = False
             retries = 0

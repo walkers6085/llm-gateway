@@ -107,30 +107,59 @@ class Bridge:
                  'session': session.to_dict(), 'provider': self.app.provider or 'gateway',
                  'notifications': self.app.settings.get('tui', {}).get('notifications', {}), 'catalog': navigation_catalog(), 'next_agent_mode': self.requested_mode[1] if self.requested_mode and self.requested_mode[0] == session.id else None, **self.dashboard_data()}
         if history:
-            editable = {row['seq'] for row in self.app.revert_messages()}
-            rows = [{**row['message'], **({'message_id': self.message_id(row), 'content': row['metadata'].get('user_input', row['message'].get('content', ''))} if row['message']['role'] == 'user' and row['seq'] in editable else {}), **({'agent_mode': row['metadata']['agent_mode']} if 'agent_mode' in row['metadata'] else {}), **({'metrics': row['metadata']['metrics']} if row['metadata'].get('metrics') else {})} for row in self.app.store.timeline(session.id)]
-            display, size, clipped = [], 0, False
-            for row in reversed(rows[-100:]):
-                item = json.loads(json.dumps(row))
-                if isinstance(item.get('content'), str):
-                    clipped |= len(item['content']) > 20000
-                    item['content'] = item['content'][:20000]
-                if isinstance(item.get('reasoning_content'), str):
-                    clipped |= len(item['reasoning_content']) > 20000
-                    item['reasoning_content'] = item['reasoning_content'][:20000]
-                for call in item.get('tool_calls') or []:
-                    fn = call.get('function') or {}
-                    if isinstance(fn.get('arguments'), str):
-                        clipped |= len(fn['arguments']) > 12000
-                        fn['arguments'] = fn['arguments'][:12000]
-                encoded = len(json.dumps(item, ensure_ascii=False).encode())
-                if size + encoded > MAX_FRAME//2:
-                    break
-                display.append(item)
-                size += encoded
-            event['history'] = list(reversed(display))
-            event['history_truncated'] = clipped or len(display) < len(rows)
+            event.update(self.history_page_data())
         self.emit(event)
+
+    def history_page_data(self, before=None):
+        rows, more = self.app.store.timeline_page(self.app.session.id, before=before)
+        statuses = self.app.store.tool_statuses(self.app.session.id, [row['message']['tool_call_id'] for row in rows if row['message']['role'] == 'tool'])
+        display, size, clipped = [], 0, False
+        for row in reversed(rows):
+            item = {**row['message'], 'seq': row['seq']}
+            metadata = row['metadata']
+            if item['role'] == 'user' and ('user_input' in metadata or not metadata.get('request_id')):
+                item.update(message_id=self.message_id(row), content=metadata.get('user_input', item.get('content', '')))
+            for key in ('agent_mode', 'metrics'):
+                if key in metadata:
+                    item[key] = metadata[key]
+            if item['role'] == 'tool':
+                item.update(statuses.get(item['tool_call_id'], {}))
+            item = json.loads(json.dumps(item))
+            for key in ('content', 'reasoning_content'):
+                if isinstance(item.get(key), str):
+                    clipped |= len(item[key]) > 20000
+                    item[key] = item[key][:20000]
+            for call in item.get('tool_calls') or []:
+                fn = call.get('function') or {}
+                if isinstance(fn.get('arguments'), str):
+                    clipped |= len(fn['arguments']) > 12000
+                    fn['arguments'] = fn['arguments'][:12000]
+            encoded = len(json.dumps(item, ensure_ascii=False).encode())
+            if size + encoded > MAX_FRAME // 2:
+                if display:
+                    more = True
+                    break
+                # Даже один ответ с огромным числом вызовов не должен закрыть доступ к остальной истории.
+                item = {**{key: item[key] for key in ('seq', 'role', 'message_id', 'tool_call_id', 'agent_mode', 'name', 'ok', 'ms') if key in item},
+                        'content': '[Сообщение слишком велико для интерфейса; полный текст доступен через /export]'}
+                clipped = True
+                encoded = len(json.dumps(item, ensure_ascii=False).encode())
+            display.append(item)
+            size += encoded
+        return {'history': list(reversed(display)), 'history_before': display[-1]['seq'] if display else before,
+                'history_has_more': more, 'history_truncated': clipped}
+
+    def load_history(self, message):
+        reply = {'type': 'history_page', 'id': message.get('id'), 'session_id': message.get('session_id')}
+        try:
+            self.validate_message_session(message)
+            before = message.get('before')
+            if type(before) is not int or not 1 <= before < 2**63 or not isinstance(message.get('id'), str) or len(message['id']) > 100:
+                raise ValueError('неверный курсор истории')
+            reply.update(self.history_page_data(before))
+        except ValueError as exc:
+            reply['error'] = str(exc)
+        self.emit(reply)
 
     async def initialize(self):
         try:
@@ -639,6 +668,8 @@ class Bridge:
         kind = message.get('type')
         if kind == 'shutdown':
             self.stop.set()
+        elif kind == 'load_history':
+            self.load_history(message)
         elif kind == 'input_history':
             self.history_input(message)
         elif kind == 'edit_message':

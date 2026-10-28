@@ -39,6 +39,10 @@ async def compact(agent, limit, *, manual=False, on_progress=None):
         summary = ''
     if not source:
         return False
+    if on_progress and not manual:
+        model_summary = config.get('mode', 'model') == 'model'
+        on_progress({'type': 'warning', 'message': 'Контекст заполнен: ' + ('создаю сводку через модель' if model_summary else 'сокращаю рабочий контекст') + '. История чата сохраняется',
+                     'compaction': {'stage': 'start', 'method': 'model' if model_summary else 'local'}})
     parent = current.get()
     budget = parent.budget
     limits = resolve(agent.settings, agent.model, agent.model_metadata)
